@@ -3,6 +3,7 @@ import asyncio
 import logging
 import math
 import re
+import html
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -2955,6 +2956,87 @@ async def post_shutdown(
 
 
 # =========================================================
+# BENVENUTO NUOVI MEMBRI GRUPPO B
+# =========================================================
+
+WELCOME_DELETE_SECONDS = 10 * 60
+CHANNEL_URL = "https://t.me/bestprice_2026"
+
+
+def _same_telegram_chat_id(a, b):
+    """Confronta in modo tollerante gli ID chat Telethon/Bot API."""
+    try:
+        a = int(a)
+        b = int(b)
+    except (TypeError, ValueError):
+        return False
+
+    if a == b:
+        return True
+
+    # Un Channel Telethon può essere salvato come ID positivo, mentre
+    # il Bot API lo espone nel formato -100xxxxxxxxxx.
+    a_abs = str(abs(a))
+    b_abs = str(abs(b))
+    return a_abs.removeprefix("100") == b_abs.removeprefix("100")
+
+
+async def _delete_welcome_later(bot, chat_id, message_id):
+    await asyncio.sleep(WELCOME_DELETE_SECONDS)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.warning("Impossibile eliminare il benvenuto %s: %s", message_id, e)
+
+
+async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Invia un solo benvenuto personale ai nuovi membri del Gruppo B."""
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message or not chat or not message.new_chat_members:
+        return
+
+    # La funzione deve lavorare esclusivamente nel Gruppo B configurato.
+    if not state.get("group_b") or not _same_telegram_chat_id(
+        chat.id,
+        state["group_b"].get("id"),
+    ):
+        return
+
+    for member in message.new_chat_members:
+        if member.is_bot:
+            continue
+
+        if member.username:
+            person = f"@{html.escape(member.username)}"
+        else:
+            visible_name = html.escape(member.full_name or "nuovo membro")
+            person = f'<a href="tg://user?id={member.id}">{visible_name}</a>'
+
+        text = (
+            f"👋 <b>Benvenuto {person}!</b>\n\n"
+            "🔥 Le offerte Amazon selezionate da <b>BestPrice24h</b> "
+            "ti aspettano sul nostro canale ufficiale.\n\n"
+            "👇 <b>Entra e scopri le offerte di oggi!</b>"
+        )
+
+        sent = await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔥 VAI AL CANALE", url=CHANNEL_URL)]
+            ]),
+        )
+
+        asyncio.create_task(
+            _delete_welcome_later(context.bot, chat.id, sent.message_id)
+        )
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
@@ -2983,6 +3065,13 @@ def main():
 
     application.add_handler(
         MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            welcome_new_members,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
             filters.TEXT
             & ~filters.COMMAND,
             text_input,
@@ -2991,7 +3080,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.4 avviato"
+        "V4.4.1 avviato"
     )
 
     application.run_polling()
