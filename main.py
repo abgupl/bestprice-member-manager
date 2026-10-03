@@ -78,6 +78,9 @@ state = {
     "daily_target": 1,
     "max_attempts": 3,
     "interval_minutes": 10,
+    "start_time": "09:00",
+    "auto_enabled": False,
+    "last_autostart_day": "",
 
     "running": False,
     "stop_requested": False,
@@ -102,6 +105,7 @@ state = {
 }
 
 worker_task = None
+scheduler_task = None
 worker_lock = asyncio.Lock()
 
 
@@ -264,18 +268,30 @@ async def load_settings():
         )
     )
 
-    state["max_attempts"] = int(
-        await get_setting(
-            "max_attempts",
-            "3",
-        )
-    )
+    state["max_attempts"] = 3
 
     state["interval_minutes"] = int(
         await get_setting(
             "interval_minutes",
             "10",
         )
+    )
+
+    state["start_time"] = await get_setting(
+        "start_time",
+        "09:00",
+    )
+
+    state["auto_enabled"] = (
+        await get_setting(
+            "auto_enabled",
+            "0",
+        ) == "1"
+    )
+
+    state["last_autostart_day"] = await get_setting(
+        "last_autostart_day",
+        "",
     )
 
     state["telegram_locked"] = (
@@ -1139,118 +1155,46 @@ def group_label(group):
 def main_keyboard():
 
     keyboard = [
-
-        # GRUPPI
         [
-            InlineKeyboardButton(
-                "📥 GRUPPO A",
-                callback_data="set_a",
-            ),
-            InlineKeyboardButton(
-                "📤 GRUPPO B",
-                callback_data="set_b",
-            ),
+            InlineKeyboardButton("📥 GRUPPO A", callback_data="set_a"),
+            InlineKeyboardButton("📤 GRUPPO B", callback_data="set_b"),
         ],
-
-        # TARGET
         [
-            InlineKeyboardButton(
-                "➖",
-                callback_data="target_minus",
-            ),
-            InlineKeyboardButton(
-                f"🎯 "
-                f"{state['daily_target']}"
-                f"/GIORNO",
-                callback_data="noop",
-            ),
-            InlineKeyboardButton(
-                "➕",
-                callback_data="target_plus",
-            ),
+            InlineKeyboardButton("➖", callback_data="target_minus"),
+            InlineKeyboardButton(f"🎯 {state['daily_target']}/GIORNO", callback_data="noop"),
+            InlineKeyboardButton("➕", callback_data="target_plus"),
         ],
-
-        # TIMER
         [
             InlineKeyboardButton(
-                "➖",
-                callback_data="interval_minus",
-            ),
-            InlineKeyboardButton(
-                f"⏱ "
-                f"{state['interval_minutes']} "
-                f"MIN",
-                callback_data="noop",
-            ),
-            InlineKeyboardButton(
-                "➕",
-                callback_data="interval_plus",
-            ),
+                f"🕐 PARTENZA {state['start_time']}",
+                callback_data="set_start_time",
+            )
         ],
-
-        # MAX
         [
-            InlineKeyboardButton(
-                "➖",
-                callback_data="attempts_minus",
-            ),
-            InlineKeyboardButton(
-                f"🔎 MAX "
-                f"{state['max_attempts']}",
-                callback_data="noop",
-            ),
-            InlineKeyboardButton(
-                "➕",
-                callback_data="attempts_plus",
-            ),
+            InlineKeyboardButton("➖", callback_data="interval_minus"),
+            InlineKeyboardButton(f"⏱ {state['interval_minutes']} MIN", callback_data="noop"),
+            InlineKeyboardButton("➕", callback_data="interval_plus"),
         ],
-
-        # AUTO
         [
             InlineKeyboardButton(
-                "🤖 AVVIA AUTOMATICO",
+                "🤖 ATTIVA AUTOMATICO",
                 callback_data="start_run",
             )
         ],
-
         [
-            InlineKeyboardButton(
-                "⏸ PAUSA",
-                callback_data="pause",
-            ),
-            InlineKeyboardButton(
-                "🛑 STOP",
-                callback_data="stop",
-            ),
+            InlineKeyboardButton("🛑 STOP", callback_data="stop"),
         ],
-
-        # MANUALE
         [
-            InlineKeyboardButton(
-                "👥 MEMBRI GRUPPO A",
-                callback_data="members",
-            ),
-            InlineKeyboardButton(
-                "➕ INVITA PER ID",
-                callback_data="manual_invite",
-            ),
+            InlineKeyboardButton("👥 MEMBRI GRUPPO A", callback_data="members"),
+            InlineKeyboardButton("➕ INVITA PER ID", callback_data="manual_invite"),
         ],
-
-        # INFO
         [
-            InlineKeyboardButton(
-                "📊 STATISTICHE",
-                callback_data="statistics",
-            ),
-            InlineKeyboardButton(
-                "📋 LOG",
-                callback_data="logs",
-            ),
+            InlineKeyboardButton("📊 STATISTICHE", callback_data="statistics"),
+            InlineKeyboardButton("📋 LOG", callback_data="logs"),
         ],
     ]
 
     if state["telegram_locked"]:
-
         keyboard.append([
             InlineKeyboardButton(
                 "🔓 RIABILITA INVITI",
@@ -1258,86 +1202,46 @@ def main_keyboard():
             )
         ])
 
-    return InlineKeyboardMarkup(
-        keyboard
-    )
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def home_text():
 
     stats = await get_today_stats()
-
-    remaining = max(
-        0,
-        state["daily_target"]
-        - stats["migrated"],
-    )
+    remaining = max(0, state["daily_target"] - stats["migrated"])
 
     if state["telegram_locked"]:
-
-        status = (
-            "🔒 INVITI SOSPESI"
-        )
-
+        status = "🔒 INVITI SOSPESI"
     elif state["running"]:
-
+        status = "🟢 AUTOMATICO ATTIVO"
+    elif state["auto_enabled"] and remaining == 0:
         status = (
-            "🟢 AUTOMATICO ATTIVO"
+            f"🌙 IN ATTESA — prossima partenza domani "
+            f"{state['start_time']}"
         )
-
+    elif state["auto_enabled"]:
+        status = f"🌙 PROGRAMMATO — partenza {state['start_time']}"
     else:
-
-        status = "🔴 FERMO"
+        status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER "
-        "V4.3.1\n\n"
-
-        f"📥 A: "
-        f"{group_label(state['group_a'])}\n"
-
-        f"📤 B: "
-        f"{group_label(state['group_b'])}\n\n"
-
+        "👥 BESTPRICE MEMBER MANAGER V4.4\n\n"
+        f"📥 A: {group_label(state['group_a'])}\n"
+        f"📤 B: {group_label(state['group_b'])}\n\n"
         "🤖 AUTOMATICO\n"
-
-        f"🎯 Target: "
-        f"{state['daily_target']}/giorno\n"
-
-        f"⏱ Intervallo: "
-        f"{state['interval_minutes']} min\n"
-
-        f"🔎 MAX: "
-        f"{state['max_attempts']}\n\n"
-
+        f"🎯 Target: {state['daily_target']}/giorno\n"
+        f"🕐 Partenza: {state['start_time']}\n"
+        f"⏱ Intervallo: {state['interval_minutes']} min\n\n"
         "📅 OGGI\n"
-
-        f"✅ Confermati: "
-        f"{stats['migrated']}\n"
-
-        f"🎯 Rimanenti: "
-        f"{remaining}\n"
-
-        f"🔎 Tentativi: "
-        f"{stats['attempts']}\n"
-
-        f"🛡 Privacy: "
-        f"{stats['privacy']}\n"
-
-        f"↪️ Già presenti: "
-        f"{stats['already']}\n"
-
-        f"⚠️ Non confermati: "
-        f"{stats['unconfirmed']}\n"
-
-        f"❌ Errori: "
-        f"{stats['errors']}\n\n"
-
+        f"✅ Confermati: {stats['migrated']}\n"
+        f"🎯 Rimanenti: {remaining}\n"
+        f"🔎 Tentativi: {stats['attempts']}\n"
+        f"🛡 Privacy: {stats['privacy']}\n"
+        f"↪️ Già presenti: {stats['already']}\n"
+        f"⚠️ Non confermati: {stats['unconfirmed']}\n"
+        f"❌ Errori: {stats['errors']}\n\n"
         f"{status}\n\n"
-
-        f"🕐 "
-        f"{now_it().strftime('%H:%M:%S')}\n"
-
+        f"🕐 {now_it().strftime('%H:%M:%S')}\n"
         "Ultimo evento:\n"
         f"{state['last_event']}"
     )
@@ -1519,8 +1423,10 @@ async def invite_one(
 
         state["running"] = False
         state["telegram_locked"] = True
+        state["auto_enabled"] = False
 
         await set_setting("telegram_locked", "1")
+        await set_setting("auto_enabled", "0")
 
         await add_log(
             f"🚫 {mode} — {display} — PeerFloodError — "
@@ -1545,6 +1451,56 @@ async def invite_one(
             "error",
             display,
         )
+
+
+# =========================================================
+# SCHEDULER GIORNALIERO
+# =========================================================
+
+async def daily_scheduler(application):
+    global worker_task
+
+    while True:
+        try:
+            if (
+                state["auto_enabled"]
+                and not state["running"]
+                and not state["telegram_locked"]
+                and state["group_a"]
+                and state["group_b"]
+            ):
+                now = now_it()
+                today = now.date().isoformat()
+                current_hm = now.strftime("%H:%M")
+                stats = await get_today_stats()
+
+                if (
+                    current_hm >= state["start_time"]
+                    and state["last_autostart_day"] != today
+                    and stats["migrated"] < state["daily_target"]
+                ):
+                    state["last_autostart_day"] = today
+                    await set_setting("last_autostart_day", today)
+                    state["running"] = True
+                    state["stop_requested"] = False
+                    await add_log(
+                        f"⏰ Partenza automatica programmata delle {state['start_time']}"
+                    )
+                    worker_task = asyncio.create_task(
+                        migration_worker(application)
+                    )
+
+            await asyncio.sleep(15)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.exception("Errore daily_scheduler")
+            await add_log(
+                f"❌ Scheduler — {type(e).__name__}: {str(e)[:180]}",
+                "ERROR",
+            )
+            await asyncio.sleep(30)
 
 
 # =========================================================
@@ -1946,6 +1902,22 @@ async def buttons(
         )
 
     # =====================================================
+    # ORARIO PARTENZA
+    # =====================================================
+
+    elif data == "set_start_time":
+
+        state["waiting_for"] = "start_time"
+        await query.edit_message_text(
+            "🕐 ORARIO PARTENZA\n\n"
+            "Scrivi l'orario giornaliero nel formato HH:MM.\n"
+            "Esempio: 09:00",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ ANNULLA", callback_data="home")
+            ]]),
+        )
+
+    # =====================================================
     # TARGET
     # =====================================================
 
@@ -2032,42 +2004,6 @@ async def buttons(
         )
 
     # =====================================================
-    # MAX
-    # =====================================================
-
-    elif data == "attempts_minus":
-
-        if state["max_attempts"] > 1:
-
-            state["max_attempts"] -= 1
-
-            await set_setting(
-                "max_attempts",
-                state["max_attempts"],
-            )
-
-        await query.edit_message_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
-        )
-
-    elif data == "attempts_plus":
-
-        if state["max_attempts"] < 50:
-
-            state["max_attempts"] += 1
-
-            await set_setting(
-                "max_attempts",
-                state["max_attempts"],
-            )
-
-        await query.edit_message_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
-        )
-
-    # =====================================================
     # AVVIA AUTO
     # =====================================================
 
@@ -2123,13 +2059,9 @@ async def buttons(
             f"✅ Oggi: "
             f"{stats['migrated']}\n"
 
-            f"⏱ "
-            f"{state['interval_minutes']} "
-            f"min\n"
-
-            f"🔎 MAX "
-            f"{state['max_attempts']}\n\n"
-
+            f"🕐 Partenza giornaliera: {state['start_time']}\n"
+            f"⏱ {state['interval_minutes']} min\n\n"
+            "L'automatico resterà programmato ogni giorno finché non premi STOP.\n\n"
             "Confermi?",
 
             reply_markup=InlineKeyboardMarkup([[
@@ -2152,16 +2084,29 @@ async def buttons(
         ):
             return
 
-        state["running"] = True
+        state["auto_enabled"] = True
         state["stop_requested"] = False
+        await set_setting("auto_enabled", "1")
 
-        worker_task = (
-            asyncio.create_task(
-                migration_worker(
-                    context.application
-                )
+        stats = await get_today_stats()
+        now = now_it()
+        today = now.date().isoformat()
+
+        if (
+            stats["migrated"] < state["daily_target"]
+            and now.strftime("%H:%M") >= state["start_time"]
+        ):
+            state["last_autostart_day"] = today
+            await set_setting("last_autostart_day", today)
+            state["running"] = True
+            worker_task = asyncio.create_task(
+                migration_worker(context.application)
             )
-        )
+            await add_log("🤖 Automatico giornaliero attivato — avvio immediato")
+        else:
+            await add_log(
+                f"🌙 Automatico giornaliero attivato — partenza {state['start_time']}"
+            )
 
         await query.edit_message_text(
             await home_text(),
@@ -2169,29 +2114,18 @@ async def buttons(
         )
 
     # =====================================================
-    # PAUSA / STOP
+    # STOP
     # =====================================================
-
-    elif data == "pause":
-
-        state["running"] = False
-
-        await add_log(
-            "⏸ Pausa richiesta"
-        )
-
-        await query.edit_message_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
-        )
 
     elif data == "stop":
 
         state["running"] = False
         state["stop_requested"] = True
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
 
         await add_log(
-            "🛑 STOP richiesto"
+            "🛑 Automatico disattivato manualmente"
         )
 
         await query.edit_message_text(
@@ -2728,6 +2662,31 @@ async def text_input(
     ]
 
     # =====================================================
+    # ORARIO PARTENZA
+    # =====================================================
+
+    if target == "start_time":
+        value = update.message.text.strip()
+        match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", value)
+
+        if not match:
+            await update.message.reply_text(
+                "❌ Orario non valido. Usa HH:MM, ad esempio 09:00."
+            )
+            return
+
+        state["start_time"] = value
+        state["waiting_for"] = None
+        await set_setting("start_time", value)
+        await add_log(f"🕐 Orario partenza impostato: {value}")
+
+        await update.message.reply_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    # =====================================================
     # ID MANUALI
     # =====================================================
 
@@ -2972,13 +2931,22 @@ async def post_init(
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.3.5"
+        "V4.4"
+    )
+
+    global scheduler_task
+    scheduler_task = asyncio.create_task(
+        daily_scheduler(application)
     )
 
 
 async def post_shutdown(
     application,
 ):
+
+    global scheduler_task
+    if scheduler_task:
+        scheduler_task.cancel()
 
     state["running"] = False
     state["stop_requested"] = True
@@ -3023,7 +2991,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.3.5 avviato"
+        "V4.4 avviato"
     )
 
     application.run_polling()
