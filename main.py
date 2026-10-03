@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -45,6 +46,8 @@ ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 DB_PATH = "/data/manager.db"
 ITALY_TZ = ZoneInfo("Europe/Rome")
 
+PAGE_SIZE = 20
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -79,7 +82,11 @@ state = {
     "running": False,
     "stop_requested": False,
     "telegram_locked": False,
+
     "waiting_for": None,
+
+    "member_page": 0,
+    "manual_ids": [],
 
     "last_event": "Nessuna attività",
 }
@@ -89,7 +96,7 @@ worker_lock = asyncio.Lock()
 
 
 # =========================================================
-# DATA / ORA ITALIANA
+# TEMPO
 # =========================================================
 
 def now_it():
@@ -153,7 +160,18 @@ async def init_db():
             )
         """)
 
-        # Compatibilità con DB V4.1 già esistente
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS extracted_members (
+                source_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                display_name TEXT,
+                extracted_at TEXT NOT NULL,
+                PRIMARY KEY(source_id, user_id)
+            )
+        """)
+
+        # Compatibilità V4.1
         try:
             await db.execute(
                 "ALTER TABLE daily_stats "
@@ -202,20 +220,9 @@ async def get_setting(key, default=None):
 
 async def save_group(prefix, group):
 
-    await set_setting(
-        f"{prefix}_id",
-        group["id"],
-    )
-
-    await set_setting(
-        f"{prefix}_name",
-        group["name"],
-    )
-
-    await set_setting(
-        f"{prefix}_input",
-        group["input"],
-    )
+    await set_setting(f"{prefix}_id", group["id"])
+    await set_setting(f"{prefix}_name", group["name"])
+    await set_setting(f"{prefix}_input", group["input"])
 
 
 async def load_settings():
@@ -238,17 +245,9 @@ async def load_settings():
 
     for prefix in ("group_a", "group_b"):
 
-        group_id = await get_setting(
-            f"{prefix}_id"
-        )
-
-        name = await get_setting(
-            f"{prefix}_name"
-        )
-
-        input_value = await get_setting(
-            f"{prefix}_input"
-        )
+        group_id = await get_setting(f"{prefix}_id")
+        name = await get_setting(f"{prefix}_name")
+        input_value = await get_setting(f"{prefix}_input")
 
         if group_id and name and input_value:
 
@@ -293,7 +292,7 @@ async def increment_stat(field, amount=1):
     }
 
     if field not in allowed:
-        raise ValueError("Campo statistico non valido")
+        return
 
     await ensure_today()
 
@@ -383,11 +382,7 @@ async def add_log(message, level="INFO"):
 
         await db.execute(
             """
-            INSERT INTO logs(
-                created_at,
-                level,
-                message
-            )
+            INSERT INTO logs(created_at, level, message)
             VALUES (?, ?, ?)
             """,
             (
@@ -405,7 +400,6 @@ async def add_log(message, level="INFO"):
 async def clear_logs():
 
     async with aiosqlite.connect(DB_PATH) as db:
-
         await db.execute("DELETE FROM logs")
         await db.commit()
 
@@ -421,12 +415,10 @@ async def save_processed(user, status):
     username = getattr(user, "username", None)
 
     display_name = " ".join(
-        value
-        for value in [
+        x for x in [
             getattr(user, "first_name", None),
             getattr(user, "last_name", None),
-        ]
-        if value
+        ] if x
     )
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -479,22 +471,18 @@ async def was_processed(user_id):
             ),
         )
 
-        row = await cursor.fetchone()
-
-    return row is not None
+        return await cursor.fetchone() is not None
 
 
 # =========================================================
-# SICUREZZA BOT
+# SICUREZZA
 # =========================================================
 
 def is_admin(update):
 
-    user = update.effective_user
-
     return (
-        user is not None
-        and user.id == ADMIN_USER_ID
+        update.effective_user is not None
+        and update.effective_user.id == ADMIN_USER_ID
     )
 
 
@@ -524,16 +512,8 @@ async def resolve_group(value):
 
     if "t.me/" in value:
 
-        value = value.split(
-            "t.me/",
-            1,
-        )[1]
-
-        value = value.split(
-            "?",
-            1,
-        )[0]
-
+        value = value.split("t.me/", 1)[1]
+        value = value.split("?", 1)[0]
         value = value.strip("/")
 
         if value.startswith("+"):
@@ -546,52 +526,26 @@ async def resolve_group(value):
     if value.lstrip("-").isdigit():
         value = int(value)
 
-    entity = await user_client.get_entity(
-        value
-    )
+    entity = await user_client.get_entity(value)
 
-    if not isinstance(
-        entity,
-        (Channel, Chat),
-    ):
-        raise ValueError(
-            "Non è un gruppo Telegram."
-        )
+    if not isinstance(entity, (Channel, Chat)):
+        raise ValueError("Non è un gruppo Telegram.")
 
-    if (
-        isinstance(entity, Channel)
-        and not entity.megagroup
-    ):
-        raise ValueError(
-            "È un canale, non un gruppo."
-        )
+    if isinstance(entity, Channel) and not entity.megagroup:
+        raise ValueError("È un canale, non un gruppo.")
 
     return {
         "id": entity.id,
-        "name": getattr(
-            entity,
-            "title",
-            "Gruppo",
-        ),
+        "name": getattr(entity, "title", "Gruppo"),
         "input": value,
     }
 
 
 # =========================================================
-# VERIFICA MEMBERSHIP B
+# MEMBERSHIP B
 # =========================================================
 
-async def verify_in_destination(
-    destination,
-    user,
-):
-
-    """
-    Verifica se Telegram considera realmente
-    l'utente partecipante del gruppo B.
-
-    Restituisce True/False.
-    """
+async def verify_in_destination(destination, user):
 
     try:
 
@@ -609,14 +563,12 @@ async def verify_in_destination(
 
 
 # =========================================================
-# TIMER INTERROMPIBILE
+# TIMER
 # =========================================================
 
 async def interruptible_wait(minutes):
 
-    total_seconds = minutes * 60
-
-    for _ in range(total_seconds):
+    for _ in range(minutes * 60):
 
         if (
             not state["running"]
@@ -628,6 +580,222 @@ async def interruptible_wait(minutes):
         await asyncio.sleep(1)
 
     return True
+
+
+# =========================================================
+# ESTRAZIONE MEMBRI A
+# =========================================================
+
+async def extract_members_a():
+
+    if not state["group_a"]:
+        raise ValueError("Gruppo A non impostato")
+
+    source = await user_client.get_entity(
+        state["group_a"]["input"]
+    )
+
+    me = await user_client.get_me()
+
+    rows = []
+
+    async for user in user_client.iter_participants(source):
+
+        if user.id == me.id:
+            continue
+
+        if getattr(user, "bot", False):
+            continue
+
+        if getattr(user, "deleted", False):
+            continue
+
+        username = getattr(user, "username", None)
+
+        display_name = " ".join(
+            x for x in [
+                getattr(user, "first_name", None),
+                getattr(user, "last_name", None),
+            ] if x
+        )
+
+        rows.append(
+            (
+                state["group_a"]["id"],
+                user.id,
+                username,
+                display_name,
+                now_it().isoformat(),
+            )
+        )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+            """
+            DELETE FROM extracted_members
+            WHERE source_id = ?
+            """,
+            (state["group_a"]["id"],),
+        )
+
+        await db.executemany(
+            """
+            INSERT OR REPLACE INTO extracted_members
+            (
+                source_id,
+                user_id,
+                username,
+                display_name,
+                extracted_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+        await db.commit()
+
+    return len(rows)
+
+
+async def extracted_count():
+
+    if not state["group_a"]:
+        return 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM extracted_members
+            WHERE source_id = ?
+            """,
+            (state["group_a"]["id"],),
+        )
+
+        row = await cursor.fetchone()
+
+    return row[0]
+
+
+async def get_members_page(page):
+
+    offset = page * PAGE_SIZE
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT
+                user_id,
+                username,
+                display_name
+            FROM extracted_members
+            WHERE source_id = ?
+            ORDER BY
+                CASE WHEN username IS NULL THEN 1 ELSE 0 END,
+                username COLLATE NOCASE,
+                display_name COLLATE NOCASE
+            LIMIT ? OFFSET ?
+            """,
+            (
+                state["group_a"]["id"],
+                PAGE_SIZE,
+                offset,
+            ),
+        )
+
+        return await cursor.fetchall()
+
+
+async def members_page_text(page):
+
+    total = await extracted_count()
+
+    if total == 0:
+
+        return (
+            "👥 MEMBRI GRUPPO A\n\n"
+            "Nessun membro estratto.\n\n"
+            "Premi 🔄 ESTRAI/AGGIORNA."
+        )
+
+    pages = max(
+        1,
+        math.ceil(total / PAGE_SIZE),
+    )
+
+    page = max(
+        0,
+        min(page, pages - 1),
+    )
+
+    state["member_page"] = page
+
+    rows = await get_members_page(page)
+
+    lines = []
+
+    start_number = page * PAGE_SIZE + 1
+
+    for i, row in enumerate(
+        rows,
+        start=start_number,
+    ):
+
+        user_id, username, name = row
+
+        if username:
+            label = f"@{username}"
+        elif name:
+            label = name
+        else:
+            label = "Senza username"
+
+        lines.append(
+            f"{i}. {label} — {user_id}"
+        )
+
+    return (
+        "👥 MEMBRI GRUPPO A\n\n"
+        f"Totale: {total}\n"
+        f"Pagina: {page + 1}/{pages}\n\n"
+        + "\n".join(lines)
+    )
+
+
+def members_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "◀️",
+                callback_data="members_prev",
+            ),
+            InlineKeyboardButton(
+                "🔄 ESTRAI/AGGIORNA",
+                callback_data="extract_members",
+            ),
+            InlineKeyboardButton(
+                "▶️",
+                callback_data="members_next",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "➕ INVITA PER ID",
+                callback_data="manual_invite",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ INDIETRO",
+                callback_data="home",
+            )
+        ],
+    ])
 
 
 # =========================================================
@@ -660,6 +828,8 @@ def main_keyboard():
                 callback_data="set_b",
             ),
         ],
+
+        # AUTO
         [
             InlineKeyboardButton(
                 "➖",
@@ -704,20 +874,33 @@ def main_keyboard():
         ],
         [
             InlineKeyboardButton(
-                "▶️ AVVIA",
+                "🤖 AVVIA AUTOMATICO",
                 callback_data="start_run",
             ),
+        ],
+        [
             InlineKeyboardButton(
                 "⏸ PAUSA",
                 callback_data="pause",
             ),
-        ],
-        [
             InlineKeyboardButton(
                 "🛑 STOP",
                 callback_data="stop",
             ),
         ],
+
+        # MANUALE
+        [
+            InlineKeyboardButton(
+                "👥 MEMBRI GRUPPO A",
+                callback_data="members",
+            ),
+            InlineKeyboardButton(
+                "➕ INVITA PER ID",
+                callback_data="manual_invite",
+            ),
+        ],
+
         [
             InlineKeyboardButton(
                 "📊 STATISTICHE",
@@ -756,52 +939,181 @@ async def home_text():
         status = "🔒 INVITI SOSPESI"
 
     elif state["running"]:
-        status = "🟢 ATTIVO"
+        status = "🟢 AUTOMATICO ATTIVO"
 
     else:
         status = "🔴 FERMO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.2\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.3\n\n"
 
         f"📥 A: {group_label(state['group_a'])}\n"
         f"📤 B: {group_label(state['group_b'])}\n\n"
 
+        "🤖 AUTOMATICO\n"
+        f"🎯 Target: {state['daily_target']}/giorno\n"
+        f"⏱ Intervallo: {state['interval_minutes']} min\n"
+        f"🔎 MAX: {state['max_attempts']}\n\n"
+
         "📅 OGGI\n"
-        f"✅ Confermati: "
-        f"{stats['migrated']}/"
-        f"{state['daily_target']}\n"
-
+        f"✅ Confermati: {stats['migrated']}\n"
         f"🎯 Rimanenti: {remaining}\n"
-
-        f"⏱ Intervallo: "
-        f"{state['interval_minutes']} min\n"
-
-        f"🔎 Tentativi: "
-        f"{stats['attempts']}\n"
-
-        f"🛡 Privacy: "
-        f"{stats['privacy']}\n"
-
-        f"↪️ Già presenti: "
-        f"{stats['already']}\n"
-
-        f"⚠️ Non confermati: "
-        f"{stats['unconfirmed']}\n"
-
-        f"❌ Errori: "
-        f"{stats['errors']}\n\n"
+        f"🛡 Privacy: {stats['privacy']}\n"
+        f"↪️ Già presenti: {stats['already']}\n"
+        f"⚠️ Non confermati: {stats['unconfirmed']}\n"
+        f"❌ Errori: {stats['errors']}\n\n"
 
         f"{status}\n\n"
 
         f"🕐 {now_it().strftime('%H:%M:%S')}\n"
-        f"Ultimo evento:\n"
-        f"{state['last_event']}"
+        f"Ultimo evento:\n{state['last_event']}"
     )
 
 
 # =========================================================
-# MIGRATION WORKER
+# GESTIONE RISULTATO INVITO
+# =========================================================
+
+async def invite_one(
+    destination,
+    user,
+    mode,
+):
+
+    display = (
+        f"@{user.username}"
+        if getattr(user, "username", None)
+        else f"ID {user.id}"
+    )
+
+    await increment_stat("attempts")
+
+    await add_log(
+        f"{mode} — Tentativo: {display}"
+    )
+
+    try:
+
+        await user_client(
+            InviteToChannelRequest(
+                destination,
+                [user],
+            )
+        )
+
+        await asyncio.sleep(3)
+
+        confirmed = await verify_in_destination(
+            destination,
+            user,
+        )
+
+        if confirmed:
+
+            await increment_stat("migrated")
+
+            await save_processed(
+                user,
+                "CONFIRMED",
+            )
+
+            await add_log(
+                f"✅ {mode} — Confermato: {display}"
+            )
+
+            return "confirmed", display
+
+        await increment_stat("unconfirmed")
+
+        await save_processed(
+            user,
+            "UNCONFIRMED",
+        )
+
+        await add_log(
+            f"⚠️ {mode} — Non confermato: {display}",
+            "WARNING",
+        )
+
+        return "unconfirmed", display
+
+    except UserAlreadyParticipantError:
+
+        await increment_stat("already")
+
+        await save_processed(
+            user,
+            "ALREADY",
+        )
+
+        await add_log(
+            f"↪️ {mode} — Già presente: {display}"
+        )
+
+        return "already", display
+
+    except (
+        UserPrivacyRestrictedError,
+        UserNotMutualContactError,
+    ):
+
+        await increment_stat("privacy")
+
+        await save_processed(
+            user,
+            "PRIVACY",
+        )
+
+        await add_log(
+            f"🛡 {mode} — Privacy: {display}"
+        )
+
+        return "privacy", display
+
+    except FloodWaitError as e:
+
+        state["running"] = False
+
+        await add_log(
+            f"⏳ FloodWait {e.seconds}s. STOP.",
+            "WARNING",
+        )
+
+        return "flood_wait", display
+
+    except PeerFloodError:
+
+        state["running"] = False
+        state["telegram_locked"] = True
+
+        await set_setting(
+            "telegram_locked",
+            "1",
+        )
+
+        await add_log(
+            "🔒 Telegram ha rifiutato ulteriori "
+            "inviti. Automazione bloccata.",
+            "WARNING",
+        )
+
+        return "peer_flood", display
+
+    except Exception as e:
+
+        await increment_stat("errors")
+
+        await add_log(
+            f"❌ {mode} — {display}: "
+            f"{type(e).__name__}",
+            "ERROR",
+        )
+
+        return "error", display
+
+
+# =========================================================
+# AUTOMATICO
 # =========================================================
 
 async def migration_worker(application):
@@ -810,11 +1122,10 @@ async def migration_worker(application):
 
     async with worker_lock:
 
-        if not state["running"]:
-            return
-
-        if state["telegram_locked"]:
-            state["running"] = False
+        if (
+            not state["running"]
+            or state["telegram_locked"]
+        ):
             return
 
         state["stop_requested"] = False
@@ -822,7 +1133,7 @@ async def migration_worker(application):
         attempts_cycle = 0
 
         await add_log(
-            "▶️ Ciclo di migrazione avviato"
+            "▶️ Ciclo AUTO avviato"
         )
 
         try:
@@ -841,13 +1152,11 @@ async def migration_worker(application):
                 source
             ):
 
-                if not state["running"]:
-                    break
-
-                if state["stop_requested"]:
-                    break
-
-                if state["telegram_locked"]:
+                if (
+                    not state["running"]
+                    or state["stop_requested"]
+                    or state["telegram_locked"]
+                ):
                     break
 
                 stats = await get_today_stats()
@@ -869,223 +1178,36 @@ async def migration_worker(application):
                 ):
 
                     await add_log(
-                        "🛑 Max tentativi raggiunto"
+                        "🛑 MAX tentativi raggiunto"
                     )
 
                     break
-
-                # -------------------------
-                # FILTRI
-                # -------------------------
 
                 if user.id == me.id:
                     continue
 
-                if getattr(
-                    user,
-                    "bot",
-                    False,
-                ):
+                if getattr(user, "bot", False):
                     continue
 
-                if getattr(
-                    user,
-                    "deleted",
-                    False,
-                ):
+                if getattr(user, "deleted", False):
                     continue
 
-                if await was_processed(
-                    user.id
-                ):
+                if await was_processed(user.id):
                     continue
-
-                display = (
-                    f"@{user.username}"
-                    if getattr(
-                        user,
-                        "username",
-                        None,
-                    )
-                    else f"ID {user.id}"
-                )
 
                 attempts_cycle += 1
 
-                await increment_stat(
-                    "attempts"
+                result, display = await invite_one(
+                    destination,
+                    user,
+                    "🤖 AUTO",
                 )
 
-                await add_log(
-                    f"🔎 Candidato: {display}"
-                )
-
-                try:
-
-                    # =====================
-                    # INVITO
-                    # =====================
-
-                    await user_client(
-                        InviteToChannelRequest(
-                            destination,
-                            [user],
-                        )
-                    )
-
-                    # Lasciamo a Telegram il tempo
-                    # di aggiornare lo stato
-                    await asyncio.sleep(3)
-
-                    confirmed = (
-                        await verify_in_destination(
-                            destination,
-                            user,
-                        )
-                    )
-
-                    # =====================
-                    # CONFERMATO
-                    # =====================
-
-                    if confirmed:
-
-                        await increment_stat(
-                            "migrated"
-                        )
-
-                        await save_processed(
-                            user,
-                            "CONFIRMED",
-                        )
-
-                        await add_log(
-                            f"✅ Confermato in B: "
-                            f"{display}"
-                        )
-
-                    # =====================
-                    # NON CONFERMATO
-                    # =====================
-
-                    else:
-
-                        await increment_stat(
-                            "unconfirmed"
-                        )
-
-                        await save_processed(
-                            user,
-                            "UNCONFIRMED",
-                        )
-
-                        await add_log(
-                            f"⚠️ Invito non confermato: "
-                            f"{display}",
-                            "WARNING",
-                        )
-
-                # =========================
-                # GIÀ PRESENTE
-                # =========================
-
-                except UserAlreadyParticipantError:
-
-                    await increment_stat(
-                        "already"
-                    )
-
-                    await save_processed(
-                        user,
-                        "ALREADY",
-                    )
-
-                    await add_log(
-                        f"↪️ Già presente: "
-                        f"{display}"
-                    )
-
-                # =========================
-                # PRIVACY
-                # =========================
-
-                except (
-                    UserPrivacyRestrictedError,
-                    UserNotMutualContactError,
+                if result in (
+                    "peer_flood",
+                    "flood_wait",
                 ):
-
-                    await increment_stat(
-                        "privacy"
-                    )
-
-                    await save_processed(
-                        user,
-                        "PRIVACY",
-                    )
-
-                    await add_log(
-                        f"🛡 Privacy/non invitabile: "
-                        f"{display}"
-                    )
-
-                # =========================
-                # FLOOD WAIT
-                # =========================
-
-                except FloodWaitError as e:
-
-                    state["running"] = False
-
-                    await add_log(
-                        f"⏳ FloodWait "
-                        f"{e.seconds}s. STOP.",
-                        "WARNING",
-                    )
-
                     break
-
-                # =========================
-                # PEER FLOOD
-                # =========================
-
-                except PeerFloodError:
-
-                    state["running"] = False
-                    state["telegram_locked"] = True
-
-                    await set_setting(
-                        "telegram_locked",
-                        "1",
-                    )
-
-                    await add_log(
-                        "🔒 Telegram ha rifiutato "
-                        "ulteriori inviti. "
-                        "Automazione bloccata.",
-                        "WARNING",
-                    )
-
-                    break
-
-                # =========================
-                # ALTRO ERRORE
-                # =========================
-
-                except Exception as e:
-
-                    await increment_stat(
-                        "errors"
-                    )
-
-                    await add_log(
-                        f"❌ {display}: "
-                        f"{type(e).__name__}",
-                        "ERROR",
-                    )
-
-                # =========================
-                # CONTROLLO TARGET
-                # =========================
 
                 stats = await get_today_stats()
 
@@ -1093,21 +1215,12 @@ async def migration_worker(application):
                     stats["migrated"]
                     >= state["daily_target"]
                 ):
-
                     await add_log(
                         "🎯 Obiettivo giornaliero raggiunto"
                     )
-
                     break
 
-                # =========================
-                # TIMER
-                # =========================
-
-                if (
-                    state["running"]
-                    and not state["telegram_locked"]
-                ):
+                if state["running"]:
 
                     await add_log(
                         f"⏱ Prossima operazione tra "
@@ -1121,54 +1234,10 @@ async def migration_worker(application):
                     if not completed:
                         break
 
-            state["running"] = False
-
-            await add_log(
-                "🏁 Ciclo terminato"
-            )
-
-            stats = await get_today_stats()
-
-            try:
-
-                await application.bot.send_message(
-                    chat_id=ADMIN_USER_ID,
-                    text=(
-                        "🏁 CICLO TERMINATO\n\n"
-
-                        f"✅ Confermati: "
-                        f"{stats['migrated']}/"
-                        f"{state['daily_target']}\n"
-
-                        f"🔎 Tentativi: "
-                        f"{stats['attempts']}\n"
-
-                        f"🛡 Privacy: "
-                        f"{stats['privacy']}\n"
-
-                        f"↪️ Già presenti: "
-                        f"{stats['already']}\n"
-
-                        f"⚠️ Non confermati: "
-                        f"{stats['unconfirmed']}\n"
-
-                        f"❌ Errori: "
-                        f"{stats['errors']}"
-                    ),
-                )
-
-            except Exception:
-                logger.exception(
-                    "Errore notifica finale"
-                )
-
         except Exception as e:
 
-            state["running"] = False
-
             await add_log(
-                f"❌ Errore motore: "
-                f"{type(e).__name__}",
+                f"❌ Errore AUTO: {type(e).__name__}",
                 "ERROR",
             )
 
@@ -1178,7 +1247,86 @@ async def migration_worker(application):
 
         finally:
 
+            state["running"] = False
+
+            await add_log(
+                "🏁 Ciclo AUTO terminato"
+            )
+
             worker_task = None
+
+
+# =========================================================
+# INVITO MANUALE
+# =========================================================
+
+async def run_manual_invites(application):
+
+    ids = list(state["manual_ids"])
+
+    if not ids:
+        return []
+
+    destination = await user_client.get_entity(
+        state["group_b"]["input"]
+    )
+
+    results = []
+
+    for user_id in ids:
+
+        if state["telegram_locked"]:
+            break
+
+        try:
+
+            user = await user_client.get_entity(
+                user_id
+            )
+
+        except Exception:
+
+            await add_log(
+                f"❌ 👤 MANUALE — ID {user_id} "
+                f"non risolvibile",
+                "ERROR",
+            )
+
+            results.append(
+                f"❌ {user_id} — non trovato"
+            )
+
+            continue
+
+        result, display = await invite_one(
+            destination,
+            user,
+            "👤 MANUALE",
+        )
+
+        labels = {
+            "confirmed": "✅",
+            "already": "↪️",
+            "privacy": "🛡",
+            "unconfirmed": "⚠️",
+            "peer_flood": "🔒",
+            "flood_wait": "⏳",
+            "error": "❌",
+        }
+
+        results.append(
+            f"{labels.get(result, '❓')} {display}"
+        )
+
+        if result in (
+            "peer_flood",
+            "flood_wait",
+        ):
+            break
+
+    state["manual_ids"] = []
+
+    return results
 
 
 # =========================================================
@@ -1218,14 +1366,11 @@ async def buttons(
         return
 
     query = update.callback_query
-
     await query.answer()
 
     data = query.data
 
-    # =====================================================
-    # GRUPPO A
-    # =====================================================
+    # ---------------- GRUPPI ----------------
 
     if data == "set_a":
 
@@ -1233,8 +1378,7 @@ async def buttons(
 
         await query.edit_message_text(
             "📥 IMPOSTA GRUPPO A\n\n"
-            "Inserisci @username, link t.me "
-            "oppure ID.",
+            "Inserisci @username, link t.me oppure ID.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -1242,10 +1386,6 @@ async def buttons(
                 )
             ]]),
         )
-
-    # =====================================================
-    # GRUPPO B
-    # =====================================================
 
     elif data == "set_b":
 
@@ -1253,8 +1393,7 @@ async def buttons(
 
         await query.edit_message_text(
             "📤 IMPOSTA GRUPPO B\n\n"
-            "Inserisci @username, link t.me "
-            "oppure ID.",
+            "Inserisci @username, link t.me oppure ID.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -1263,9 +1402,7 @@ async def buttons(
             ]]),
         )
 
-    # =====================================================
-    # TARGET 1-50
-    # =====================================================
+    # ---------------- TARGET ----------------
 
     elif data == "target_minus":
 
@@ -1299,9 +1436,7 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # =====================================================
-    # INTERVALLO 10-120 MIN
-    # =====================================================
+    # ---------------- INTERVALLO ----------------
 
     elif data == "interval_minus":
 
@@ -1335,9 +1470,7 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # =====================================================
-    # MAX TENTATIVI
-    # =====================================================
+    # ---------------- MAX ----------------
 
     elif data == "attempts_minus":
 
@@ -1371,92 +1504,45 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # =====================================================
-    # AVVIA
-    # =====================================================
+    # ---------------- AUTO ----------------
 
     elif data == "start_run":
 
         if state["telegram_locked"]:
 
             await query.answer(
-                "🔒 Inviti sospesi dopo una "
-                "restrizione Telegram.",
+                "🔒 Inviti attualmente sospesi.",
                 show_alert=True,
             )
-
             return
 
         if state["running"]:
 
             await query.answer(
-                "Processo già attivo.",
+                "AUTO già attivo.",
                 show_alert=True,
             )
-
             return
 
-        if (
-            worker_task is not None
-            and not worker_task.done()
-        ):
-
-            await query.answer(
-                "Esiste già un worker attivo.",
-                show_alert=True,
-            )
-
-            return
-
-        if (
-            not state["group_a"]
-            or not state["group_b"]
-        ):
+        if not state["group_a"] or not state["group_b"]:
 
             await query.answer(
                 "Imposta prima A e B.",
                 show_alert=True,
             )
-
             return
 
         stats = await get_today_stats()
 
-        if (
-            stats["migrated"]
-            >= state["daily_target"]
-        ):
-
-            await query.answer(
-                "🎯 Limite giornaliero raggiunto.",
-                show_alert=True,
-            )
-
-            return
-
         await query.edit_message_text(
-            "⚠️ CONFERMA AVVIO\n\n"
-
-            f"📥 Da: "
-            f"{state['group_a']['name']}\n"
-
-            f"📤 A: "
-            f"{state['group_b']['name']}\n\n"
-
-            f"🎯 Target: "
-            f"{state['daily_target']}/giorno\n"
-
-            f"✅ Confermati oggi: "
-            f"{stats['migrated']}\n"
-
-            f"⏱ Intervallo: "
-            f"{state['interval_minutes']} min\n"
-
-            f"🔎 Max tentativi: "
-            f"{state['max_attempts']}\n\n"
-
-            "Avviare il ciclo?",
-
+            "⚠️ AVVIO AUTOMATICO\n\n"
+            f"📥 {state['group_a']['name']}\n"
+            f"📤 {state['group_b']['name']}\n\n"
+            f"🎯 {state['daily_target']}/giorno\n"
+            f"✅ Oggi: {stats['migrated']}\n"
+            f"⏱ {state['interval_minutes']} min\n"
+            f"🔎 MAX {state['max_attempts']}\n\n"
+            "Confermi?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "✅ CONFERMA",
@@ -1469,48 +1555,12 @@ async def buttons(
             ]]),
         )
 
-    # =====================================================
-    # CONFERMA
-    # =====================================================
-
     elif data == "confirm_run":
 
         if state["telegram_locked"]:
-
-            await query.answer(
-                "🔒 Inviti sospesi.",
-                show_alert=True,
-            )
-
             return
 
-        if (
-            state["running"]
-            or (
-                worker_task is not None
-                and not worker_task.done()
-            )
-        ):
-
-            await query.answer(
-                "Processo già attivo.",
-                show_alert=True,
-            )
-
-            return
-
-        stats = await get_today_stats()
-
-        if (
-            stats["migrated"]
-            >= state["daily_target"]
-        ):
-
-            await query.answer(
-                "Limite già raggiunto.",
-                show_alert=True,
-            )
-
+        if state["running"]:
             return
 
         state["running"] = True
@@ -1527,33 +1577,23 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # =====================================================
-    # PAUSA
-    # =====================================================
-
     elif data == "pause":
 
-        if state["running"]:
+        state["running"] = False
 
-            state["running"] = False
-
-            await add_log(
-                "⏸ Pausa richiesta"
-            )
+        await add_log(
+            "⏸ Pausa richiesta"
+        )
 
         await query.edit_message_text(
             await home_text(),
             reply_markup=main_keyboard(),
         )
 
-    # =====================================================
-    # STOP
-    # =====================================================
-
     elif data == "stop":
 
-        state["stop_requested"] = True
         state["running"] = False
+        state["stop_requested"] = True
 
         await add_log(
             "🛑 STOP richiesto"
@@ -1565,8 +1605,178 @@ async def buttons(
         )
 
     # =====================================================
-    # STATISTICHE
+    # MEMBRI A
     # =====================================================
+
+    elif data == "members":
+
+        if not state["group_a"]:
+
+            await query.answer(
+                "Imposta prima il gruppo A.",
+                show_alert=True,
+            )
+            return
+
+        state["member_page"] = 0
+
+        await query.edit_message_text(
+            await members_page_text(0),
+            reply_markup=members_keyboard(),
+        )
+
+    elif data == "extract_members":
+
+        if not state["group_a"]:
+            return
+
+        await query.edit_message_text(
+            "⏳ Estrazione membri in corso..."
+        )
+
+        try:
+
+            count = await extract_members_a()
+
+            state["member_page"] = 0
+
+            await add_log(
+                f"👥 Estratti {count} membri da A"
+            )
+
+            await query.edit_message_text(
+                await members_page_text(0),
+                reply_markup=members_keyboard(),
+            )
+
+        except Exception as e:
+
+            await add_log(
+                f"❌ Estrazione: {type(e).__name__}",
+                "ERROR",
+            )
+
+            await query.edit_message_text(
+                f"❌ Errore estrazione: "
+                f"{type(e).__name__}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "⬅️ INDIETRO",
+                        callback_data="home",
+                    )
+                ]]),
+            )
+
+    elif data == "members_prev":
+
+        page = max(
+            0,
+            state["member_page"] - 1,
+        )
+
+        await query.edit_message_text(
+            await members_page_text(page),
+            reply_markup=members_keyboard(),
+        )
+
+    elif data == "members_next":
+
+        total = await extracted_count()
+
+        pages = max(
+            1,
+            math.ceil(total / PAGE_SIZE),
+        )
+
+        page = min(
+            pages - 1,
+            state["member_page"] + 1,
+        )
+
+        await query.edit_message_text(
+            await members_page_text(page),
+            reply_markup=members_keyboard(),
+        )
+
+    # =====================================================
+    # INVITO MANUALE
+    # =====================================================
+
+    elif data == "manual_invite":
+
+        if state["telegram_locked"]:
+
+            await query.answer(
+                "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
+            return
+
+        if not state["group_b"]:
+
+            await query.answer(
+                "Imposta prima il gruppo B.",
+                show_alert=True,
+            )
+            return
+
+        state["waiting_for"] = "manual_ids"
+
+        await query.edit_message_text(
+            "➕ INVITO MANUALE\n\n"
+            "Inserisci uno o più ID Telegram, "
+            "uno per riga.\n\n"
+            "Esempio:\n"
+            "123456789\n"
+            "987654321\n\n"
+            "Nessun invito partirà finché "
+            "non premi CONFERMA.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    elif data == "manual_confirm":
+
+        if state["telegram_locked"]:
+
+            await query.answer(
+                "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
+            return
+
+        await query.edit_message_text(
+            "⏳ Elaborazione manuale..."
+        )
+
+        results = await run_manual_invites(
+            context.application
+        )
+
+        text = (
+            "👤 RISULTATO MANUALE\n\n"
+            + (
+                "\n".join(results)
+                if results
+                else "Nessuna operazione eseguita."
+            )
+        )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ HOME",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    # ---------------- STATISTICHE ----------------
 
     elif data == "statistics":
 
@@ -1577,45 +1787,20 @@ async def buttons(
             "📊 STATISTICHE\n\n"
 
             "📅 OGGI\n"
-
-            f"✅ Confermati: "
-            f"{today['migrated']}/"
-            f"{state['daily_target']}\n"
-
-            f"🔎 Tentativi: "
-            f"{today['attempts']}\n"
-
-            f"🛡 Privacy: "
-            f"{today['privacy']}\n"
-
-            f"↪️ Già presenti: "
-            f"{today['already']}\n"
-
-            f"⚠️ Non confermati: "
-            f"{today['unconfirmed']}\n"
-
-            f"❌ Errori: "
-            f"{today['errors']}\n\n"
+            f"✅ Confermati: {today['migrated']}\n"
+            f"🔎 Tentativi: {today['attempts']}\n"
+            f"🛡 Privacy: {today['privacy']}\n"
+            f"↪️ Già presenti: {today['already']}\n"
+            f"⚠️ Non confermati: {today['unconfirmed']}\n"
+            f"❌ Errori: {today['errors']}\n\n"
 
             "📈 TOTALI\n"
-
-            f"✅ Confermati: "
-            f"{total['migrated']}\n"
-
-            f"🔎 Tentativi: "
-            f"{total['attempts']}\n"
-
-            f"🛡 Privacy: "
-            f"{total['privacy']}\n"
-
-            f"↪️ Già presenti: "
-            f"{total['already']}\n"
-
-            f"⚠️ Non confermati: "
-            f"{total['unconfirmed']}\n"
-
-            f"❌ Errori: "
-            f"{total['errors']}"
+            f"✅ Confermati: {total['migrated']}\n"
+            f"🔎 Tentativi: {total['attempts']}\n"
+            f"🛡 Privacy: {total['privacy']}\n"
+            f"↪️ Già presenti: {total['already']}\n"
+            f"⚠️ Non confermati: {total['unconfirmed']}\n"
+            f"❌ Errori: {total['errors']}"
         )
 
         await query.edit_message_text(
@@ -1628,15 +1813,11 @@ async def buttons(
             ]]),
         )
 
-    # =====================================================
-    # LOG
-    # =====================================================
+    # ---------------- LOG ----------------
 
     elif data == "logs":
 
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        async with aiosqlite.connect(DB_PATH) as db:
 
             cursor = await db.execute(
                 """
@@ -1659,41 +1840,25 @@ async def buttons(
                     created_at
                 )
 
-                if dt.tzinfo is None:
+                if dt.tzinfo:
+                    dt = dt.astimezone(ITALY_TZ)
 
-                    dt = dt.replace(
-                        tzinfo=ITALY_TZ
-                    )
-
-                else:
-
-                    dt = dt.astimezone(
-                        ITALY_TZ
-                    )
-
-                stamp = dt.strftime(
-                    "%H:%M:%S"
-                )
+                stamp = dt.strftime("%H:%M:%S")
 
             except Exception:
-
                 stamp = "--:--:--"
 
             lines.append(
                 f"{stamp}  {message}"
             )
 
-        text = (
+        await query.edit_message_text(
             "📋 ULTIMI EVENTI\n\n"
             + (
                 "\n".join(lines)
                 if lines
                 else "Nessun evento."
-            )
-        )
-
-        await query.edit_message_text(
-            text,
+            ),
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
@@ -1716,16 +1881,10 @@ async def buttons(
             ]),
         )
 
-    # =====================================================
-    # PULISCI LOG
-    # =====================================================
-
     elif data == "clear_logs_confirm":
 
         await query.edit_message_text(
-            "⚠️ Cancellare il LOG?\n\n"
-            "Statistiche e utenti processati "
-            "rimarranno memorizzati.",
+            "⚠️ Cancellare il LOG?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🗑 SÌ",
@@ -1746,23 +1905,20 @@ async def buttons(
             "✅ Log cancellato.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    "⬅️ INDIETRO",
+                    "⬅️ HOME",
                     callback_data="home",
                 )
             ]]),
         )
 
-    # =====================================================
-    # SBLOCCO MANUALE
-    # =====================================================
+    # ---------------- SBLOCCO ----------------
 
     elif data == "unlock_confirm":
 
         await query.edit_message_text(
             "⚠️ RIABILITARE GLI INVITI?\n\n"
-            "Procedi solo dopo aver verificato "
-            "che Telegram consenta nuovamente "
-            "gli inviti.",
+            "Usalo solo dopo aver verificato "
+            "che la restrizione Telegram sia cessata.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🔓 CONFERMA",
@@ -1793,13 +1949,10 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # =====================================================
-    # HOME
-    # =====================================================
-
     elif data == "home":
 
         state["waiting_for"] = None
+        state["manual_ids"] = []
 
         await query.edit_message_text(
             await home_text(),
@@ -1811,7 +1964,7 @@ async def buttons(
 
 
 # =========================================================
-# INPUT A/B
+# INPUT TESTUALE
 # =========================================================
 
 async def text_input(
@@ -1825,6 +1978,75 @@ async def text_input(
         return
 
     target = state["waiting_for"]
+
+    # =====================================================
+    # ID MANUALI
+    # =====================================================
+
+    if target == "manual_ids":
+
+        raw = update.message.text
+
+        # Accetta righe, spazi e virgole
+        raw = raw.replace(",", " ")
+
+        parts = raw.split()
+
+        ids = []
+
+        for part in parts:
+
+            part = part.strip()
+
+            if part.lstrip("-").isdigit():
+
+                value = int(part)
+
+                if value not in ids:
+                    ids.append(value)
+
+        if not ids:
+
+            await update.message.reply_text(
+                "❌ Non ho trovato ID Telegram validi."
+            )
+            return
+
+        # Limite per conferma manuale
+        ids = ids[:20]
+
+        state["manual_ids"] = ids
+        state["waiting_for"] = None
+
+        lines = "\n".join(
+            f"• {user_id}"
+            for user_id in ids
+        )
+
+        await update.message.reply_text(
+            "👤 CONFERMA INVITO MANUALE\n\n"
+            f"📤 Destinazione:\n"
+            f"{state['group_b']['name']}\n\n"
+            f"Utenti selezionati: {len(ids)}\n\n"
+            f"{lines}\n\n"
+            "Procedere?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "✅ CONFERMA",
+                    callback_data="manual_confirm",
+                ),
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="home",
+                ),
+            ]]),
+        )
+
+        return
+
+    # =====================================================
+    # GRUPPI A/B
+    # =====================================================
 
     if target not in ("a", "b"):
         return
@@ -1849,7 +2071,6 @@ async def text_input(
             await update.message.reply_text(
                 "❌ A e B devono essere diversi."
             )
-
             return
 
         if target == "a":
@@ -1928,7 +2149,7 @@ async def post_init(application):
     )
 
     logger.info(
-        "Timezone: Europe/Rome"
+        "BestPrice Member Manager V4.3"
     )
 
 
@@ -1975,7 +2196,7 @@ def main():
     )
 
     logger.info(
-        "BestPrice Member Manager V4.2 avviato"
+        "BestPrice Member Manager V4.3 avviato"
     )
 
     application.run_polling()
