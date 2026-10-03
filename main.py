@@ -700,10 +700,15 @@ async def verify_in_destination(
             )
         )
 
-        return True
+        return True, None, None
 
-    except Exception:
-        return False
+    except Exception as e:
+
+        return (
+            False,
+            type(e).__name__,
+            str(e)[:220],
+        )
 
 
 # =========================================================
@@ -1376,16 +1381,33 @@ async def invite_one(
             )
         )
 
-        await asyncio.sleep(3)
+        await add_log(
+            f"📨 {mode} — {display} — "
+            "InviteToChannelRequest completata senza eccezioni"
+        )
 
-        confirmed = (
-            await verify_in_destination(
-                destination,
-                user,
-            )
+        await add_log(
+            f"🔍 {mode} — {display} — "
+            "verifica presenza tra 10 secondi"
+        )
+
+        await asyncio.sleep(10)
+
+        (
+            confirmed,
+            verify_error,
+            verify_message,
+        ) = await verify_in_destination(
+            destination,
+            user,
         )
 
         if confirmed:
+
+            await add_log(
+                f"🔍 {mode} — {display} — "
+                "GetParticipantRequest: PRESENTE"
+            )
 
             await increment_stat(
                 "migrated"
@@ -1417,9 +1439,13 @@ async def invite_one(
         )
 
         await add_log(
-            f"⚠️ {mode} — "
-            f"Non confermato: "
-            f"{display}",
+            f"⚠️ {mode} — {display} — "
+            f"verifica fallita: {verify_error or 'Sconosciuto'}"
+            + (
+                f": {verify_message}"
+                if verify_message
+                else ""
+            ),
             "WARNING",
         )
 
@@ -2946,7 +2972,7 @@ async def post_init(
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.3.4"
+        "V4.3.5"
     )
 
 
@@ -2997,7 +3023,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.3.4 avviato"
+        "V4.3.5 avviato"
     )
 
     application.run_polling()
