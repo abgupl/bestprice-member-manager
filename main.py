@@ -45,7 +45,6 @@ ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 
 DB_PATH = "/data/manager.db"
 ITALY_TZ = ZoneInfo("Europe/Rome")
-
 PAGE_SIZE = 20
 
 logging.basicConfig(
@@ -88,6 +87,15 @@ state = {
     "member_page": 0,
     "manual_ids": [],
 
+    "extract_diag": {
+        "telegram_count": 0,
+        "received": 0,
+        "bots": 0,
+        "deleted": 0,
+        "duplicates": 0,
+        "saved": 0,
+    },
+
     "last_event": "Nessuna attività",
 }
 
@@ -96,7 +104,7 @@ worker_lock = asyncio.Lock()
 
 
 # =========================================================
-# TEMPO
+# DATA / ORA
 # =========================================================
 
 def now_it():
@@ -167,15 +175,20 @@ async def init_db():
                 username TEXT,
                 display_name TEXT,
                 extracted_at TEXT NOT NULL,
-                PRIMARY KEY(source_id, user_id)
+                PRIMARY KEY (
+                    source_id,
+                    user_id
+                )
             )
         """)
 
-        # Compatibilità V4.1
+        # Compatibilità con database precedenti
         try:
             await db.execute(
-                "ALTER TABLE daily_stats "
-                "ADD COLUMN unconfirmed INTEGER DEFAULT 0"
+                """
+                ALTER TABLE daily_stats
+                ADD COLUMN unconfirmed INTEGER DEFAULT 0
+                """
             )
         except Exception:
             pass
@@ -209,7 +222,11 @@ async def get_setting(key, default=None):
     async with aiosqlite.connect(DB_PATH) as db:
 
         cursor = await db.execute(
-            "SELECT value FROM settings WHERE key = ?",
+            """
+            SELECT value
+            FROM settings
+            WHERE key = ?
+            """,
             (key,),
         )
 
@@ -220,39 +237,82 @@ async def get_setting(key, default=None):
 
 async def save_group(prefix, group):
 
-    await set_setting(f"{prefix}_id", group["id"])
-    await set_setting(f"{prefix}_name", group["name"])
-    await set_setting(f"{prefix}_input", group["input"])
+    await set_setting(
+        f"{prefix}_id",
+        group["id"],
+    )
+
+    await set_setting(
+        f"{prefix}_name",
+        group["name"],
+    )
+
+    await set_setting(
+        f"{prefix}_input",
+        group["input"],
+    )
 
 
 async def load_settings():
 
     state["daily_target"] = int(
-        await get_setting("daily_target", "1")
+        await get_setting(
+            "daily_target",
+            "1",
+        )
     )
 
     state["max_attempts"] = int(
-        await get_setting("max_attempts", "3")
+        await get_setting(
+            "max_attempts",
+            "3",
+        )
     )
 
     state["interval_minutes"] = int(
-        await get_setting("interval_minutes", "10")
+        await get_setting(
+            "interval_minutes",
+            "10",
+        )
     )
 
     state["telegram_locked"] = (
-        await get_setting("telegram_locked", "0") == "1"
+        await get_setting(
+            "telegram_locked",
+            "0",
+        ) == "1"
     )
 
-    for prefix in ("group_a", "group_b"):
+    for prefix in (
+        "group_a",
+        "group_b",
+    ):
 
-        group_id = await get_setting(f"{prefix}_id")
-        name = await get_setting(f"{prefix}_name")
-        input_value = await get_setting(f"{prefix}_input")
+        group_id = await get_setting(
+            f"{prefix}_id"
+        )
 
-        if group_id and name and input_value:
+        name = await get_setting(
+            f"{prefix}_name"
+        )
 
-            if str(input_value).lstrip("-").isdigit():
-                input_value = int(input_value)
+        input_value = await get_setting(
+            f"{prefix}_input"
+        )
+
+        if (
+            group_id
+            and name
+            and input_value
+        ):
+
+            if str(
+                input_value
+            ).lstrip("-").isdigit():
+
+                input_value = int(
+                    input_value
+                )
 
             state[prefix] = {
                 "id": int(group_id),
@@ -271,7 +331,8 @@ async def ensure_today():
 
         await db.execute(
             """
-            INSERT OR IGNORE INTO daily_stats(day)
+            INSERT OR IGNORE
+            INTO daily_stats(day)
             VALUES (?)
             """,
             (today_it(),),
@@ -280,7 +341,10 @@ async def ensure_today():
         await db.commit()
 
 
-async def increment_stat(field, amount=1):
+async def increment_stat(
+    field,
+    amount=1,
+):
 
     allowed = {
         "migrated",
@@ -292,7 +356,9 @@ async def increment_stat(field, amount=1):
     }
 
     if field not in allowed:
-        return
+        raise ValueError(
+            "Campo statistico non valido"
+        )
 
     await ensure_today()
 
@@ -304,7 +370,10 @@ async def increment_stat(field, amount=1):
             SET {field} = {field} + ?
             WHERE day = ?
             """,
-            (amount, today_it()),
+            (
+                amount,
+                today_it(),
+            ),
         )
 
         await db.commit()
@@ -374,7 +443,10 @@ async def get_total_stats():
 # LOG
 # =========================================================
 
-async def add_log(message, level="INFO"):
+async def add_log(
+    message,
+    level="INFO",
+):
 
     state["last_event"] = message
 
@@ -382,7 +454,11 @@ async def add_log(message, level="INFO"):
 
         await db.execute(
             """
-            INSERT INTO logs(created_at, level, message)
+            INSERT INTO logs(
+                created_at,
+                level,
+                message
+            )
             VALUES (?, ?, ?)
             """,
             (
@@ -394,38 +470,66 @@ async def add_log(message, level="INFO"):
 
         await db.commit()
 
-    logger.info("%s | %s", level, message)
+    logger.info(
+        "%s | %s",
+        level,
+        message,
+    )
 
 
 async def clear_logs():
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM logs")
+
+        await db.execute(
+            "DELETE FROM logs"
+        )
+
         await db.commit()
 
-    state["last_event"] = "Log cancellato"
+    state["last_event"] = (
+        "Log cancellato"
+    )
 
 
 # =========================================================
 # PROCESSATI
 # =========================================================
 
-async def save_processed(user, status):
+async def save_processed(
+    user,
+    status,
+):
 
-    username = getattr(user, "username", None)
+    username = getattr(
+        user,
+        "username",
+        None,
+    )
 
     display_name = " ".join(
-        x for x in [
-            getattr(user, "first_name", None),
-            getattr(user, "last_name", None),
-        ] if x
+        value
+        for value in [
+            getattr(
+                user,
+                "first_name",
+                None,
+            ),
+            getattr(
+                user,
+                "last_name",
+                None,
+            ),
+        ]
+        if value
     )
 
     async with aiosqlite.connect(DB_PATH) as db:
 
         await db.execute(
             """
-            INSERT OR REPLACE INTO processed
+            INSERT OR REPLACE
+            INTO processed
             (
                 user_id,
                 source_id,
@@ -471,18 +575,22 @@ async def was_processed(user_id):
             ),
         )
 
-        return await cursor.fetchone() is not None
+        row = await cursor.fetchone()
+
+    return row is not None
 
 
 # =========================================================
-# SICUREZZA
+# SICUREZZA BOT
 # =========================================================
 
 def is_admin(update):
 
+    user = update.effective_user
+
     return (
-        update.effective_user is not None
-        and update.effective_user.id == ADMIN_USER_ID
+        user is not None
+        and user.id == ADMIN_USER_ID
     )
 
 
@@ -512,40 +620,74 @@ async def resolve_group(value):
 
     if "t.me/" in value:
 
-        value = value.split("t.me/", 1)[1]
-        value = value.split("?", 1)[0]
+        value = value.split(
+            "t.me/",
+            1,
+        )[1]
+
+        value = value.split(
+            "?",
+            1,
+        )[0]
+
         value = value.strip("/")
 
         if value.startswith("+"):
+
             raise ValueError(
                 "Per gruppi privati usa l'ID."
             )
 
-        value = "@" + value.lstrip("@")
+        value = (
+            "@"
+            + value.lstrip("@")
+        )
 
     if value.lstrip("-").isdigit():
+
         value = int(value)
 
-    entity = await user_client.get_entity(value)
+    entity = await user_client.get_entity(
+        value
+    )
 
-    if not isinstance(entity, (Channel, Chat)):
-        raise ValueError("Non è un gruppo Telegram.")
+    if not isinstance(
+        entity,
+        (Channel, Chat),
+    ):
 
-    if isinstance(entity, Channel) and not entity.megagroup:
-        raise ValueError("È un canale, non un gruppo.")
+        raise ValueError(
+            "Non è un gruppo Telegram."
+        )
+
+    if (
+        isinstance(entity, Channel)
+        and not entity.megagroup
+    ):
+
+        raise ValueError(
+            "È un canale, non un gruppo."
+        )
 
     return {
         "id": entity.id,
-        "name": getattr(entity, "title", "Gruppo"),
+        "name": getattr(
+            entity,
+            "title",
+            "Gruppo",
+        ),
         "input": value,
     }
 
 
 # =========================================================
-# MEMBERSHIP B
+# VERIFICA MEMBRO IN B
 # =========================================================
 
-async def verify_in_destination(destination, user):
+async def verify_in_destination(
+    destination,
+    user,
+):
 
     try:
 
@@ -563,18 +705,27 @@ async def verify_in_destination(destination, user):
 
 
 # =========================================================
-# TIMER
+# TIMER INTERROMPIBILE
 # =========================================================
 
-async def interruptible_wait(minutes):
+async def interruptible_wait(
+    minutes,
+):
 
-    for _ in range(minutes * 60):
+    total_seconds = (
+        minutes * 60
+    )
+
+    for _ in range(
+        total_seconds
+    ):
 
         if (
             not state["running"]
             or state["stop_requested"]
             or state["telegram_locked"]
         ):
+
             return False
 
         await asyncio.sleep(1)
@@ -589,7 +740,10 @@ async def interruptible_wait(minutes):
 async def extract_members_a():
 
     if not state["group_a"]:
-        raise ValueError("Gruppo A non impostato")
+
+        raise ValueError(
+            "Gruppo A non impostato"
+        )
 
     source = await user_client.get_entity(
         state["group_a"]["input"]
@@ -597,26 +751,116 @@ async def extract_members_a():
 
     me = await user_client.get_me()
 
+    diag = {
+        "telegram_count": 0,
+        "received": 0,
+        "bots": 0,
+        "deleted": 0,
+        "duplicates": 0,
+        "saved": 0,
+    }
+
+    # -----------------------------------------
+    # CONTEGGIO DICHIARATO DA TELEGRAM
+    # -----------------------------------------
+
+    try:
+
+        participants = (
+            await user_client.get_participants(
+                source,
+                limit=1,
+            )
+        )
+
+        if (
+            participants.total
+            is not None
+        ):
+
+            diag[
+                "telegram_count"
+            ] = participants.total
+
+    except Exception as e:
+
+        logger.warning(
+            "Impossibile leggere "
+            "participants.total: %s",
+            type(e).__name__,
+        )
+
+    # -----------------------------------------
+    # ESTRAZIONE EFFETTIVA
+    # -----------------------------------------
+
     rows = []
+    seen_ids = set()
 
-    async for user in user_client.iter_participants(source):
+    async for user in (
+        user_client.iter_participants(
+            source,
+            aggressive=False,
+        )
+    ):
 
+        diag["received"] += 1
+
+        # Esclude il nostro account
         if user.id == me.id:
             continue
 
-        if getattr(user, "bot", False):
+        # Esclude bot
+        if getattr(
+            user,
+            "bot",
+            False,
+        ):
+
+            diag["bots"] += 1
             continue
 
-        if getattr(user, "deleted", False):
+        # Esclude eliminati
+        if getattr(
+            user,
+            "deleted",
+            False,
+        ):
+
+            diag["deleted"] += 1
             continue
 
-        username = getattr(user, "username", None)
+        # Evita duplicati
+        if user.id in seen_ids:
+
+            diag["duplicates"] += 1
+            continue
+
+        seen_ids.add(
+            user.id
+        )
+
+        username = getattr(
+            user,
+            "username",
+            None,
+        )
 
         display_name = " ".join(
-            x for x in [
-                getattr(user, "first_name", None),
-                getattr(user, "last_name", None),
-            ] if x
+            value
+            for value in [
+                getattr(
+                    user,
+                    "first_name",
+                    None,
+                ),
+                getattr(
+                    user,
+                    "last_name",
+                    None,
+                ),
+            ]
+            if value
         )
 
         rows.append(
@@ -629,34 +873,59 @@ async def extract_members_a():
             )
         )
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    # -----------------------------------------
+    # DATABASE
+    # -----------------------------------------
+
+    async with aiosqlite.connect(
+        DB_PATH
+    ) as db:
 
         await db.execute(
             """
             DELETE FROM extracted_members
             WHERE source_id = ?
             """,
-            (state["group_a"]["id"],),
+            (
+                state["group_a"]["id"],
+            ),
         )
 
-        await db.executemany(
-            """
-            INSERT OR REPLACE INTO extracted_members
-            (
-                source_id,
-                user_id,
-                username,
-                display_name,
-                extracted_at
+        if rows:
+
+            await db.executemany(
+                """
+                INSERT OR REPLACE
+                INTO extracted_members
+                (
+                    source_id,
+                    user_id,
+                    username,
+                    display_name,
+                    extracted_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
             )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
 
         await db.commit()
 
-    return len(rows)
+    diag["saved"] = len(rows)
+
+    state["extract_diag"] = diag
+
+    await add_log(
+        "👥 ESTRAZIONE — "
+        f"Telegram: "
+        f"{diag['telegram_count']} | "
+        f"Ricevuti: "
+        f"{diag['received']} | "
+        f"Salvati: "
+        f"{diag['saved']}"
+    )
+
+    return diag
 
 
 async def extracted_count():
@@ -664,7 +933,9 @@ async def extracted_count():
     if not state["group_a"]:
         return 0
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(
+        DB_PATH
+    ) as db:
 
         cursor = await db.execute(
             """
@@ -672,7 +943,9 @@ async def extracted_count():
             FROM extracted_members
             WHERE source_id = ?
             """,
-            (state["group_a"]["id"],),
+            (
+                state["group_a"]["id"],
+            ),
         )
 
         row = await cursor.fetchone()
@@ -682,9 +955,13 @@ async def extracted_count():
 
 async def get_members_page(page):
 
-    offset = page * PAGE_SIZE
+    offset = (
+        page * PAGE_SIZE
+    )
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(
+        DB_PATH
+    ) as db:
 
         cursor = await db.execute(
             """
@@ -695,7 +972,11 @@ async def get_members_page(page):
             FROM extracted_members
             WHERE source_id = ?
             ORDER BY
-                CASE WHEN username IS NULL THEN 1 ELSE 0 END,
+                CASE
+                    WHEN username IS NULL
+                    THEN 1
+                    ELSE 0
+                END,
                 username COLLATE NOCASE,
                 display_name COLLATE NOCASE
             LIMIT ? OFFSET ?
@@ -707,7 +988,9 @@ async def get_members_page(page):
             ),
         )
 
-        return await cursor.fetchall()
+        rows = await cursor.fetchall()
+
+    return rows
 
 
 async def members_page_text(page):
@@ -724,44 +1007,70 @@ async def members_page_text(page):
 
     pages = max(
         1,
-        math.ceil(total / PAGE_SIZE),
+        math.ceil(
+            total / PAGE_SIZE
+        ),
     )
 
     page = max(
         0,
-        min(page, pages - 1),
+        min(
+            page,
+            pages - 1,
+        ),
     )
 
     state["member_page"] = page
 
-    rows = await get_members_page(page)
+    rows = await get_members_page(
+        page
+    )
 
     lines = []
 
-    start_number = page * PAGE_SIZE + 1
+    start_number = (
+        page * PAGE_SIZE
+        + 1
+    )
 
     for i, row in enumerate(
         rows,
         start=start_number,
     ):
 
-        user_id, username, name = row
+        (
+            user_id,
+            username,
+            name,
+        ) = row
 
         if username:
-            label = f"@{username}"
+
+            label = (
+                f"@{username}"
+            )
+
         elif name:
+
             label = name
+
         else:
-            label = "Senza username"
+
+            label = (
+                "Senza username"
+            )
 
         lines.append(
-            f"{i}. {label} — {user_id}"
+            f"{i}. "
+            f"{label} — "
+            f"{user_id}"
         )
 
     return (
         "👥 MEMBRI GRUPPO A\n\n"
         f"Totale: {total}\n"
-        f"Pagina: {page + 1}/{pages}\n\n"
+        f"Pagina: "
+        f"{page + 1}/{pages}\n\n"
         + "\n".join(lines)
     )
 
@@ -805,12 +1114,17 @@ def members_keyboard():
 def group_label(group):
 
     if not group:
+
         return "Non impostato"
 
     name = group["name"]
 
     if len(name) > 24:
-        return name[:21] + "..."
+
+        return (
+            name[:21]
+            + "..."
+        )
 
     return name
 
@@ -818,6 +1132,8 @@ def group_label(group):
 def main_keyboard():
 
     keyboard = [
+
+        # GRUPPI
         [
             InlineKeyboardButton(
                 "📥 GRUPPO A",
@@ -829,14 +1145,16 @@ def main_keyboard():
             ),
         ],
 
-        # AUTO
+        # TARGET
         [
             InlineKeyboardButton(
                 "➖",
                 callback_data="target_minus",
             ),
             InlineKeyboardButton(
-                f"🎯 {state['daily_target']}/GIORNO",
+                f"🎯 "
+                f"{state['daily_target']}"
+                f"/GIORNO",
                 callback_data="noop",
             ),
             InlineKeyboardButton(
@@ -844,13 +1162,17 @@ def main_keyboard():
                 callback_data="target_plus",
             ),
         ],
+
+        # TIMER
         [
             InlineKeyboardButton(
                 "➖",
                 callback_data="interval_minus",
             ),
             InlineKeyboardButton(
-                f"⏱ {state['interval_minutes']} MIN",
+                f"⏱ "
+                f"{state['interval_minutes']} "
+                f"MIN",
                 callback_data="noop",
             ),
             InlineKeyboardButton(
@@ -858,13 +1180,16 @@ def main_keyboard():
                 callback_data="interval_plus",
             ),
         ],
+
+        # MAX
         [
             InlineKeyboardButton(
                 "➖",
                 callback_data="attempts_minus",
             ),
             InlineKeyboardButton(
-                f"🔎 MAX {state['max_attempts']}",
+                f"🔎 MAX "
+                f"{state['max_attempts']}",
                 callback_data="noop",
             ),
             InlineKeyboardButton(
@@ -872,12 +1197,15 @@ def main_keyboard():
                 callback_data="attempts_plus",
             ),
         ],
+
+        # AUTO
         [
             InlineKeyboardButton(
                 "🤖 AVVIA AUTOMATICO",
                 callback_data="start_run",
-            ),
+            )
         ],
+
         [
             InlineKeyboardButton(
                 "⏸ PAUSA",
@@ -901,6 +1229,7 @@ def main_keyboard():
             ),
         ],
 
+        # INFO
         [
             InlineKeyboardButton(
                 "📊 STATISTICHE",
@@ -922,7 +1251,9 @@ def main_keyboard():
             )
         ])
 
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        keyboard
+    )
 
 
 async def home_text():
@@ -936,42 +1267,77 @@ async def home_text():
     )
 
     if state["telegram_locked"]:
-        status = "🔒 INVITI SOSPESI"
+
+        status = (
+            "🔒 INVITI SOSPESI"
+        )
 
     elif state["running"]:
-        status = "🟢 AUTOMATICO ATTIVO"
+
+        status = (
+            "🟢 AUTOMATICO ATTIVO"
+        )
 
     else:
+
         status = "🔴 FERMO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.3\n\n"
+        "👥 BESTPRICE MEMBER MANAGER "
+        "V4.3.1\n\n"
 
-        f"📥 A: {group_label(state['group_a'])}\n"
-        f"📤 B: {group_label(state['group_b'])}\n\n"
+        f"📥 A: "
+        f"{group_label(state['group_a'])}\n"
+
+        f"📤 B: "
+        f"{group_label(state['group_b'])}\n\n"
 
         "🤖 AUTOMATICO\n"
-        f"🎯 Target: {state['daily_target']}/giorno\n"
-        f"⏱ Intervallo: {state['interval_minutes']} min\n"
-        f"🔎 MAX: {state['max_attempts']}\n\n"
+
+        f"🎯 Target: "
+        f"{state['daily_target']}/giorno\n"
+
+        f"⏱ Intervallo: "
+        f"{state['interval_minutes']} min\n"
+
+        f"🔎 MAX: "
+        f"{state['max_attempts']}\n\n"
 
         "📅 OGGI\n"
-        f"✅ Confermati: {stats['migrated']}\n"
-        f"🎯 Rimanenti: {remaining}\n"
-        f"🛡 Privacy: {stats['privacy']}\n"
-        f"↪️ Già presenti: {stats['already']}\n"
-        f"⚠️ Non confermati: {stats['unconfirmed']}\n"
-        f"❌ Errori: {stats['errors']}\n\n"
+
+        f"✅ Confermati: "
+        f"{stats['migrated']}\n"
+
+        f"🎯 Rimanenti: "
+        f"{remaining}\n"
+
+        f"🔎 Tentativi: "
+        f"{stats['attempts']}\n"
+
+        f"🛡 Privacy: "
+        f"{stats['privacy']}\n"
+
+        f"↪️ Già presenti: "
+        f"{stats['already']}\n"
+
+        f"⚠️ Non confermati: "
+        f"{stats['unconfirmed']}\n"
+
+        f"❌ Errori: "
+        f"{stats['errors']}\n\n"
 
         f"{status}\n\n"
 
-        f"🕐 {now_it().strftime('%H:%M:%S')}\n"
-        f"Ultimo evento:\n{state['last_event']}"
+        f"🕐 "
+        f"{now_it().strftime('%H:%M:%S')}\n"
+
+        "Ultimo evento:\n"
+        f"{state['last_event']}"
     )
 
 
 # =========================================================
-# GESTIONE RISULTATO INVITO
+# INVITO SINGOLO
 # =========================================================
 
 async def invite_one(
@@ -982,14 +1348,21 @@ async def invite_one(
 
     display = (
         f"@{user.username}"
-        if getattr(user, "username", None)
+        if getattr(
+            user,
+            "username",
+            None,
+        )
         else f"ID {user.id}"
     )
 
-    await increment_stat("attempts")
+    await increment_stat(
+        "attempts"
+    )
 
     await add_log(
-        f"{mode} — Tentativo: {display}"
+        f"{mode} — Tentativo: "
+        f"{display}"
     )
 
     try:
@@ -1003,14 +1376,18 @@ async def invite_one(
 
         await asyncio.sleep(3)
 
-        confirmed = await verify_in_destination(
-            destination,
-            user,
+        confirmed = (
+            await verify_in_destination(
+                destination,
+                user,
+            )
         )
 
         if confirmed:
 
-            await increment_stat("migrated")
+            await increment_stat(
+                "migrated"
+            )
 
             await save_processed(
                 user,
@@ -1018,12 +1395,19 @@ async def invite_one(
             )
 
             await add_log(
-                f"✅ {mode} — Confermato: {display}"
+                f"✅ {mode} — "
+                f"Confermato: "
+                f"{display}"
             )
 
-            return "confirmed", display
+            return (
+                "confirmed",
+                display,
+            )
 
-        await increment_stat("unconfirmed")
+        await increment_stat(
+            "unconfirmed"
+        )
 
         await save_processed(
             user,
@@ -1031,15 +1415,22 @@ async def invite_one(
         )
 
         await add_log(
-            f"⚠️ {mode} — Non confermato: {display}",
+            f"⚠️ {mode} — "
+            f"Non confermato: "
+            f"{display}",
             "WARNING",
         )
 
-        return "unconfirmed", display
+        return (
+            "unconfirmed",
+            display,
+        )
 
     except UserAlreadyParticipantError:
 
-        await increment_stat("already")
+        await increment_stat(
+            "already"
+        )
 
         await save_processed(
             user,
@@ -1047,17 +1438,24 @@ async def invite_one(
         )
 
         await add_log(
-            f"↪️ {mode} — Già presente: {display}"
+            f"↪️ {mode} — "
+            f"Già presente: "
+            f"{display}"
         )
 
-        return "already", display
+        return (
+            "already",
+            display,
+        )
 
     except (
         UserPrivacyRestrictedError,
         UserNotMutualContactError,
     ):
 
-        await increment_stat("privacy")
+        await increment_stat(
+            "privacy"
+        )
 
         await save_processed(
             user,
@@ -1065,21 +1463,30 @@ async def invite_one(
         )
 
         await add_log(
-            f"🛡 {mode} — Privacy: {display}"
+            f"🛡 {mode} — "
+            f"Privacy: "
+            f"{display}"
         )
 
-        return "privacy", display
+        return (
+            "privacy",
+            display,
+        )
 
     except FloodWaitError as e:
 
         state["running"] = False
 
         await add_log(
-            f"⏳ FloodWait {e.seconds}s. STOP.",
+            f"⏳ FloodWait "
+            f"{e.seconds}s. STOP.",
             "WARNING",
         )
 
-        return "flood_wait", display
+        return (
+            "flood_wait",
+            display,
+        )
 
     except PeerFloodError:
 
@@ -1092,31 +1499,43 @@ async def invite_one(
         )
 
         await add_log(
-            "🔒 Telegram ha rifiutato ulteriori "
-            "inviti. Automazione bloccata.",
+            "🔒 Telegram ha rifiutato "
+            "ulteriori inviti. "
+            "Automazione bloccata.",
             "WARNING",
         )
 
-        return "peer_flood", display
+        return (
+            "peer_flood",
+            display,
+        )
 
     except Exception as e:
 
-        await increment_stat("errors")
+        await increment_stat(
+            "errors"
+        )
 
         await add_log(
-            f"❌ {mode} — {display}: "
+            f"❌ {mode} — "
+            f"{display}: "
             f"{type(e).__name__}",
             "ERROR",
         )
 
-        return "error", display
+        return (
+            "error",
+            display,
+        )
 
 
 # =========================================================
-# AUTOMATICO
+# WORKER AUTOMATICO
 # =========================================================
 
-async def migration_worker(application):
+async def migration_worker(
+    application,
+):
 
     global worker_task
 
@@ -1138,18 +1557,24 @@ async def migration_worker(application):
 
         try:
 
-            source = await user_client.get_entity(
-                state["group_a"]["input"]
+            source = (
+                await user_client.get_entity(
+                    state["group_a"]["input"]
+                )
             )
 
-            destination = await user_client.get_entity(
-                state["group_b"]["input"]
+            destination = (
+                await user_client.get_entity(
+                    state["group_b"]["input"]
+                )
             )
 
             me = await user_client.get_me()
 
-            async for user in user_client.iter_participants(
-                source
+            async for user in (
+                user_client.iter_participants(
+                    source
+                )
             ):
 
                 if (
@@ -1159,7 +1584,9 @@ async def migration_worker(application):
                 ):
                     break
 
-                stats = await get_today_stats()
+                stats = (
+                    await get_today_stats()
+                )
 
                 if (
                     stats["migrated"]
@@ -1167,7 +1594,8 @@ async def migration_worker(application):
                 ):
 
                     await add_log(
-                        "🎯 Obiettivo giornaliero raggiunto"
+                        "🎯 Obiettivo "
+                        "giornaliero raggiunto"
                     )
 
                     break
@@ -1178,7 +1606,8 @@ async def migration_worker(application):
                 ):
 
                     await add_log(
-                        "🛑 MAX tentativi raggiunto"
+                        "🛑 MAX tentativi "
+                        "raggiunto"
                     )
 
                     break
@@ -1186,21 +1615,33 @@ async def migration_worker(application):
                 if user.id == me.id:
                     continue
 
-                if getattr(user, "bot", False):
+                if getattr(
+                    user,
+                    "bot",
+                    False,
+                ):
                     continue
 
-                if getattr(user, "deleted", False):
+                if getattr(
+                    user,
+                    "deleted",
+                    False,
+                ):
                     continue
 
-                if await was_processed(user.id):
+                if await was_processed(
+                    user.id
+                ):
                     continue
 
                 attempts_cycle += 1
 
-                result, display = await invite_one(
-                    destination,
-                    user,
-                    "🤖 AUTO",
+                result, display = (
+                    await invite_one(
+                        destination,
+                        user,
+                        "🤖 AUTO",
+                    )
                 )
 
                 if result in (
@@ -1209,26 +1650,37 @@ async def migration_worker(application):
                 ):
                     break
 
-                stats = await get_today_stats()
+                stats = (
+                    await get_today_stats()
+                )
 
                 if (
                     stats["migrated"]
                     >= state["daily_target"]
                 ):
+
                     await add_log(
-                        "🎯 Obiettivo giornaliero raggiunto"
+                        "🎯 Obiettivo "
+                        "giornaliero raggiunto"
                     )
+
                     break
 
                 if state["running"]:
 
                     await add_log(
-                        f"⏱ Prossima operazione tra "
-                        f"{state['interval_minutes']} minuti"
+                        "⏱ Prossima operazione "
+                        f"tra "
+                        f"{state['interval_minutes']} "
+                        "minuti"
                     )
 
-                    completed = await interruptible_wait(
-                        state["interval_minutes"]
+                    completed = (
+                        await interruptible_wait(
+                            state[
+                                "interval_minutes"
+                            ]
+                        )
                     )
 
                     if not completed:
@@ -1237,7 +1689,8 @@ async def migration_worker(application):
         except Exception as e:
 
             await add_log(
-                f"❌ Errore AUTO: {type(e).__name__}",
+                f"❌ Errore AUTO: "
+                f"{type(e).__name__}",
                 "ERROR",
             )
 
@@ -1257,18 +1710,22 @@ async def migration_worker(application):
 
 
 # =========================================================
-# INVITO MANUALE
+# INVITI MANUALI
 # =========================================================
 
-async def run_manual_invites(application):
+async def run_manual_invites():
 
-    ids = list(state["manual_ids"])
+    ids = list(
+        state["manual_ids"]
+    )
 
     if not ids:
         return []
 
-    destination = await user_client.get_entity(
-        state["group_b"]["input"]
+    destination = (
+        await user_client.get_entity(
+            state["group_b"]["input"]
+        )
     )
 
     results = []
@@ -1280,28 +1737,34 @@ async def run_manual_invites(application):
 
         try:
 
-            user = await user_client.get_entity(
-                user_id
+            user = (
+                await user_client.get_entity(
+                    user_id
+                )
             )
 
         except Exception:
 
             await add_log(
-                f"❌ 👤 MANUALE — ID {user_id} "
-                f"non risolvibile",
+                "❌ 👤 MANUALE — "
+                f"ID {user_id} "
+                "non risolvibile",
                 "ERROR",
             )
 
             results.append(
-                f"❌ {user_id} — non trovato"
+                f"❌ {user_id} — "
+                "non trovato"
             )
 
             continue
 
-        result, display = await invite_one(
-            destination,
-            user,
-            "👤 MANUALE",
+        result, display = (
+            await invite_one(
+                destination,
+                user,
+                "👤 MANUALE",
+            )
         )
 
         labels = {
@@ -1315,7 +1778,8 @@ async def run_manual_invites(application):
         }
 
         results.append(
-            f"{labels.get(result, '❓')} {display}"
+            f"{labels.get(result, '❓')} "
+            f"{display}"
         )
 
         if result in (
@@ -1350,7 +1814,7 @@ async def start(
 
 
 # =========================================================
-# CALLBACK
+# CALLBACK BUTTONS
 # =========================================================
 
 async def buttons(
@@ -1366,11 +1830,14 @@ async def buttons(
         return
 
     query = update.callback_query
+
     await query.answer()
 
     data = query.data
 
-    # ---------------- GRUPPI ----------------
+    # =====================================================
+    # GRUPPO A
+    # =====================================================
 
     if data == "set_a":
 
@@ -1378,7 +1845,8 @@ async def buttons(
 
         await query.edit_message_text(
             "📥 IMPOSTA GRUPPO A\n\n"
-            "Inserisci @username, link t.me oppure ID.",
+            "Inserisci @username, "
+            "link t.me oppure ID.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -1386,6 +1854,10 @@ async def buttons(
                 )
             ]]),
         )
+
+    # =====================================================
+    # GRUPPO B
+    # =====================================================
 
     elif data == "set_b":
 
@@ -1393,7 +1865,8 @@ async def buttons(
 
         await query.edit_message_text(
             "📤 IMPOSTA GRUPPO B\n\n"
-            "Inserisci @username, link t.me oppure ID.",
+            "Inserisci @username, "
+            "link t.me oppure ID.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -1402,7 +1875,9 @@ async def buttons(
             ]]),
         )
 
-    # ---------------- TARGET ----------------
+    # =====================================================
+    # TARGET
+    # =====================================================
 
     elif data == "target_minus":
 
@@ -1436,17 +1911,26 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # ---------------- INTERVALLO ----------------
+    # =====================================================
+    # INTERVALLO
+    # =====================================================
 
     elif data == "interval_minus":
 
-        if state["interval_minutes"] > 10:
+        if (
+            state["interval_minutes"]
+            > 10
+        ):
 
-            state["interval_minutes"] -= 5
+            state[
+                "interval_minutes"
+            ] -= 5
 
             await set_setting(
                 "interval_minutes",
-                state["interval_minutes"],
+                state[
+                    "interval_minutes"
+                ],
             )
 
         await query.edit_message_text(
@@ -1456,13 +1940,20 @@ async def buttons(
 
     elif data == "interval_plus":
 
-        if state["interval_minutes"] < 120:
+        if (
+            state["interval_minutes"]
+            < 120
+        ):
 
-            state["interval_minutes"] += 5
+            state[
+                "interval_minutes"
+            ] += 5
 
             await set_setting(
                 "interval_minutes",
-                state["interval_minutes"],
+                state[
+                    "interval_minutes"
+                ],
             )
 
         await query.edit_message_text(
@@ -1470,7 +1961,9 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # ---------------- MAX ----------------
+    # =====================================================
+    # MAX
+    # =====================================================
 
     elif data == "attempts_minus":
 
@@ -1504,16 +1997,19 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # ---------------- AUTO ----------------
+    # =====================================================
+    # AVVIA AUTO
+    # =====================================================
 
     elif data == "start_run":
 
         if state["telegram_locked"]:
 
             await query.answer(
-                "🔒 Inviti attualmente sospesi.",
+                "🔒 Inviti sospesi.",
                 show_alert=True,
             )
+
             return
 
         if state["running"]:
@@ -1522,27 +2018,50 @@ async def buttons(
                 "AUTO già attivo.",
                 show_alert=True,
             )
+
             return
 
-        if not state["group_a"] or not state["group_b"]:
+        if (
+            not state["group_a"]
+            or not state["group_b"]
+        ):
 
             await query.answer(
                 "Imposta prima A e B.",
                 show_alert=True,
             )
+
             return
 
-        stats = await get_today_stats()
+        stats = (
+            await get_today_stats()
+        )
 
         await query.edit_message_text(
             "⚠️ AVVIO AUTOMATICO\n\n"
-            f"📥 {state['group_a']['name']}\n"
-            f"📤 {state['group_b']['name']}\n\n"
-            f"🎯 {state['daily_target']}/giorno\n"
-            f"✅ Oggi: {stats['migrated']}\n"
-            f"⏱ {state['interval_minutes']} min\n"
-            f"🔎 MAX {state['max_attempts']}\n\n"
+
+            f"📥 "
+            f"{state['group_a']['name']}\n"
+
+            f"📤 "
+            f"{state['group_b']['name']}\n\n"
+
+            f"🎯 "
+            f"{state['daily_target']}"
+            f"/giorno\n"
+
+            f"✅ Oggi: "
+            f"{stats['migrated']}\n"
+
+            f"⏱ "
+            f"{state['interval_minutes']} "
+            f"min\n"
+
+            f"🔎 MAX "
+            f"{state['max_attempts']}\n\n"
+
             "Confermi?",
+
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "✅ CONFERMA",
@@ -1557,18 +2076,20 @@ async def buttons(
 
     elif data == "confirm_run":
 
-        if state["telegram_locked"]:
-            return
-
-        if state["running"]:
+        if (
+            state["telegram_locked"]
+            or state["running"]
+        ):
             return
 
         state["running"] = True
         state["stop_requested"] = False
 
-        worker_task = asyncio.create_task(
-            migration_worker(
-                context.application
+        worker_task = (
+            asyncio.create_task(
+                migration_worker(
+                    context.application
+                )
             )
         )
 
@@ -1576,6 +2097,10 @@ async def buttons(
             await home_text(),
             reply_markup=main_keyboard(),
         )
+
+    # =====================================================
+    # PAUSA / STOP
+    # =====================================================
 
     elif data == "pause":
 
@@ -1613,9 +2138,11 @@ async def buttons(
         if not state["group_a"]:
 
             await query.answer(
-                "Imposta prima il gruppo A.",
+                "Imposta prima "
+                "il gruppo A.",
                 show_alert=True,
             )
+
             return
 
         state["member_page"] = 0
@@ -1625,47 +2152,120 @@ async def buttons(
             reply_markup=members_keyboard(),
         )
 
+    # =====================================================
+    # ESTRAZIONE + DIAGNOSTICA
+    # =====================================================
+
     elif data == "extract_members":
 
         if not state["group_a"]:
             return
 
         await query.edit_message_text(
-            "⏳ Estrazione membri in corso..."
+            "⏳ Estrazione membri "
+            "in corso...\n\n"
+            "Sto confrontando la lista "
+            "ricevuta con il numero "
+            "dichiarato da Telegram."
         )
 
         try:
 
-            count = await extract_members_a()
+            diag = (
+                await extract_members_a()
+            )
 
             state["member_page"] = 0
 
-            await add_log(
-                f"👥 Estratti {count} membri da A"
+            total = (
+                await extracted_count()
+            )
+
+            text = (
+                "🔎 DIAGNOSTICA ESTRAZIONE\n\n"
+
+                f"👥 Telegram dichiara: "
+                f"{diag['telegram_count']}\n"
+
+                f"📥 Ricevuti dalla sessione: "
+                f"{diag['received']}\n"
+
+                f"🤖 Bot esclusi: "
+                f"{diag['bots']}\n"
+
+                f"🗑 Account eliminati: "
+                f"{diag['deleted']}\n"
+
+                f"♻️ Duplicati: "
+                f"{diag['duplicates']}\n"
+
+                f"💾 Salvati: "
+                f"{diag['saved']}\n\n"
+
+                f"📋 Disponibili nella lista: "
+                f"{total}"
             )
 
             await query.edit_message_text(
-                await members_page_text(0),
-                reply_markup=members_keyboard(),
+                text,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "👥 MOSTRA MEMBRI",
+                            callback_data="members_show",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🔄 RIPETI ESTRAZIONE",
+                            callback_data="extract_members",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ HOME",
+                            callback_data="home",
+                        )
+                    ],
+                ]),
             )
 
         except Exception as e:
 
             await add_log(
-                f"❌ Estrazione: {type(e).__name__}",
+                f"❌ Estrazione: "
+                f"{type(e).__name__}",
                 "ERROR",
             )
 
+            logger.exception(
+                "Errore estrazione membri"
+            )
+
             await query.edit_message_text(
-                f"❌ Errore estrazione: "
-                f"{type(e).__name__}",
+                "❌ ERRORE ESTRAZIONE\n\n"
+                f"{type(e).__name__}\n\n"
+                "Controlla il LOG.",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
-                        "⬅️ INDIETRO",
+                        "⬅️ HOME",
                         callback_data="home",
                     )
                 ]]),
             )
+
+    # =====================================================
+    # MOSTRA MEMBRI
+    # =====================================================
+
+    elif data == "members_show":
+
+        state["member_page"] = 0
+
+        await query.edit_message_text(
+            await members_page_text(0),
+            reply_markup=members_keyboard(),
+        )
 
     elif data == "members_prev":
 
@@ -1681,11 +2281,15 @@ async def buttons(
 
     elif data == "members_next":
 
-        total = await extracted_count()
+        total = (
+            await extracted_count()
+        )
 
         pages = max(
             1,
-            math.ceil(total / PAGE_SIZE),
+            math.ceil(
+                total / PAGE_SIZE
+            ),
         )
 
         page = min(
@@ -1699,7 +2303,7 @@ async def buttons(
         )
 
     # =====================================================
-    # INVITO MANUALE
+    # MANUALE
     # =====================================================
 
     elif data == "manual_invite":
@@ -1710,27 +2314,36 @@ async def buttons(
                 "🔒 Inviti sospesi.",
                 show_alert=True,
             )
+
             return
 
         if not state["group_b"]:
 
             await query.answer(
-                "Imposta prima il gruppo B.",
+                "Imposta prima "
+                "il gruppo B.",
                 show_alert=True,
             )
+
             return
 
-        state["waiting_for"] = "manual_ids"
+        state[
+            "waiting_for"
+        ] = "manual_ids"
 
         await query.edit_message_text(
             "➕ INVITO MANUALE\n\n"
-            "Inserisci uno o più ID Telegram, "
-            "uno per riga.\n\n"
+
+            "Inserisci uno o più "
+            "ID Telegram, uno per riga.\n\n"
+
             "Esempio:\n"
             "123456789\n"
             "987654321\n\n"
-            "Nessun invito partirà finché "
-            "non premi CONFERMA.",
+
+            "Nessun invito partirà "
+            "finché non premi CONFERMA.",
+
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -1747,14 +2360,15 @@ async def buttons(
                 "🔒 Inviti sospesi.",
                 show_alert=True,
             )
+
             return
 
         await query.edit_message_text(
             "⏳ Elaborazione manuale..."
         )
 
-        results = await run_manual_invites(
-            context.application
+        results = (
+            await run_manual_invites()
         )
 
         text = (
@@ -1762,7 +2376,9 @@ async def buttons(
             + (
                 "\n".join(results)
                 if results
-                else "Nessuna operazione eseguita."
+                else
+                "Nessuna operazione "
+                "eseguita."
             )
         )
 
@@ -1776,31 +2392,62 @@ async def buttons(
             ]]),
         )
 
-    # ---------------- STATISTICHE ----------------
+    # =====================================================
+    # STATISTICHE
+    # =====================================================
 
     elif data == "statistics":
 
-        today = await get_today_stats()
-        total = await get_total_stats()
+        today = (
+            await get_today_stats()
+        )
+
+        total = (
+            await get_total_stats()
+        )
 
         text = (
             "📊 STATISTICHE\n\n"
 
             "📅 OGGI\n"
-            f"✅ Confermati: {today['migrated']}\n"
-            f"🔎 Tentativi: {today['attempts']}\n"
-            f"🛡 Privacy: {today['privacy']}\n"
-            f"↪️ Già presenti: {today['already']}\n"
-            f"⚠️ Non confermati: {today['unconfirmed']}\n"
-            f"❌ Errori: {today['errors']}\n\n"
+
+            f"✅ Confermati: "
+            f"{today['migrated']}\n"
+
+            f"🔎 Tentativi: "
+            f"{today['attempts']}\n"
+
+            f"🛡 Privacy: "
+            f"{today['privacy']}\n"
+
+            f"↪️ Già presenti: "
+            f"{today['already']}\n"
+
+            f"⚠️ Non confermati: "
+            f"{today['unconfirmed']}\n"
+
+            f"❌ Errori: "
+            f"{today['errors']}\n\n"
 
             "📈 TOTALI\n"
-            f"✅ Confermati: {total['migrated']}\n"
-            f"🔎 Tentativi: {total['attempts']}\n"
-            f"🛡 Privacy: {total['privacy']}\n"
-            f"↪️ Già presenti: {total['already']}\n"
-            f"⚠️ Non confermati: {total['unconfirmed']}\n"
-            f"❌ Errori: {total['errors']}"
+
+            f"✅ Confermati: "
+            f"{total['migrated']}\n"
+
+            f"🔎 Tentativi: "
+            f"{total['attempts']}\n"
+
+            f"🛡 Privacy: "
+            f"{total['privacy']}\n"
+
+            f"↪️ Già presenti: "
+            f"{total['already']}\n"
+
+            f"⚠️ Non confermati: "
+            f"{total['unconfirmed']}\n"
+
+            f"❌ Errori: "
+            f"{total['errors']}"
         )
 
         await query.edit_message_text(
@@ -1813,26 +2460,37 @@ async def buttons(
             ]]),
         )
 
-    # ---------------- LOG ----------------
+    # =====================================================
+    # LOG
+    # =====================================================
 
     elif data == "logs":
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(
+            DB_PATH
+        ) as db:
 
             cursor = await db.execute(
                 """
-                SELECT created_at, message
+                SELECT
+                    created_at,
+                    message
                 FROM logs
                 ORDER BY id DESC
                 LIMIT 20
                 """
             )
 
-            rows = await cursor.fetchall()
+            rows = (
+                await cursor.fetchall()
+            )
 
         lines = []
 
-        for created_at, message in reversed(rows):
+        for (
+            created_at,
+            message,
+        ) in reversed(rows):
 
             try:
 
@@ -1840,12 +2498,24 @@ async def buttons(
                     created_at
                 )
 
-                if dt.tzinfo:
-                    dt = dt.astimezone(ITALY_TZ)
+                if dt.tzinfo is None:
 
-                stamp = dt.strftime("%H:%M:%S")
+                    dt = dt.replace(
+                        tzinfo=ITALY_TZ
+                    )
+
+                else:
+
+                    dt = dt.astimezone(
+                        ITALY_TZ
+                    )
+
+                stamp = dt.strftime(
+                    "%H:%M:%S"
+                )
 
             except Exception:
+
                 stamp = "--:--:--"
 
             lines.append(
@@ -1859,6 +2529,7 @@ async def buttons(
                 if lines
                 else "Nessun evento."
             ),
+
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
@@ -1911,14 +2582,18 @@ async def buttons(
             ]]),
         )
 
-    # ---------------- SBLOCCO ----------------
+    # =====================================================
+    # SBLOCCO
+    # =====================================================
 
     elif data == "unlock_confirm":
 
         await query.edit_message_text(
             "⚠️ RIABILITARE GLI INVITI?\n\n"
             "Usalo solo dopo aver verificato "
-            "che la restrizione Telegram sia cessata.",
+            "che Telegram consenta nuovamente "
+            "gli inviti.",
+
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🔓 CONFERMA",
@@ -1933,7 +2608,9 @@ async def buttons(
 
     elif data == "unlock":
 
-        state["telegram_locked"] = False
+        state[
+            "telegram_locked"
+        ] = False
 
         await set_setting(
             "telegram_locked",
@@ -1941,13 +2618,18 @@ async def buttons(
         )
 
         await add_log(
-            "🔓 Blocco inviti rimosso manualmente"
+            "🔓 Blocco inviti "
+            "rimosso manualmente"
         )
 
         await query.edit_message_text(
             await home_text(),
             reply_markup=main_keyboard(),
         )
+
+    # =====================================================
+    # HOME
+    # =====================================================
 
     elif data == "home":
 
@@ -1977,7 +2659,9 @@ async def text_input(
         await deny_access(update)
         return
 
-    target = state["waiting_for"]
+    target = state[
+        "waiting_for"
+    ]
 
     # =====================================================
     # ID MANUALI
@@ -1985,10 +2669,10 @@ async def text_input(
 
     if target == "manual_ids":
 
-        raw = update.message.text
-
-        # Accetta righe, spazi e virgole
-        raw = raw.replace(",", " ")
+        raw = (
+            update.message.text
+            .replace(",", " ")
+        )
 
         parts = raw.split()
 
@@ -2003,16 +2687,21 @@ async def text_input(
                 value = int(part)
 
                 if value not in ids:
-                    ids.append(value)
+
+                    ids.append(
+                        value
+                    )
 
         if not ids:
 
             await update.message.reply_text(
-                "❌ Non ho trovato ID Telegram validi."
+                "❌ Non ho trovato "
+                "ID Telegram validi."
             )
+
             return
 
-        # Limite per conferma manuale
+        # Max 20 per conferma manuale
         ids = ids[:20]
 
         state["manual_ids"] = ids
@@ -2025,11 +2714,17 @@ async def text_input(
 
         await update.message.reply_text(
             "👤 CONFERMA INVITO MANUALE\n\n"
+
             f"📤 Destinazione:\n"
             f"{state['group_b']['name']}\n\n"
-            f"Utenti selezionati: {len(ids)}\n\n"
+
+            f"Utenti selezionati: "
+            f"{len(ids)}\n\n"
+
             f"{lines}\n\n"
+
             "Procedere?",
+
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "✅ CONFERMA",
@@ -2045,10 +2740,13 @@ async def text_input(
         return
 
     # =====================================================
-    # GRUPPI A/B
+    # GRUPPI
     # =====================================================
 
-    if target not in ("a", "b"):
+    if target not in (
+        "a",
+        "b",
+    ):
         return
 
     try:
@@ -2065,12 +2763,15 @@ async def text_input(
 
         if (
             other
-            and other["id"] == group["id"]
+            and other["id"]
+            == group["id"]
         ):
 
             await update.message.reply_text(
-                "❌ A e B devono essere diversi."
+                "❌ A e B devono "
+                "essere diversi."
             )
+
             return
 
         if target == "a":
@@ -2098,15 +2799,20 @@ async def text_input(
         state["waiting_for"] = None
 
         await add_log(
-            f"⚙️ Gruppo {label} impostato: "
+            f"⚙️ Gruppo {label} "
+            f"impostato: "
             f"{group['name']}"
         )
 
         await update.message.reply_text(
-            f"✅ GRUPPO {label} IMPOSTATO\n\n"
+            f"✅ GRUPPO {label} "
+            f"IMPOSTATO\n\n"
+
             f"👥 {group['name']}\n"
             f"🆔 {group['id']}\n\n"
+
             "💾 Salvato.",
+
             reply_markup=main_keyboard(),
         )
 
@@ -2118,7 +2824,8 @@ async def text_input(
 
         await update.message.reply_text(
             "❌ Gruppo non utilizzabile.\n\n"
-            f"Errore: {type(e).__name__}"
+            f"Errore: "
+            f"{type(e).__name__}"
         )
 
 
@@ -2126,7 +2833,9 @@ async def text_input(
 # INIT
 # =========================================================
 
-async def post_init(application):
+async def post_init(
+    application,
+):
 
     await init_db()
     await load_settings()
@@ -2134,26 +2843,33 @@ async def post_init(application):
 
     await user_client.connect()
 
-    if not await user_client.is_user_authorized():
+    if not (
+        await user_client.is_user_authorized()
+    ):
 
         raise RuntimeError(
-            "TELEGRAM_SESSION non autorizzata."
+            "TELEGRAM_SESSION "
+            "non autorizzata."
         )
 
     me = await user_client.get_me()
 
     logger.info(
-        "Account operativo: %s (%s)",
+        "Account operativo: "
+        "%s (%s)",
         me.first_name,
         me.id,
     )
 
     logger.info(
-        "BestPrice Member Manager V4.3"
+        "BestPrice Member Manager "
+        "V4.3.1"
     )
 
 
-async def post_shutdown(application):
+async def post_shutdown(
+    application,
+):
 
     state["running"] = False
     state["stop_requested"] = True
@@ -2190,13 +2906,15 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             text_input,
         )
     )
 
     logger.info(
-        "BestPrice Member Manager V4.3 avviato"
+        "BestPrice Member Manager "
+        "V4.3.1 avviato"
     )
 
     application.run_polling()
