@@ -87,10 +87,10 @@ state = {
 
     "member_page": 0,
     "manual_ids": [],
-    "manual_members": [],
 
     "extract_diag": {
         "telegram_count": 0,
         "received": 0,
         "bots": 0,
         "deleted": 0,
+        "duplicates": 0,
