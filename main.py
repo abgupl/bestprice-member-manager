@@ -87,6 +87,7 @@ state = {
 
     "member_page": 0,
     "manual_ids": [],
+    "manual_refs": [],
 
     "extract_diag": {
         "telegram_count": 0,
@@ -1714,58 +1715,113 @@ async def migration_worker(
 # INVITI MANUALI
 # =========================================================
 
+async def resolve_manual_user(user_id=None, username=None):
+    """Risolvi un utente usando prima username/DB, poi il Gruppo A."""
+
+    candidates = []
+
+    if username:
+        clean_username = username.strip().lstrip("@")
+        if clean_username:
+            candidates.append("@" + clean_username)
+
+    # Se abbiamo un ID, recupera l'eventuale username già estratto.
+    if user_id is not None and state["group_a"]:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """
+                SELECT username
+                FROM extracted_members
+                WHERE source_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (state["group_a"]["id"], int(user_id)),
+            )
+            row = await cursor.fetchone()
+
+        if row and row[0]:
+            candidate = "@" + row[0].lstrip("@")
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    # Username è il metodo più affidabile quando disponibile.
+    for candidate in candidates:
+        try:
+            return await user_client.get_entity(candidate)
+        except Exception:
+            pass
+
+    # Prova l'ID dalla cache/sessione Telethon.
+    if user_id is not None:
+        try:
+            return await user_client.get_entity(int(user_id))
+        except Exception:
+            pass
+
+    # Ultimo fallback: cerca l'ID nella lista del Gruppo A accessibile
+    # alla sessione. Questo evita di dipendere dalla cache dopo un restart.
+    if user_id is not None and state["group_a"]:
+        try:
+            source = await user_client.get_entity(state["group_a"]["input"])
+            async for participant in user_client.iter_participants(source):
+                if participant.id == int(user_id):
+                    return participant
+        except Exception:
+            pass
+
+    return None
+
+
 async def run_manual_invites():
 
-    ids = list(
-        state["manual_ids"]
-    )
+    refs = list(state.get("manual_refs") or [])
 
-    if not ids:
+    # Compatibilità con eventuali liste preparate dalla versione precedente.
+    if not refs:
+        refs = [
+            {"id": user_id, "username": None, "label": None}
+            for user_id in state["manual_ids"]
+        ]
+
+    if not refs:
         return []
 
-    destination = (
-        await user_client.get_entity(
-            state["group_b"]["input"]
-        )
+    destination = await user_client.get_entity(
+        state["group_b"]["input"]
     )
 
     results = []
 
-    for user_id in ids:
+    for ref in refs:
 
         if state["telegram_locked"]:
             break
 
-        try:
+        user_id = ref.get("id")
+        username = ref.get("username")
+        shown = (
+            "@" + username.lstrip("@")
+            if username
+            else (f"ID {user_id}" if user_id is not None else "utente")
+        )
 
-            user = (
-                await user_client.get_entity(
-                    user_id
-                )
-            )
+        user = await resolve_manual_user(
+            user_id=user_id,
+            username=username,
+        )
 
-        except Exception:
-
+        if user is None:
             await add_log(
-                "❌ 👤 MANUALE — "
-                f"ID {user_id} "
-                "non risolvibile",
+                f"❌ 👤 MANUALE — {shown} non risolvibile",
                 "ERROR",
             )
-
-            results.append(
-                f"❌ {user_id} — "
-                "non trovato"
-            )
-
+            results.append(f"❌ {shown} — non trovato")
             continue
 
-        result, display = (
-            await invite_one(
-                destination,
-                user,
-                "👤 MANUALE",
-            )
+        result, display = await invite_one(
+            destination,
+            user,
+            "👤 MANUALE",
         )
 
         labels = {
@@ -1779,17 +1835,14 @@ async def run_manual_invites():
         }
 
         results.append(
-            f"{labels.get(result, '❓')} "
-            f"{display}"
+            f"{labels.get(result, '❓')} {display}"
         )
 
-        if result in (
-            "peer_flood",
-            "flood_wait",
-        ):
+        if result in ("peer_flood", "flood_wait"):
             break
 
     state["manual_ids"] = []
+    state["manual_refs"] = []
 
     return results
 
@@ -2629,6 +2682,7 @@ async def buttons(
 
         state["waiting_for"] = None
         state["manual_ids"] = []
+        state["manual_refs"] = []
 
         await query.edit_message_text(
             await home_text(),
@@ -2665,13 +2719,13 @@ async def text_input(
 
         raw = update.message.text
         members = []
-        seen_ids = set()
+        seen = set()
 
-        # Formato della pagina MEMBRI GRUPPO A:
-        # 1. @username — 123456789
+        # Formato: 1. @username — 123456789
         page_pattern = re.compile(
             r"^\s*\d+\.\s+(.+?)\s+[—–-]\s*(\d+)\s*$"
         )
+        username_pattern = re.compile(r"^@?([A-Za-z0-9_]{5,32})$")
 
         for line in raw.splitlines():
             line = line.strip()
@@ -2682,19 +2736,46 @@ async def text_input(
             if match:
                 label = match.group(1).strip()
                 user_id = int(match.group(2))
-                if user_id not in seen_ids:
-                    seen_ids.add(user_id)
-                    members.append((user_id, label))
+                username = None
+                username_match = re.search(r"@([A-Za-z0-9_]{5,32})", label)
+                if username_match:
+                    username = username_match.group(1)
 
-        # Fallback: accetta anche soli ID, uno per riga/spazio/virgola.
-        if not members:
-            for token in re.split(r"[\s,]+", raw):
-                token = token.strip()
-                if token.isdigit():
-                    user_id = int(token)
-                    if user_id not in seen_ids:
-                        seen_ids.add(user_id)
-                        members.append((user_id, None))
+                key = (user_id, username)
+                if key not in seen:
+                    seen.add(key)
+                    members.append({
+                        "id": user_id,
+                        "username": username,
+                        "label": label,
+                    })
+                continue
+
+            # Singolo ID numerico.
+            if line.isdigit():
+                user_id = int(line)
+                key = (user_id, None)
+                if key not in seen:
+                    seen.add(key)
+                    members.append({
+                        "id": user_id,
+                        "username": None,
+                        "label": None,
+                    })
+                continue
+
+            # Username con o senza @, uno per riga.
+            username_match = username_pattern.match(line)
+            if username_match:
+                username = username_match.group(1)
+                key = (None, username.lower())
+                if key not in seen:
+                    seen.add(key)
+                    members.append({
+                        "id": None,
+                        "username": username,
+                        "label": "@" + username,
+                    })
 
         if not members:
             await update.message.reply_text(
@@ -2702,17 +2783,23 @@ async def text_input(
             )
             return
 
-        # Una pagina alla volta: massimo 20 utenti.
         members = members[:20]
-        ids = [user_id for user_id, _ in members]
-
-        state["manual_ids"] = ids
+        state["manual_refs"] = members
+        state["manual_ids"] = [
+            item["id"] for item in members if item["id"] is not None
+        ]
         state["waiting_for"] = None
 
         preview_lines = []
-        for index, (user_id, label) in enumerate(members, start=1):
-            if label:
+        for index, item in enumerate(members, start=1):
+            user_id = item["id"]
+            username = item["username"]
+            label = item["label"]
+
+            if label and user_id is not None:
                 preview_lines.append(f"{index}. {label} — {user_id}")
+            elif username:
+                preview_lines.append(f"{index}. @{username}")
             else:
                 preview_lines.append(f"{index}. ID {user_id}")
 
@@ -2727,7 +2814,7 @@ async def text_input(
         await update.message.reply_text(
             "👤 CONFERMA INVITO MANUALE\n\n"
             f"📤 Destinazione:\n{state['group_b']['name']}\n\n"
-            f"Utenti riconosciuti: {len(ids)}\n\n"
+            f"Utenti riconosciuti: {len(members)}\n\n"
             + "\n".join(preview_lines)
             + lock_note
             + "\n\nProcedere?",
@@ -2869,7 +2956,7 @@ async def post_init(
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.3.2"
+        "V4.3.3"
     )
 
 
@@ -2920,7 +3007,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.3.2 avviato"
+        "V4.3.3 avviato"
     )
 
     application.run_polling()
