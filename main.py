@@ -1226,7 +1226,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.4\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.4.2\n\n"
         f"📥 A: {group_label(state['group_a'])}\n"
         f"📤 B: {group_label(state['group_b'])}\n\n"
         "🤖 AUTOMATICO\n"
@@ -2932,7 +2932,7 @@ async def post_init(
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.4"
+        "V4.4.2"
     )
 
     global scheduler_task
@@ -3004,6 +3004,20 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         return
 
+    # Elimina subito il messaggio di servizio Telegram
+    # (es. "Mario si è unito al gruppo").
+    try:
+        await context.bot.delete_message(
+            chat_id=chat.id,
+            message_id=message.message_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "Impossibile eliminare il messaggio di ingresso %s: %s",
+            message.message_id,
+            e,
+        )
+
     for member in message.new_chat_members:
         if member.is_bot:
             continue
@@ -3015,10 +3029,14 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
             person = f'<a href="tg://user?id={member.id}">{visible_name}</a>'
 
         text = (
-            f"👋 <b>Benvenuto {person}!</b>\n\n"
-            "🔥 Le offerte Amazon selezionate da <b>BestPrice24h</b> "
-            "ti aspettano sul nostro canale ufficiale.\n\n"
-            "👇 <b>Entra e scopri le offerte di oggi!</b>"
+            f"👋 <b>Benvenuto {person} nella Community BestPrice24h!</b>\n\n"
+            "🔥 Sei nel posto giusto per scoprire <b>offerte, ribassi di prezzo e occasioni Amazon</b> "
+            "selezionate ogni giorno.\n\n"
+            "📲 Le offerte vengono pubblicate sul nostro <b>canale ufficiale BestPrice24h</b>, "
+            "così puoi trovarle subito senza perderti tra centinaia di prodotti.\n\n"
+            "💡 <b>Il consiglio:</b> entra nel canale e attiva le notifiche per non perdere "
+            "le occasioni migliori.\n\n"
+            "👇 <b>Ci vediamo nel canale!</b>"
         )
 
         sent = await context.bot.send_message(
@@ -3027,7 +3045,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔥 VAI AL CANALE", url=CHANNEL_URL)]
+                [InlineKeyboardButton("🔥 SCOPRI LE OFFERTE", url=CHANNEL_URL)]
             ]),
         )
 
@@ -3080,7 +3098,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.4.1 avviato"
+        "V4.4.2 avviato"
     )
 
     application.run_polling()
