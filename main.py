@@ -25,7 +25,10 @@ from telethon.errors import (
     UserNotMutualContactError,
     UserAlreadyParticipantError,
 )
-from telethon.tl.functions.channels import InviteToChannelRequest
+from telethon.tl.functions.channels import (
+    InviteToChannelRequest,
+    GetParticipantRequest,
+)
 from telethon.tl.types import Channel, Chat
 
 
@@ -71,9 +74,11 @@ state = {
 
     "daily_target": 1,
     "max_attempts": 3,
+    "interval_minutes": 10,
 
     "running": False,
     "stop_requested": False,
+    "telegram_locked": False,
     "waiting_for": None,
 
     "last_event": "Nessuna attività",
@@ -84,7 +89,7 @@ worker_lock = asyncio.Lock()
 
 
 # =========================================================
-# TEMPO ITALIA
+# DATA / ORA ITALIANA
 # =========================================================
 
 def now_it():
@@ -143,9 +148,19 @@ async def init_db():
                 attempts INTEGER DEFAULT 0,
                 privacy INTEGER DEFAULT 0,
                 already INTEGER DEFAULT 0,
-                errors INTEGER DEFAULT 0
+                errors INTEGER DEFAULT 0,
+                unconfirmed INTEGER DEFAULT 0
             )
         """)
+
+        # Compatibilità con DB V4.1 già esistente
+        try:
+            await db.execute(
+                "ALTER TABLE daily_stats "
+                "ADD COLUMN unconfirmed INTEGER DEFAULT 0"
+            )
+        except Exception:
+            pass
 
         await db.commit()
 
@@ -182,10 +197,7 @@ async def get_setting(key, default=None):
 
         row = await cursor.fetchone()
 
-    if row:
-        return row[0]
-
-    return default
+    return row[0] if row else default
 
 
 async def save_group(prefix, group):
@@ -208,18 +220,21 @@ async def save_group(prefix, group):
 
 async def load_settings():
 
-    target = await get_setting(
-        "daily_target",
-        "1",
+    state["daily_target"] = int(
+        await get_setting("daily_target", "1")
     )
 
-    max_attempts = await get_setting(
-        "max_attempts",
-        "3",
+    state["max_attempts"] = int(
+        await get_setting("max_attempts", "3")
     )
 
-    state["daily_target"] = int(target)
-    state["max_attempts"] = int(max_attempts)
+    state["interval_minutes"] = int(
+        await get_setting("interval_minutes", "10")
+    )
+
+    state["telegram_locked"] = (
+        await get_setting("telegram_locked", "0") == "1"
+    )
 
     for prefix in ("group_a", "group_b"):
 
@@ -237,7 +252,6 @@ async def load_settings():
 
         if group_id and name and input_value:
 
-            # Manteniamo numerico l'ID se era numerico
             if str(input_value).lstrip("-").isdigit():
                 input_value = int(input_value)
 
@@ -249,12 +263,10 @@ async def load_settings():
 
 
 # =========================================================
-# STATISTICHE GIORNALIERE
+# STATISTICHE
 # =========================================================
 
 async def ensure_today():
-
-    day = today_it()
 
     async with aiosqlite.connect(DB_PATH) as db:
 
@@ -263,7 +275,7 @@ async def ensure_today():
             INSERT OR IGNORE INTO daily_stats(day)
             VALUES (?)
             """,
-            (day,),
+            (today_it(),),
         )
 
         await db.commit()
@@ -277,6 +289,7 @@ async def increment_stat(field, amount=1):
         "privacy",
         "already",
         "errors",
+        "unconfirmed",
     }
 
     if field not in allowed:
@@ -311,7 +324,8 @@ async def get_today_stats():
                 attempts,
                 privacy,
                 already,
-                errors
+                errors,
+                unconfirmed
             FROM daily_stats
             WHERE day = ?
             """,
@@ -326,6 +340,7 @@ async def get_today_stats():
         "privacy": row[2],
         "already": row[3],
         "errors": row[4],
+        "unconfirmed": row[5],
     }
 
 
@@ -339,7 +354,8 @@ async def get_total_stats():
                 COALESCE(SUM(attempts), 0),
                 COALESCE(SUM(privacy), 0),
                 COALESCE(SUM(already), 0),
-                COALESCE(SUM(errors), 0)
+                COALESCE(SUM(errors), 0),
+                COALESCE(SUM(unconfirmed), 0)
             FROM daily_stats
         """)
 
@@ -351,6 +367,7 @@ async def get_total_stats():
         "privacy": row[2],
         "already": row[3],
         "errors": row[4],
+        "unconfirmed": row[5],
     }
 
 
@@ -359,8 +376,6 @@ async def get_total_stats():
 # =========================================================
 
 async def add_log(message, level="INFO"):
-
-    now = now_it().isoformat()
 
     state["last_event"] = message
 
@@ -376,7 +391,7 @@ async def add_log(message, level="INFO"):
             VALUES (?, ?, ?)
             """,
             (
-                now,
+                now_it().isoformat(),
                 level,
                 message,
             ),
@@ -384,40 +399,26 @@ async def add_log(message, level="INFO"):
 
         await db.commit()
 
-    logger.info(
-        "%s | %s",
-        level,
-        message,
-    )
+    logger.info("%s | %s", level, message)
 
 
 async def clear_logs():
 
     async with aiosqlite.connect(DB_PATH) as db:
 
-        await db.execute(
-            "DELETE FROM logs"
-        )
-
+        await db.execute("DELETE FROM logs")
         await db.commit()
 
     state["last_event"] = "Log cancellato"
 
 
 # =========================================================
-# UTENTI PROCESSATI
+# PROCESSATI
 # =========================================================
 
 async def save_processed(user, status):
 
-    source_id = state["group_a"]["id"]
-    destination_id = state["group_b"]["id"]
-
-    username = getattr(
-        user,
-        "username",
-        None,
-    )
+    username = getattr(user, "username", None)
 
     display_name = " ".join(
         value
@@ -446,8 +447,8 @@ async def save_processed(user, status):
             """,
             (
                 user.id,
-                source_id,
-                destination_id,
+                state["group_a"]["id"],
+                state["group_b"]["id"],
                 username,
                 display_name,
                 status,
@@ -484,7 +485,7 @@ async def was_processed(user_id):
 
 
 # =========================================================
-# SICUREZZA
+# SICUREZZA BOT
 # =========================================================
 
 def is_admin(update):
@@ -537,7 +538,7 @@ async def resolve_group(value):
 
         if value.startswith("+"):
             raise ValueError(
-                "Per gruppi privati usa l'ID Telegram."
+                "Per gruppi privati usa l'ID."
             )
 
         value = "@" + value.lstrip("@")
@@ -577,6 +578,59 @@ async def resolve_group(value):
 
 
 # =========================================================
+# VERIFICA MEMBERSHIP B
+# =========================================================
+
+async def verify_in_destination(
+    destination,
+    user,
+):
+
+    """
+    Verifica se Telegram considera realmente
+    l'utente partecipante del gruppo B.
+
+    Restituisce True/False.
+    """
+
+    try:
+
+        await user_client(
+            GetParticipantRequest(
+                destination,
+                user,
+            )
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+# =========================================================
+# TIMER INTERROMPIBILE
+# =========================================================
+
+async def interruptible_wait(minutes):
+
+    total_seconds = minutes * 60
+
+    for _ in range(total_seconds):
+
+        if (
+            not state["running"]
+            or state["stop_requested"]
+            or state["telegram_locked"]
+        ):
+            return False
+
+        await asyncio.sleep(1)
+
+    return True
+
+
+# =========================================================
 # INTERFACCIA
 # =========================================================
 
@@ -587,15 +641,15 @@ def group_label(group):
 
     name = group["name"]
 
-    if len(name) > 25:
-        return name[:22] + "..."
+    if len(name) > 24:
+        return name[:21] + "..."
 
     return name
 
 
 def main_keyboard():
 
-    return InlineKeyboardMarkup([
+    keyboard = [
         [
             InlineKeyboardButton(
                 "📥 GRUPPO A",
@@ -618,6 +672,20 @@ def main_keyboard():
             InlineKeyboardButton(
                 "➕",
                 callback_data="target_plus",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "➖",
+                callback_data="interval_minus",
+            ),
+            InlineKeyboardButton(
+                f"⏱ {state['interval_minutes']} MIN",
+                callback_data="noop",
+            ),
+            InlineKeyboardButton(
+                "➕",
+                callback_data="interval_plus",
             ),
         ],
         [
@@ -660,18 +728,23 @@ def main_keyboard():
                 callback_data="logs",
             ),
         ],
-    ])
+    ]
+
+    if state["telegram_locked"]:
+
+        keyboard.append([
+            InlineKeyboardButton(
+                "🔓 RIABILITA INVITI",
+                callback_data="unlock_confirm",
+            )
+        ])
+
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def home_text():
 
     stats = await get_today_stats()
-
-    status = (
-        "🟢 ATTIVO"
-        if state["running"]
-        else "🔴 FERMO"
-    )
 
     remaining = max(
         0,
@@ -679,30 +752,56 @@ async def home_text():
         - stats["migrated"],
     )
 
+    if state["telegram_locked"]:
+        status = "🔒 INVITI SOSPESI"
+
+    elif state["running"]:
+        status = "🟢 ATTIVO"
+
+    else:
+        status = "🔴 FERMO"
+
     return (
-        "👥 BESTPRICE MEMBER MANAGER\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.2\n\n"
 
         f"📥 A: {group_label(state['group_a'])}\n"
         f"📤 B: {group_label(state['group_b'])}\n\n"
 
         "📅 OGGI\n"
-        f"✅ Migrati: "
-        f"{stats['migrated']}/{state['daily_target']}\n"
+        f"✅ Confermati: "
+        f"{stats['migrated']}/"
+        f"{state['daily_target']}\n"
+
         f"🎯 Rimanenti: {remaining}\n"
-        f"🔎 Tentativi: {stats['attempts']}\n"
-        f"🛡 Privacy: {stats['privacy']}\n"
-        f"↪️ Già presenti: {stats['already']}\n"
-        f"⚠️ Errori: {stats['errors']}\n\n"
+
+        f"⏱ Intervallo: "
+        f"{state['interval_minutes']} min\n"
+
+        f"🔎 Tentativi: "
+        f"{stats['attempts']}\n"
+
+        f"🛡 Privacy: "
+        f"{stats['privacy']}\n"
+
+        f"↪️ Già presenti: "
+        f"{stats['already']}\n"
+
+        f"⚠️ Non confermati: "
+        f"{stats['unconfirmed']}\n"
+
+        f"❌ Errori: "
+        f"{stats['errors']}\n\n"
 
         f"{status}\n\n"
 
         f"🕐 {now_it().strftime('%H:%M:%S')}\n"
-        f"Ultimo evento: {state['last_event']}"
+        f"Ultimo evento:\n"
+        f"{state['last_event']}"
     )
 
 
 # =========================================================
-# MOTORE
+# MIGRATION WORKER
 # =========================================================
 
 async def migration_worker(application):
@@ -712,6 +811,10 @@ async def migration_worker(application):
     async with worker_lock:
 
         if not state["running"]:
+            return
+
+        if state["telegram_locked"]:
+            state["running"] = False
             return
 
         state["stop_requested"] = False
@@ -739,15 +842,12 @@ async def migration_worker(application):
             ):
 
                 if not state["running"]:
-                    await add_log(
-                        "⏸ Ciclo messo in pausa"
-                    )
                     break
 
                 if state["stop_requested"]:
-                    await add_log(
-                        "🛑 Ciclo interrotto"
-                    )
+                    break
+
+                if state["telegram_locked"]:
                     break
 
                 stats = await get_today_stats()
@@ -756,21 +856,28 @@ async def migration_worker(application):
                     stats["migrated"]
                     >= state["daily_target"]
                 ):
+
                     await add_log(
                         "🎯 Obiettivo giornaliero raggiunto"
                     )
+
                     break
 
                 if (
                     attempts_cycle
                     >= state["max_attempts"]
                 ):
+
                     await add_log(
-                        "🛑 Max tentativi del ciclo raggiunto"
+                        "🛑 Max tentativi raggiunto"
                     )
+
                     break
 
-                # Filtri senza richiesta Telegram
+                # -------------------------
+                # FILTRI
+                # -------------------------
+
                 if user.id == me.id:
                     continue
 
@@ -803,17 +910,21 @@ async def migration_worker(application):
                     else f"ID {user.id}"
                 )
 
-                await add_log(
-                    f"🔎 Candidato: {display}"
-                )
-
                 attempts_cycle += 1
 
                 await increment_stat(
                     "attempts"
                 )
 
+                await add_log(
+                    f"🔎 Candidato: {display}"
+                )
+
                 try:
+
+                    # =====================
+                    # INVITO
+                    # =====================
 
                     await user_client(
                         InviteToChannelRequest(
@@ -822,18 +933,61 @@ async def migration_worker(application):
                         )
                     )
 
-                    await increment_stat(
-                        "migrated"
+                    # Lasciamo a Telegram il tempo
+                    # di aggiornare lo stato
+                    await asyncio.sleep(3)
+
+                    confirmed = (
+                        await verify_in_destination(
+                            destination,
+                            user,
+                        )
                     )
 
-                    await save_processed(
-                        user,
-                        "MIGRATED",
-                    )
+                    # =====================
+                    # CONFERMATO
+                    # =====================
 
-                    await add_log(
-                        f"✅ Migrato: {display}"
-                    )
+                    if confirmed:
+
+                        await increment_stat(
+                            "migrated"
+                        )
+
+                        await save_processed(
+                            user,
+                            "CONFIRMED",
+                        )
+
+                        await add_log(
+                            f"✅ Confermato in B: "
+                            f"{display}"
+                        )
+
+                    # =====================
+                    # NON CONFERMATO
+                    # =====================
+
+                    else:
+
+                        await increment_stat(
+                            "unconfirmed"
+                        )
+
+                        await save_processed(
+                            user,
+                            "UNCONFIRMED",
+                        )
+
+                        await add_log(
+                            f"⚠️ Invito non confermato: "
+                            f"{display}",
+                            "WARNING",
+                        )
+
+                # =========================
+                # GIÀ PRESENTE
+                # =========================
 
                 except UserAlreadyParticipantError:
 
@@ -847,8 +1001,13 @@ async def migration_worker(application):
                     )
 
                     await add_log(
-                        f"↪️ Già presente: {display}"
+                        f"↪️ Già presente: "
+                        f"{display}"
                     )
+
+                # =========================
+                # PRIVACY
+                # =========================
 
                 except (
                     UserPrivacyRestrictedError,
@@ -865,30 +1024,52 @@ async def migration_worker(application):
                     )
 
                     await add_log(
-                        f"🛡 Privacy/non invitabile: {display}"
+                        f"🛡 Privacy/non invitabile: "
+                        f"{display}"
                     )
+
+                # =========================
+                # FLOOD WAIT
+                # =========================
 
                 except FloodWaitError as e:
 
                     state["running"] = False
 
                     await add_log(
-                        f"⏳ FloodWait {e.seconds}s. STOP.",
+                        f"⏳ FloodWait "
+                        f"{e.seconds}s. STOP.",
                         "WARNING",
                     )
 
                     break
+
+                # =========================
+                # PEER FLOOD
+                # =========================
 
                 except PeerFloodError:
 
                     state["running"] = False
+                    state["telegram_locked"] = True
+
+                    await set_setting(
+                        "telegram_locked",
+                        "1",
+                    )
 
                     await add_log(
-                        "🚫 Restrizione Telegram. STOP.",
+                        "🔒 Telegram ha rifiutato "
+                        "ulteriori inviti. "
+                        "Automazione bloccata.",
                         "WARNING",
                     )
 
                     break
+
+                # =========================
+                # ALTRO ERRORE
+                # =========================
 
                 except Exception as e:
 
@@ -896,16 +1077,49 @@ async def migration_worker(application):
                         "errors"
                     )
 
-                    await save_processed(
-                        user,
-                        f"ERROR:{type(e).__name__}",
-                    )
-
                     await add_log(
-                        f"⚠️ {display}: "
+                        f"❌ {display}: "
                         f"{type(e).__name__}",
                         "ERROR",
                     )
+
+                # =========================
+                # CONTROLLO TARGET
+                # =========================
+
+                stats = await get_today_stats()
+
+                if (
+                    stats["migrated"]
+                    >= state["daily_target"]
+                ):
+
+                    await add_log(
+                        "🎯 Obiettivo giornaliero raggiunto"
+                    )
+
+                    break
+
+                # =========================
+                # TIMER
+                # =========================
+
+                if (
+                    state["running"]
+                    and not state["telegram_locked"]
+                ):
+
+                    await add_log(
+                        f"⏱ Prossima operazione tra "
+                        f"{state['interval_minutes']} minuti"
+                    )
+
+                    completed = await interruptible_wait(
+                        state["interval_minutes"]
+                    )
+
+                    if not completed:
+                        break
 
             state["running"] = False
 
@@ -921,22 +1135,29 @@ async def migration_worker(application):
                     chat_id=ADMIN_USER_ID,
                     text=(
                         "🏁 CICLO TERMINATO\n\n"
-                        f"✅ Migrati oggi: "
+
+                        f"✅ Confermati: "
                         f"{stats['migrated']}/"
                         f"{state['daily_target']}\n"
-                        f"🔎 Tentativi oggi: "
+
+                        f"🔎 Tentativi: "
                         f"{stats['attempts']}\n"
+
                         f"🛡 Privacy: "
                         f"{stats['privacy']}\n"
+
                         f"↪️ Già presenti: "
                         f"{stats['already']}\n"
-                        f"⚠️ Errori: "
+
+                        f"⚠️ Non confermati: "
+                        f"{stats['unconfirmed']}\n"
+
+                        f"❌ Errori: "
                         f"{stats['errors']}"
                     ),
                 )
 
             except Exception:
-
                 logger.exception(
                     "Errore notifica finale"
                 )
@@ -970,6 +1191,7 @@ async def start(
 ):
 
     if not is_admin(update):
+
         await deny_access(update)
         return
 
@@ -991,15 +1213,19 @@ async def buttons(
     global worker_task
 
     if not is_admin(update):
+
         await deny_access(update)
         return
 
     query = update.callback_query
+
     await query.answer()
 
     data = query.data
 
-    # ---------------- A ----------------
+    # =====================================================
+    # GRUPPO A
+    # =====================================================
 
     if data == "set_a":
 
@@ -1008,7 +1234,7 @@ async def buttons(
         await query.edit_message_text(
             "📥 IMPOSTA GRUPPO A\n\n"
             "Inserisci @username, link t.me "
-            "oppure ID del gruppo sorgente.",
+            "oppure ID.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -1017,7 +1243,9 @@ async def buttons(
             ]]),
         )
 
-    # ---------------- B ----------------
+    # =====================================================
+    # GRUPPO B
+    # =====================================================
 
     elif data == "set_b":
 
@@ -1026,7 +1254,7 @@ async def buttons(
         await query.edit_message_text(
             "📤 IMPOSTA GRUPPO B\n\n"
             "Inserisci @username, link t.me "
-            "oppure ID del gruppo destinazione.",
+            "oppure ID.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -1035,7 +1263,9 @@ async def buttons(
             ]]),
         )
 
-    # ---------------- TARGET ----------------
+    # =====================================================
+    # TARGET 1-50
+    # =====================================================
 
     elif data == "target_minus":
 
@@ -1055,7 +1285,7 @@ async def buttons(
 
     elif data == "target_plus":
 
-        if state["daily_target"] < 5:
+        if state["daily_target"] < 50:
 
             state["daily_target"] += 1
 
@@ -1069,7 +1299,45 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # ---------------- MAX ATTEMPTS ----------------
+    # =====================================================
+    # INTERVALLO 10-120 MIN
+    # =====================================================
+
+    elif data == "interval_minus":
+
+        if state["interval_minutes"] > 10:
+
+            state["interval_minutes"] -= 5
+
+            await set_setting(
+                "interval_minutes",
+                state["interval_minutes"],
+            )
+
+        await query.edit_message_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+
+    elif data == "interval_plus":
+
+        if state["interval_minutes"] < 120:
+
+            state["interval_minutes"] += 5
+
+            await set_setting(
+                "interval_minutes",
+                state["interval_minutes"],
+            )
+
+        await query.edit_message_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+
+    # =====================================================
+    # MAX TENTATIVI
+    # =====================================================
 
     elif data == "attempts_minus":
 
@@ -1089,7 +1357,7 @@ async def buttons(
 
     elif data == "attempts_plus":
 
-        if state["max_attempts"] < 20:
+        if state["max_attempts"] < 50:
 
             state["max_attempts"] += 1
 
@@ -1103,16 +1371,29 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # ---------------- AVVIA ----------------
+    # =====================================================
+    # AVVIA
+    # =====================================================
 
     elif data == "start_run":
+
+        if state["telegram_locked"]:
+
+            await query.answer(
+                "🔒 Inviti sospesi dopo una "
+                "restrizione Telegram.",
+                show_alert=True,
+            )
+
+            return
 
         if state["running"]:
 
             await query.answer(
-                "Il ciclo è già attivo.",
+                "Processo già attivo.",
                 show_alert=True,
             )
+
             return
 
         if (
@@ -1121,9 +1402,10 @@ async def buttons(
         ):
 
             await query.answer(
-                "Esiste già un processo attivo.",
+                "Esiste già un worker attivo.",
                 show_alert=True,
             )
+
             return
 
         if (
@@ -1135,6 +1417,7 @@ async def buttons(
                 "Imposta prima A e B.",
                 show_alert=True,
             )
+
             return
 
         stats = await get_today_stats()
@@ -1145,22 +1428,35 @@ async def buttons(
         ):
 
             await query.answer(
-                "🎯 Limite giornaliero già raggiunto.",
+                "🎯 Limite giornaliero raggiunto.",
                 show_alert=True,
             )
+
             return
 
         await query.edit_message_text(
             "⚠️ CONFERMA AVVIO\n\n"
-            f"📥 Da: {state['group_a']['name']}\n"
-            f"📤 A: {state['group_b']['name']}\n\n"
-            f"🎯 Limite giornaliero: "
-            f"{state['daily_target']}\n"
-            f"✅ Già migrati oggi: "
+
+            f"📥 Da: "
+            f"{state['group_a']['name']}\n"
+
+            f"📤 A: "
+            f"{state['group_b']['name']}\n\n"
+
+            f"🎯 Target: "
+            f"{state['daily_target']}/giorno\n"
+
+            f"✅ Confermati oggi: "
             f"{stats['migrated']}\n"
-            f"🔎 Max tentativi/ciclo: "
+
+            f"⏱ Intervallo: "
+            f"{state['interval_minutes']} min\n"
+
+            f"🔎 Max tentativi: "
             f"{state['max_attempts']}\n\n"
-            "Avviare?",
+
+            "Avviare il ciclo?",
+
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "✅ CONFERMA",
@@ -1173,7 +1469,20 @@ async def buttons(
             ]]),
         )
 
+    # =====================================================
+    # CONFERMA
+    # =====================================================
+
     elif data == "confirm_run":
+
+        if state["telegram_locked"]:
+
+            await query.answer(
+                "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
+
+            return
 
         if (
             state["running"]
@@ -1187,6 +1496,7 @@ async def buttons(
                 "Processo già attivo.",
                 show_alert=True,
             )
+
             return
 
         stats = await get_today_stats()
@@ -1197,9 +1507,10 @@ async def buttons(
         ):
 
             await query.answer(
-                "Limite giornaliero raggiunto.",
+                "Limite già raggiunto.",
                 show_alert=True,
             )
+
             return
 
         state["running"] = True
@@ -1216,7 +1527,9 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # ---------------- PAUSA ----------------
+    # =====================================================
+    # PAUSA
+    # =====================================================
 
     elif data == "pause":
 
@@ -1225,7 +1538,7 @@ async def buttons(
             state["running"] = False
 
             await add_log(
-                "⏸ Pausa richiesta dall'amministratore"
+                "⏸ Pausa richiesta"
             )
 
         await query.edit_message_text(
@@ -1233,7 +1546,9 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # ---------------- STOP ----------------
+    # =====================================================
+    # STOP
+    # =====================================================
 
     elif data == "stop":
 
@@ -1241,7 +1556,7 @@ async def buttons(
         state["running"] = False
 
         await add_log(
-            "🛑 STOP richiesto dall'amministratore"
+            "🛑 STOP richiesto"
         )
 
         await query.edit_message_text(
@@ -1249,7 +1564,9 @@ async def buttons(
             reply_markup=main_keyboard(),
         )
 
-    # ---------------- STATISTICHE ----------------
+    # =====================================================
+    # STATISTICHE
+    # =====================================================
 
     elif data == "statistics":
 
@@ -1260,28 +1577,44 @@ async def buttons(
             "📊 STATISTICHE\n\n"
 
             "📅 OGGI\n"
-            f"✅ Migrati: "
+
+            f"✅ Confermati: "
             f"{today['migrated']}/"
             f"{state['daily_target']}\n"
+
             f"🔎 Tentativi: "
             f"{today['attempts']}\n"
+
             f"🛡 Privacy: "
             f"{today['privacy']}\n"
+
             f"↪️ Già presenti: "
             f"{today['already']}\n"
-            f"⚠️ Errori: "
+
+            f"⚠️ Non confermati: "
+            f"{today['unconfirmed']}\n"
+
+            f"❌ Errori: "
             f"{today['errors']}\n\n"
 
             "📈 TOTALI\n"
-            f"✅ Migrati: "
+
+            f"✅ Confermati: "
             f"{total['migrated']}\n"
+
             f"🔎 Tentativi: "
             f"{total['attempts']}\n"
+
             f"🛡 Privacy: "
             f"{total['privacy']}\n"
+
             f"↪️ Già presenti: "
             f"{total['already']}\n"
-            f"⚠️ Errori: "
+
+            f"⚠️ Non confermati: "
+            f"{total['unconfirmed']}\n"
+
+            f"❌ Errori: "
             f"{total['errors']}"
         )
 
@@ -1295,7 +1628,9 @@ async def buttons(
             ]]),
         )
 
-    # ---------------- LOG ----------------
+    # =====================================================
+    # LOG
+    # =====================================================
 
     elif data == "logs":
 
@@ -1316,9 +1651,7 @@ async def buttons(
 
         lines = []
 
-        for created_at, message in reversed(
-            rows
-        ):
+        for created_at, message in reversed(rows):
 
             try:
 
@@ -1327,10 +1660,13 @@ async def buttons(
                 )
 
                 if dt.tzinfo is None:
+
                     dt = dt.replace(
                         tzinfo=ITALY_TZ
                     )
+
                 else:
+
                     dt = dt.astimezone(
                         ITALY_TZ
                     )
@@ -1363,31 +1699,33 @@ async def buttons(
                     InlineKeyboardButton(
                         "🔄 AGGIORNA",
                         callback_data="logs",
-                    ),
+                    )
                 ],
                 [
                     InlineKeyboardButton(
                         "🗑 PULISCI LOG",
                         callback_data="clear_logs_confirm",
-                    ),
+                    )
                 ],
                 [
                     InlineKeyboardButton(
                         "⬅️ INDIETRO",
                         callback_data="home",
-                    ),
+                    )
                 ],
             ]),
         )
 
-    # ---------------- CLEAR LOG ----------------
+    # =====================================================
+    # PULISCI LOG
+    # =====================================================
 
     elif data == "clear_logs_confirm":
 
         await query.edit_message_text(
             "⚠️ Cancellare il LOG?\n\n"
-            "Gli utenti già processati e le "
-            "statistiche NON verranno cancellati.",
+            "Statistiche e utenti processati "
+            "rimarranno memorizzati.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🗑 SÌ",
@@ -1405,9 +1743,7 @@ async def buttons(
         await clear_logs()
 
         await query.edit_message_text(
-            "✅ Log cancellato.\n\n"
-            "Storico utenti e statistiche "
-            "sono rimasti intatti.",
+            "✅ Log cancellato.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "⬅️ INDIETRO",
@@ -1416,7 +1752,50 @@ async def buttons(
             ]]),
         )
 
-    # ---------------- HOME ----------------
+    # =====================================================
+    # SBLOCCO MANUALE
+    # =====================================================
+
+    elif data == "unlock_confirm":
+
+        await query.edit_message_text(
+            "⚠️ RIABILITARE GLI INVITI?\n\n"
+            "Procedi solo dopo aver verificato "
+            "che Telegram consenta nuovamente "
+            "gli inviti.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🔓 CONFERMA",
+                    callback_data="unlock",
+                ),
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="home",
+                ),
+            ]]),
+        )
+
+    elif data == "unlock":
+
+        state["telegram_locked"] = False
+
+        await set_setting(
+            "telegram_locked",
+            "0",
+        )
+
+        await add_log(
+            "🔓 Blocco inviti rimosso manualmente"
+        )
+
+        await query.edit_message_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+
+    # =====================================================
+    # HOME
+    # =====================================================
 
     elif data == "home":
 
@@ -1432,7 +1811,7 @@ async def buttons(
 
 
 # =========================================================
-# INPUT GRUPPI
+# INPUT A/B
 # =========================================================
 
 async def text_input(
@@ -1441,6 +1820,7 @@ async def text_input(
 ):
 
     if not is_admin(update):
+
         await deny_access(update)
         return
 
@@ -1469,6 +1849,7 @@ async def text_input(
             await update.message.reply_text(
                 "❌ A e B devono essere diversi."
             )
+
             return
 
         if target == "a":
@@ -1504,7 +1885,7 @@ async def text_input(
             f"✅ GRUPPO {label} IMPOSTATO\n\n"
             f"👥 {group['name']}\n"
             f"🆔 {group['id']}\n\n"
-            "💾 Configurazione salvata.",
+            "💾 Salvato.",
             reply_markup=main_keyboard(),
         )
 
@@ -1547,7 +1928,7 @@ async def post_init(application):
     )
 
     logger.info(
-        "Timezone applicazione: Europe/Rome"
+        "Timezone: Europe/Rome"
     )
 
 
@@ -1594,7 +1975,7 @@ def main():
     )
 
     logger.info(
-        "BestPrice Member Manager V4.1 avviato"
+        "BestPrice Member Manager V4.2 avviato"
     )
 
     application.run_polling()
