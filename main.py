@@ -1450,78 +1450,68 @@ async def invite_one(
             display,
         )
 
-    except (
-        UserPrivacyRestrictedError,
-        UserNotMutualContactError,
-    ):
+    except UserPrivacyRestrictedError as e:
 
-        await increment_stat(
-            "privacy"
-        )
-
-        await save_processed(
-            user,
-            "PRIVACY",
-        )
+        await increment_stat("privacy")
+        await save_processed(user, "PRIVACY")
 
         await add_log(
-            f"🛡 {mode} — "
-            f"Privacy: "
-            f"{display}"
+            f"🛡 {mode} — {display} — "
+            f"UserPrivacyRestrictedError: {str(e)[:180]}",
+            "WARNING",
         )
 
-        return (
-            "privacy",
-            display,
+        return ("privacy", display)
+
+    except UserNotMutualContactError as e:
+
+        await increment_stat("privacy")
+        await save_processed(user, "PRIVACY")
+
+        await add_log(
+            f"🛡 {mode} — {display} — "
+            f"UserNotMutualContactError: {str(e)[:180]}",
+            "WARNING",
         )
+
+        return ("privacy", display)
 
     except FloodWaitError as e:
 
         state["running"] = False
 
         await add_log(
-            f"⏳ FloodWait "
-            f"{e.seconds}s. STOP.",
+            f"⏳ {mode} — {display} — FloodWaitError — "
+            f"Telegram richiede attesa di {e.seconds}s. "
+            "Ciclo fermato; nessun blocco locale PeerFlood impostato.",
             "WARNING",
         )
 
-        return (
-            "flood_wait",
-            display,
-        )
+        return ("flood_wait", display)
 
-    except PeerFloodError:
+    except PeerFloodError as e:
 
         state["running"] = False
         state["telegram_locked"] = True
 
-        await set_setting(
-            "telegram_locked",
-            "1",
-        )
+        await set_setting("telegram_locked", "1")
 
         await add_log(
-            "🔒 Telegram ha rifiutato "
-            "ulteriori inviti. "
-            "Automazione bloccata.",
+            f"🚫 {mode} — {display} — PeerFloodError — "
+            f"risposta Telegram: {str(e)[:180]} — "
+            "STOP e blocco locale del bot attivato.",
             "WARNING",
         )
 
-        return (
-            "peer_flood",
-            display,
-        )
+        return ("peer_flood", display)
 
     except Exception as e:
 
-        await increment_stat(
-            "errors"
-        )
+        await increment_stat("errors")
 
         await add_log(
-            f"❌ {mode} — "
-            f"{display}: "
-            f"{type(e).__name__}",
+            f"❌ {mode} — {display} — "
+            f"{type(e).__name__}: {str(e)[:220]}",
             "ERROR",
         )
 
@@ -2956,7 +2946,7 @@ async def post_init(
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.3.3"
+        "V4.3.4"
     )
 
 
@@ -3007,7 +2997,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.3.3 avviato"
+        "V4.3.4 avviato"
     )
 
     application.run_polling()
