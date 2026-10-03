@@ -1,128 +1,96 @@
+import os
+import asyncio
+import logging
+import math
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-            label = "B"
+import aiosqlite
 
-        state["waiting_for"] = None
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-        await add_log(
-            f"⚙️ Gruppo {label} "
-            f"impostato: "
-            f"{group['name']}"
-        )
-
-        await update.message.reply_text(
-            f"✅ GRUPPO {label} "
-            f"IMPOSTATO\n\n"
-
-            f"👥 {group['name']}\n"
-            f"🆔 {group['id']}\n\n"
-
-            "💾 Salvato.",
-
-            reply_markup=main_keyboard(),
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Errore impostazione gruppo"
-        )
-
-        await update.message.reply_text(
-            "❌ Gruppo non utilizzabile.\n\n"
-            f"Errore: "
-            f"{type(e).__name__}"
-        )
-
-
-# =========================================================
-# INIT
-# =========================================================
-
-async def post_init(
-    application,
-):
-
-    await init_db()
-    await load_settings()
-    await ensure_today()
-
-    await user_client.connect()
-
-    if not (
-        await user_client.is_user_authorized()
-    ):
-
-        raise RuntimeError(
-            "TELEGRAM_SESSION "
-            "non autorizzata."
-        )
-
-    me = await user_client.get_me()
-
-    logger.info(
-        "Account operativo: "
-        "%s (%s)",
-        me.first_name,
-        me.id,
-    )
-
-    logger.info(
-        "BestPrice Member Manager "
-        "V4.3.2"
-    )
-
-
-async def post_shutdown(
-    application,
-):
-
-    state["running"] = False
-    state["stop_requested"] = True
-
-    await user_client.disconnect()
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import (
+    FloodWaitError,
+    PeerFloodError,
+    UserPrivacyRestrictedError,
+    UserNotMutualContactError,
+    UserAlreadyParticipantError,
+)
+from telethon.tl.functions.channels import (
+    InviteToChannelRequest,
+    GetParticipantRequest,
+)
+from telethon.tl.types import Channel, Chat
 
 
 # =========================================================
-# MAIN
+# CONFIG
 # =========================================================
 
-def main():
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+TELEGRAM_SESSION = os.environ["TELEGRAM_SESSION"]
+ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+DB_PATH = "/data/manager.db"
+ITALY_TZ = ZoneInfo("Europe/Rome")
+PAGE_SIZE = 20
 
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
 
-    application.add_handler(
-        CallbackQueryHandler(
-            buttons
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            text_input,
-        )
-    )
-
-    logger.info(
-        "BestPrice Member Manager "
-        "V4.3.2 avviato"
-    )
-
-    application.run_polling()
+logger = logging.getLogger(__name__)
 
 
-if __name__ == "__main__":
+# =========================================================
+# TELETHON
+# =========================================================
+
+user_client = TelegramClient(
+    StringSession(TELEGRAM_SESSION),
+    API_ID,
+    API_HASH,
+)
+
+
+# =========================================================
+# STATO
+# =========================================================
+
+state = {
+    "group_a": None,
+    "group_b": None,
+
+    "daily_target": 1,
+    "max_attempts": 3,
+    "interval_minutes": 10,
+
+    "running": False,
+    "stop_requested": False,
+    "telegram_locked": False,
+
+    "waiting_for": None,
+
+    "member_page": 0,
+    "manual_ids": [],
+    "manual_members": [],
+
+    "extract_diag": {
+        "telegram_count": 0,
+        "received": 0,
+        "bots": 0,
+        "deleted": 0,
