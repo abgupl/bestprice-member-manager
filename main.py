@@ -3174,6 +3174,71 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+
+# =========================================================
+# MODERAZIONE GRUPPO B
+# =========================================================
+
+_LINK_RE = re.compile(
+    r"(?i)(?:https?://|www\.|t\.me/|telegram\.me/|(?:[a-z0-9-]+\.)+(?:com|it|net|org|eu|io|co|me|app|dev|info|biz)(?:/|\b))"
+)
+
+
+def _message_contains_link(message):
+    """Rileva link espliciti, link Telegram e URL incorporati nel testo/caption."""
+    if not message:
+        return False
+
+    for entity in list(message.entities or []) + list(message.caption_entities or []):
+        if entity.type in ("url", "text_link"):
+            return True
+
+    content = (message.text or message.caption or "").strip()
+    return bool(content and _LINK_RE.search(content))
+
+
+async def moderate_group_b_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Nel Gruppo B elimina silenziosamente i messaggi degli utenti che contengono link."""
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat:
+        return
+
+    # Moderazione esclusivamente nel Gruppo B configurato.
+    if not state.get("group_b") or not _same_telegram_chat_id(
+        chat.id,
+        state["group_b"].get("id"),
+    ):
+        return
+
+    # Non toccare i messaggi inviati dal bot stesso.
+    if user and user.is_bot:
+        return
+
+    if not _message_contains_link(message):
+        return
+
+    try:
+        await context.bot.delete_message(
+            chat_id=chat.id,
+            message_id=message.message_id,
+        )
+        who = (
+            f"@{user.username}"
+            if user and user.username
+            else (user.full_name if user else "utente")
+        )
+        await add_log(f"🗑 Link eliminato nel Gruppo B — {who}")
+    except Exception as e:
+        logger.warning(
+            "Impossibile eliminare messaggio con link nel Gruppo B %s: %s",
+            message.message_id,
+            e,
+        )
+        await add_log("⚠️ Link rilevato nel Gruppo B ma eliminazione non riuscita")
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -3210,7 +3275,15 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT
+            filters.ChatType.GROUPS,
+            moderate_group_b_links,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & filters.TEXT
             & ~filters.COMMAND,
             text_input,
         )
@@ -3218,7 +3291,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.4.3 avviato"
+        "V4.4.8 avviato"
     )
 
     application.run_polling()
