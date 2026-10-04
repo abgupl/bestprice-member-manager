@@ -320,6 +320,13 @@ async def init_db():
         """)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS invitation_optout (
+                chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, requested_at TEXT NOT NULL,
+                PRIMARY KEY(chat_id, user_id)
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS invitation_recovery (
                 session_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
                 source_id INTEGER NOT NULL, destination_id INTEGER NOT NULL,
@@ -730,7 +737,22 @@ async def save_processed(
         await db.commit()
 
 
+async def invitation_opted_out(user_id, chat_id=None):
+    if chat_id is None:
+        chat_id = int(state["group_b"]["id"])
+        if chat_id > 0:
+            chat_id = -1000000000000 - chat_id
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM invitation_optout WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        return await cursor.fetchone() is not None
+
+
 async def was_processed(user_id):
+    if await invitation_opted_out(user_id):
+        return True
 
     async with aiosqlite.connect(DB_PATH) as db:
 
@@ -1606,7 +1628,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.6.5\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.6.6\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -1696,6 +1718,9 @@ def missing_invitee_detail(item):
 
 
 async def invite_one(destination, user, mode):
+    if await invitation_opted_out(user.id):
+        await add_log(f"🚪 {mode} — ID {user.id} — uscita richiesta dall'utente: invito escluso")
+        return ("privacy", str(user.id))
     display = f"@{user.username}" if getattr(user, "username", None) else f"ID {user.id}"
     previous_status = await processed_status(user.id)
     pending = previous_status in {"UNCONFIRMED", "VERIFY_PENDING"}
@@ -3674,7 +3699,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.6.5 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.6.6 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -3808,14 +3833,18 @@ async def send_welcome_once(bot, chat_id, member, origin, session_id=0):
                 "così puoi trovarle subito senza perderti tra centinaia di prodotti.\n\n"
                 "💡 <b>Il consiglio:</b> entra nel canale e attiva le notifiche per non perdere "
                 "le occasioni migliori.\n\n"
-                "👇 <b>Ci vediamo nel canale!</b>"
+                "👇 <b>Ci vediamo nel canale!</b>\n\n"
+                "Se non desideri restare, premi il pulsante qui sotto: uscirai dal gruppo "
+                "e non verrai invitato di nuovo automaticamente."
             )
             sent = await bot.send_message(
                 chat_id=chat_id, text=text, parse_mode="HTML",
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔥 SCOPRI LE OFFERTE", url=CHANNEL_URL)]
+                    [InlineKeyboardButton("🔥 SCOPRI LE OFFERTE", url=CHANNEL_URL)],
+                    [InlineKeyboardButton("🚪 NON DESIDERO RESTARE", callback_data=f"welcome_exit:{user_id}")],
                 ]),
+                api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": user_id}},
             )
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
@@ -3823,11 +3852,8 @@ async def send_welcome_once(bot, chat_id, member, origin, session_id=0):
                     (chat_id, user_id, now_it().isoformat(), sent.message_id),
                 )
                 await db.commit()
-            task = asyncio.create_task(_delete_welcome_later(bot, chat_id, sent.message_id))
-            welcome_tasks.add(task)
-            task.add_done_callback(welcome_tasks.discard)
             await add_log(
-                f"👋 BENVENUTO INVIATO — ID {user_id} — {origin} — messaggio {sent.message_id}",
+                f"👋 BENVENUTO RISERVATO INVIATO — ID {user_id} — {origin} — messaggio {sent.message_id}",
                 session_id=session_id,
             )
             return True
@@ -3838,6 +3864,48 @@ async def send_welcome_once(bot, chat_id, member, origin, session_id=0):
             f"{type(exc).__name__}: {str(exc)[:220]}", "ERROR", session_id=session_id,
         )
         return False
+
+
+async def welcome_exit(update, context):
+    query = update.callback_query
+    try:
+        target = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("Pulsante non valido.", show_alert=True)
+        return
+    if query.from_user.id != target:
+        await query.answer("Questo pulsante è riservato al destinatario del benvenuto.", show_alert=True)
+        return
+    message = query.message
+    if message is None:
+        await query.answer("Apri il pulsante nel gruppo.", show_alert=True)
+        return
+    chat_id = message.chat.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM welcome_sent WHERE chat_id = ? AND user_id = ?", (chat_id, target))
+        if not await cursor.fetchone():
+            await query.answer("Benvenuto non disponibile.", show_alert=True)
+            return
+        await db.execute(
+            "INSERT OR REPLACE INTO invitation_optout VALUES (?, ?, ?)",
+            (chat_id, target, now_it().isoformat()),
+        )
+        await db.commit()
+    await query.answer("Uscita richiesta. Non verrai invitato nuovamente.", show_alert=True)
+    try:
+        # Rimuove il membro senza impedirgli un futuro ingresso volontario.
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=target, only_if_banned=False)
+        await add_log(f"🚪 USCITA VOLONTARIA — ID {target} — gruppo {chat_id}; futuri inviti esclusi", session_id=0)
+    except Exception as exc:
+        await add_log(f"❌ USCITA FALLITA — ID {target} — {type(exc).__name__}: {str(exc)[:220]}", "ERROR", session_id=0)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Non riesco a rimuovere il tuo account. Puoi uscire dal menu del gruppo. Non verrai invitato di nuovo.",
+                api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": target, "callback_query_id": query.id}},
+            )
+        except Exception:
+            logger.exception("Impossibile notificare l'errore di uscita")
 
 
 async def welcome_confirmed_invite(destination, user):
@@ -3967,11 +4035,8 @@ def main():
         )
     )
 
-    application.add_handler(
-        CallbackQueryHandler(
-            buttons
-        )
-    )
+    application.add_handler(CallbackQueryHandler(welcome_exit, pattern=r"^welcome_exit:"))
+    application.add_handler(CallbackQueryHandler(buttons))
 
     application.add_handler(
         MessageHandler(
@@ -4005,7 +4070,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.6.5 avviato"
+        "V4.6.6 avviato"
     )
 
     application.run_polling()
