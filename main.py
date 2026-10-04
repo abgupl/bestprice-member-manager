@@ -1606,7 +1606,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.6.4\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.6.5\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -2077,7 +2077,11 @@ async def migration_worker(
 
                 stats = await get_today_stats()
                 sent_attempt = stats["attempts"] > attempts_before
-                if sent_attempt:
+                status = await processed_status(user.id)
+                definite_skip = result in {"privacy", "already"} or status in {
+                    "PRIVACY", "INVITE_REJECTED", "ALREADY", "RECIPIENT_ERROR", "CHANNEL_LIMIT"
+                }
+                if sent_attempt and not definite_skip:
                     attempts_cycle += 1
 
                 if (
@@ -2092,12 +2096,14 @@ async def migration_worker(
 
                     break
 
-                if not sent_attempt:
-                    # Un controllo di presenza non è un invito: passa al prossimo utente.
-                    continue
                 if attempts_cycle >= state["max_attempts"]:
                     await add_log("🛑 MAX tentativi raggiunto")
                     break
+                if result != "confirmed":
+                    await add_log(
+                        f"↪️ 🤖 AUTO — {display} — nessuna aggiunta confermata; passo al prossimo utente senza attesa"
+                    )
+                    continue
 
                 if state["running"]:
 
@@ -3668,7 +3674,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.6.4 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.6.5 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -3999,7 +4005,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.6.4 avviato"
+        "V4.6.5 avviato"
     )
 
     application.run_polling()
