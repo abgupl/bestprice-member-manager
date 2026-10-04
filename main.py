@@ -716,7 +716,7 @@ async def was_processed(user_id):
 
         cursor = await db.execute(
             """
-            SELECT 1
+            SELECT status
             FROM processed
             WHERE user_id = ?
               AND source_id = ?
@@ -732,7 +732,17 @@ async def was_processed(user_id):
 
         row = await cursor.fetchone()
 
-    return row is not None
+    return row is not None and row[0] not in {"UNCONFIRMED", "VERIFY_PENDING"}
+
+
+async def processed_status(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT status FROM processed WHERE user_id = ? AND source_id = ? AND destination_id = ?",
+            (user_id, state["group_a"]["id"], state["group_b"]["id"]),
+        )
+        row = await cursor.fetchone()
+    return row[0] if row else None
 
 
 def sync_session_state():
@@ -1552,7 +1562,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.6.0\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.6.1\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -1565,118 +1575,156 @@ async def home_text():
 # INVITO SINGOLO
 # =========================================================
 
-async def invite_one(
-    destination,
-    user,
-    mode,
-):
+DESTINATION_ERRORS = {
+    "ChatWriteForbiddenError", "ChatAdminRequiredError", "ChannelPrivateError",
+    "ChannelInvalidError", "ChatInvalidError", "UserBannedInChannelError",
+    "UsersTooMuchError",
+}
+STOP_INVITE_RESULTS = {"peer_flood", "flood_wait", "destination_error", "verification_error"}
 
-    display = (
-        f"@{user.username}"
-        if getattr(
-            user,
-            "username",
-            None,
-        )
-        else f"ID {user.id}"
-    )
 
-    await increment_stat(
-        "attempts"
-    )
-
+async def stop_invites_for_destination(display, mode, error_name, message):
+    state["running"] = False
+    state["auto_enabled"] = False
+    await set_setting("auto_enabled", "0")
+    await increment_stat("errors")
     await add_log(
-        f"{mode} — Tentativo: "
-        f"{display}"
+        f"🛑 {mode} — {display} — PROBLEMA GRUPPO B — "
+        f"{error_name}: {message[:220]} — ciclo e programmazione AUTO fermati. "
+        "Controlla accesso, permessi e capacità del gruppo B per questa sessione. "
+        "Nessun blocco antispam locale impostato.", "ERROR",
     )
+    return ("destination_error", display)
 
+
+async def report_verification_problem(display, mode, error_name, message):
+    if error_name == "PeerFloodError":
+        state["running"] = False
+        state["auto_enabled"] = False
+        state["telegram_locked"] = True
+        state["telegram_restriction_detected"] = True
+        await set_setting("auto_enabled", "0")
+        await set_setting("telegram_locked", "1")
+        await set_setting("telegram_restriction_detected", "1")
+        await add_log(
+            f"🛑 {mode} — {display} — LIMITAZIONE DURANTE LA VERIFICA — "
+            f"{error_name}: {(message or '')[:220]} — ciclo fermato e blocco locale attivato", "WARNING",
+        )
+        return ("peer_flood", display)
+    if error_name == "FloodWaitError":
+        state["running"] = False
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+        await add_log(
+            f"⏳ {mode} — {display} — ATTESA TELEGRAM DURANTE LA VERIFICA — "
+            f"{error_name}: {(message or '')[:220]} — ciclo fermato; rispetta l'attesa richiesta", "WARNING",
+        )
+        return ("flood_wait", display)
+    if error_name in DESTINATION_ERRORS:
+        return await stop_invites_for_destination(display, mode, error_name, message or "")
+    state["running"] = False
+    state["auto_enabled"] = False
+    await set_setting("auto_enabled", "0")
+    await increment_stat("errors")
+    await add_log(
+        f"⚠️ {mode} — {display} — PRESENZA NON VERIFICABILE — "
+        f"{error_name or 'ErroreSconosciuto'}: {(message or '')[:220]} — "
+        "ciclo e programmazione AUTO fermati; nessun nuovo invito. "
+        "L'esito resta da verificare.", "WARNING",
+    )
+    return ("verification_error", display)
+
+
+def missing_invitee_detail(item):
+    """Legge solo i campi documentati, senza esporre l'intera risposta."""
+    premium_invite = getattr(item, "premium_would_allow_invite", None)
+    premium_pm = getattr(item, "premium_required_for_pm", None)
+    if premium_invite:
+        reason = "Telegram indica che l'account invitante necessita di Premium per questo invito"
+    elif premium_pm:
+        reason = "Telegram indica privacy del destinatario e requisito Premium per un messaggio privato"
+    elif hasattr(item, "premium_would_allow_invite") and hasattr(item, "premium_required_for_pm"):
+        reason = "Telegram indica che le impostazioni privacy impediscono l'aggiunta diretta"
+    else:
+        reason = "Telegram segnala il destinatario come non invitato; causa non specificata"
+    return (f"{reason}; premium_would_allow_invite={premium_invite}; "
+            f"premium_required_for_pm={premium_pm}")
+
+
+async def invite_one(destination, user, mode):
+    display = f"@{user.username}" if getattr(user, "username", None) else f"ID {user.id}"
+    previous_status = await processed_status(user.id)
+    pending = previous_status in {"UNCONFIRMED", "VERIFY_PENDING"}
+    await add_log(
+        f"🔍 {mode} — {display} — "
+        + ("Esito precedente incerto: solo verifica, nessun nuovo invito" if pending
+           else "Controllo presenza nel gruppo B prima dell'invito")
+    )
+    confirmed, error_name, error_message = await verify_in_destination(destination, user)
+    if confirmed:
+        if pending:
+            await increment_stat("migrated")
+            await save_processed(user, "CONFIRMED")
+            await add_log(f"✅ {mode} — {display} — PRESENZA CONFERMATA dopo esito precedente incerto")
+            return ("confirmed", display)
+        await increment_stat("already")
+        await save_processed(user, "ALREADY")
+        await add_log(f"↪️ {mode} — {display} — GIÀ PRESENTE nel gruppo B; nessun invito")
+        return ("already", display)
+    if error_name != "UserNotParticipantError":
+        return await report_verification_problem(display, mode, error_name, error_message)
+    if pending:
+        # Vecchi UNCONFIRMED vengono recuperati come verifiche, non nuovi inviti.
+        await save_processed(user, "NOT_ADDED")
+        await add_log(
+            f"⚠️ {mode} — {display} — NON PRESENTE dopo il precedente tentativo — "
+            f"{error_name}: {(error_message or '')[:220]} — nessun nuovo invito automatico", "WARNING",
+        )
+        return ("unconfirmed", display)
+
+    await increment_stat("attempts")
+    await add_log(f"{mode} — Tentativo: {display}")
     try:
-
-        await user_client(
-            InviteToChannelRequest(
-                destination,
-                [user],
+        response = await user_client(InviteToChannelRequest(destination, [user]))
+        # Persistenza immediata: una verifica inconcludente non deve causare reinviti.
+        await save_processed(user, "VERIFY_PENDING")
+        missing = getattr(response, "missing_invitees", None)
+        matched = [item for item in (missing or []) if getattr(item, "user_id", None) == user.id]
+        await add_log(
+            f"📨 {mode} — {display} — RISPOSTA TELEGRAM: {type(response).__name__}; "
+            + (f"missing_invitees={len(missing)}" if missing is not None
+               else "missing_invitees non disponibile in questa risposta")
+            + " — risposta ricevuta; aggiunta non ancora confermata"
+        )
+        if matched:
+            detail = " | ".join(missing_invitee_detail(item) for item in matched)
+            await increment_stat("unconfirmed")
+            await save_processed(user, "INVITE_REJECTED")
+            await add_log(
+                f"🚫 {mode} — {display} (ID {user.id}) — NON INVITATO — "
+                f"missing_invitees: {detail}", "WARNING",
             )
-        )
+            return ("unconfirmed", display)
 
-        await add_log(
-            f"📨 {mode} — {display} — "
-            "Richiesta inviata a Telegram — verifica in corso"
-        )
-
-        await add_log(
-            f"🔍 {mode} — {display} — "
-            "verifica presenza tra 10 secondi"
-        )
-
+        await add_log(f"🔍 {mode} — {display} — verifica presenza tra 10 secondi")
         await asyncio.sleep(10)
-
-        (
-            confirmed,
-            verify_error,
-            verify_message,
-        ) = await verify_in_destination(
-            destination,
-            user,
-        )
-
+        confirmed, verify_error, verify_message = await verify_in_destination(destination, user)
         if confirmed:
-
-            await add_log(
-                f"🔍 {mode} — {display} — "
-                "Verifica completata: utente presente"
-            )
-
-            await increment_stat(
-                "migrated"
-            )
-
-            await save_processed(
-                user,
-                "CONFIRMED",
-            )
-
-            await add_log(
-                f"✅ {mode} — {display} — "
-                "AGGIUNTO AL GRUPPO"
-            )
-
-            return (
-                "confirmed",
-                display,
-            )
-
-        await increment_stat(
-            "unconfirmed"
-        )
-
-        await save_processed(
-            user,
-            "UNCONFIRMED",
-        )
-
-        # La richiesta Telegram non equivale a un'aggiunta riuscita:
-        # il successo viene conteggiato solo dopo la verifica effettiva.
-        if verify_error == "UserNotParticipantError":
-            dettaglio_verifica = (
-                "Telegram ha accettato la richiesta, ma l'utente "
-                "non risulta nel gruppo"
-            )
-        else:
-            dettaglio_verifica = (
-                f"Verifica non riuscita ({verify_error or 'errore sconosciuto'})"
-            )
-
+            await increment_stat("migrated")
+            await save_processed(user, "CONFIRMED")
+            await add_log(f"✅ {mode} — {display} — AGGIUNTO AL GRUPPO — presenza verificata")
+            return ("confirmed", display)
+        if verify_error != "UserNotParticipantError":
+            # Mantiene VERIFY_PENDING: al prossimo controllo non invia un altro invito.
+            return await report_verification_problem(display, mode, verify_error, verify_message)
+        await increment_stat("unconfirmed")
+        await save_processed(user, "NOT_ADDED")
         await add_log(
-            f"⚠️ {mode} — {display} — NON AGGIUNTO — "
-            f"{dettaglio_verifica}",
-            "WARNING",
+            f"⚠️ {mode} — {display} — NON PRESENTE NEL GRUPPO B — "
+            f"{verify_error}: {(verify_message or '')[:220]} — "
+            "nessuna causa di mancata aggiunta disponibile nella risposta Telegram", "WARNING",
         )
-
-        return (
-            "unconfirmed",
-            display,
-        )
+        return ("unconfirmed", display)
 
     except UserAlreadyParticipantError:
 
@@ -1767,6 +1815,15 @@ async def invite_one(
     except Exception as e:
 
         error_name = type(e).__name__
+
+        if isinstance(e, (TimeoutError, ConnectionError, OSError)):
+            # La richiesta potrebbe essere arrivata a Telegram prima della caduta
+            # di connessione: il tentativo seguente dovrà soltanto verificarla.
+            await save_processed(user, "VERIFY_PENDING")
+            return await report_verification_problem(display, mode, error_name, str(e))
+
+        if error_name in DESTINATION_ERRORS:
+            return await stop_invites_for_destination(display, mode, error_name, str(e))
 
         # Solo errori riferiti esplicitamente al destinatario vengono salvati
         # come processati. Errori generici o del gruppo restano riprovabili.
@@ -1960,10 +2017,7 @@ async def migration_worker(
                     )
                 )
 
-                if result in (
-                    "peer_flood",
-                    "flood_wait",
-                ):
+                if result in STOP_INVITE_RESULTS:
                     break
 
                 stats = (
@@ -2168,13 +2222,15 @@ async def run_manual_invites():
             "peer_flood": "🔒",
             "flood_wait": "⏳",
             "error": "❌",
+            "destination_error": "🛑",
+            "verification_error": "⚠️",
         }
 
         results.append(
             f"{labels.get(result, '❓')} {display}"
         )
 
-        if result in ("peer_flood", "flood_wait"):
+        if result in STOP_INVITE_RESULTS:
             break
 
     state["manual_ids"] = []
@@ -2189,6 +2245,7 @@ async def run_contact_queue(bot, chat_id, refs):
     try:
         destination = await user_client.get_entity(state["group_b"]["input"])
         total = len(refs)
+        interrupted = False
         for index, ref in enumerate(refs, start=1):
             if state["telegram_locked"]:
                 await add_log("🛑 📒 RUBRICA — coda fermata: inviti sospesi")
@@ -2199,7 +2256,8 @@ async def run_contact_queue(bot, chat_id, refs):
                 await add_log(f"❌ 📒 RUBRICA — {shown} non risolvibile", "ERROR")
             else:
                 result, display = await invite_one(destination, user, "📒 RUBRICA")
-                if result in ("peer_flood", "flood_wait"):
+                if result in STOP_INVITE_RESULTS:
+                    interrupted = True
                     break
             if index < total and not state["telegram_locked"]:
                 minutes = state["contact_interval_minutes"]
@@ -2207,6 +2265,8 @@ async def run_contact_queue(bot, chat_id, refs):
                 await asyncio.sleep(minutes * 60)
         if state["telegram_locked"]:
             await bot.send_message(chat_id, "🔒 Coda Rubrica interrotta per una limitazione Telegram. Controlla il LOG.")
+        elif interrupted:
+            await bot.send_message(chat_id, "🛑 Coda Rubrica interrotta. Controlla il LOG per il motivo; i contatti successivi non sono stati tentati.")
         else:
             await bot.send_message(chat_id, "✅ Coda Rubrica completata. Controlla il LOG per il dettaglio.")
     except Exception as e:
@@ -3533,7 +3593,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.6.0 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.6.1 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -3810,7 +3870,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.6.0 avviato"
+        "V4.6.1 avviato"
     )
 
     application.run_polling()
