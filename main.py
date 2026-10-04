@@ -80,6 +80,8 @@ state = {
     "daily_target": 1,
     "max_attempts": 3,
     "interval_minutes": 10,
+    "contact_interval_minutes": 5,
+    "contact_queue_running": False,
     "start_time": "09:00",
     "auto_enabled": False,
     "last_autostart_day": "",
@@ -289,6 +291,10 @@ async def load_settings():
             "interval_minutes",
             "10",
         )
+    )
+
+    state["contact_interval_minutes"] = int(
+        await get_setting("contact_interval_minutes", "5")
     )
 
     state["start_time"] = await get_setting(
@@ -1233,6 +1239,11 @@ def contacts_keyboard():
             InlineKeyboardButton("▶️", callback_data="contacts_next"),
         ],
         [InlineKeyboardButton("➕ AGGIUNGI CONTATTI", callback_data="contacts_add")],
+        [
+            InlineKeyboardButton("➖", callback_data="contacts_interval_minus"),
+            InlineKeyboardButton(f"⏱ {state['contact_interval_minutes']} MIN", callback_data="noop"),
+            InlineKeyboardButton("➕", callback_data="contacts_interval_plus"),
+        ],
         [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
     ])
 
@@ -1964,6 +1975,43 @@ async def run_manual_invites():
     return results
 
 
+async def run_contact_queue(bot, chat_id, refs):
+    """Aggiunge il blocco Rubrica in background rispettando il timing dedicato."""
+    try:
+        destination = await user_client.get_entity(state["group_b"]["input"])
+        total = len(refs)
+        for index, ref in enumerate(refs, start=1):
+            if state["telegram_locked"]:
+                await add_log("🛑 📒 RUBRICA — coda fermata: inviti sospesi")
+                break
+            user = await resolve_manual_user(user_id=ref.get("id"), username=ref.get("username"))
+            shown = ("@" + ref["username"].lstrip("@")) if ref.get("username") else f"ID {ref.get('id')}"
+            if user is None:
+                await add_log(f"❌ 📒 RUBRICA — {shown} non risolvibile", "ERROR")
+            else:
+                result, display = await invite_one(destination, user, "📒 RUBRICA")
+                if result in ("peer_flood", "flood_wait"):
+                    break
+            if index < total and not state["telegram_locked"]:
+                minutes = state["contact_interval_minutes"]
+                await add_log(f"⏱ 📒 RUBRICA — prossimo contatto tra {minutes} minuti")
+                await asyncio.sleep(minutes * 60)
+        if state["telegram_locked"]:
+            await bot.send_message(chat_id, "🔒 Coda Rubrica interrotta per una limitazione Telegram. Controlla il LOG.")
+        else:
+            await bot.send_message(chat_id, "✅ Coda Rubrica completata. Controlla il LOG per il dettaglio.")
+    except Exception as e:
+        await add_log(f"❌ 📒 RUBRICA — errore coda: {type(e).__name__}: {e}", "ERROR")
+        try:
+            await bot.send_message(chat_id, f"❌ Errore nella coda Rubrica: {type(e).__name__}")
+        except Exception:
+            pass
+    finally:
+        state["contact_queue_running"] = False
+        state["manual_ids"] = []
+        state["manual_refs"] = []
+
+
 # =========================================================
 # /START
 # =========================================================
@@ -2592,7 +2640,7 @@ async def buttons(
         # La rubrica viene usata come sorgente manuale: l'admin copia una
         # pagina da 20 contatti e la incolla qui. Nessun contatto dell'intera
         # rubrica viene messo automaticamente in coda.
-        state["waiting_for"] = "manual_ids"
+        state["waiting_for"] = "contact_ids"
 
         await query.edit_message_text(
             "➕ AGGIUNGI CONTATTI RUBRICA\n\n"
@@ -2607,6 +2655,38 @@ async def buttons(
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ ANNULLA", callback_data="contacts")
             ]]),
+        )
+
+    elif data == "contacts_interval_minus":
+        if state["contact_interval_minutes"] > 1:
+            state["contact_interval_minutes"] -= 1
+            await set_setting("contact_interval_minutes", state["contact_interval_minutes"])
+        await query.edit_message_text(await contacts_page_text(state["contact_page"]), reply_markup=contacts_keyboard())
+
+    elif data == "contacts_interval_plus":
+        if state["contact_interval_minutes"] < 120:
+            state["contact_interval_minutes"] += 1
+            await set_setting("contact_interval_minutes", state["contact_interval_minutes"])
+        await query.edit_message_text(await contacts_page_text(state["contact_page"]), reply_markup=contacts_keyboard())
+
+    elif data == "contacts_confirm":
+        if state["telegram_locked"]:
+            await query.answer("🔒 Inviti sospesi.", show_alert=True)
+            return
+        if state.get("contact_queue_running"):
+            await query.answer("📒 Una coda Rubrica è già in esecuzione.", show_alert=True)
+            return
+        refs = list(state.get("manual_refs") or [])
+        if not refs:
+            await query.answer("Nessun contatto preparato.", show_alert=True)
+            return
+        state["contact_queue_running"] = True
+        asyncio.create_task(run_contact_queue(context.bot, query.message.chat_id, refs))
+        await query.edit_message_text(
+            f"▶️ CODA RUBRICA AVVIATA\n\nContatti: {len(refs)}\n"
+            f"⏱ Intervallo: {state['contact_interval_minutes']} minuti\n\n"
+            "Puoi continuare a usare il bot: la coda procede in background.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ HOME", callback_data="home")]])
         )
 
     # =====================================================
@@ -2999,7 +3079,7 @@ async def text_input(
     # ID MANUALI
     # =====================================================
 
-    if target == "manual_ids":
+    if target in ("manual_ids", "contact_ids"):
 
         raw = update.message.text
         members = []
@@ -3068,6 +3148,7 @@ async def text_input(
             return
 
         members = members[:20]
+        is_contact_batch = (target == "contact_ids")
         state["manual_refs"] = members
         state["manual_ids"] = [
             item["id"] for item in members if item["id"] is not None
@@ -3096,8 +3177,8 @@ async def text_input(
         )
 
         await update.message.reply_text(
-            "👤 CONFERMA INVITO MANUALE\n\n"
-            f"📤 Destinazione:\n{state['group_b']['name']}\n\n"
+            ("📒 CONFERMA CONTATTI RUBRICA\n\n" if is_contact_batch else "👤 CONFERMA INVITO MANUALE\n\n")
+            + f"📤 Destinazione:\n{state['group_b']['name']}\n\n"
             f"Utenti riconosciuti: {len(members)}\n\n"
             + "\n".join(preview_lines)
             + lock_note
@@ -3105,7 +3186,7 @@ async def text_input(
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "✅ CONFERMA",
-                    callback_data="manual_confirm",
+                    callback_data=("contacts_confirm" if is_contact_batch else "manual_confirm"),
                 ),
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -3514,7 +3595,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.5.1 avviato"
+        "V4.5.2 avviato"
     )
 
     application.run_polling()
