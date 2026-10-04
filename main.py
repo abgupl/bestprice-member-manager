@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.sessions import StringSession
 from telethon.errors import (
     FloodWaitError,
@@ -73,6 +73,9 @@ session_info = {}
 session_context = ContextVar("telegram_account", default=None)
 control_lock = asyncio.Lock()
 contact_task = None
+welcome_bot = None
+welcome_lock = asyncio.Lock()
+welcome_tasks = set()
 
 for account_id in (1, 2):
     suffix = "" if account_id == 1 else "_2"
@@ -307,6 +310,14 @@ async def init_db():
                 FROM extracted_contacts
             """)
             await db.execute("INSERT INTO settings(key, value) VALUES ('contacts_sessions_migrated', '1')")
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS welcome_sent (
+                chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                sent_at TEXT NOT NULL, message_id INTEGER NOT NULL,
+                PRIMARY KEY(chat_id, user_id)
+            )
+        """)
 
         # Compatibilità con database precedenti
         try:
@@ -1562,7 +1573,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.6.1\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.6.3\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -1666,6 +1677,7 @@ async def invite_one(destination, user, mode):
             await increment_stat("migrated")
             await save_processed(user, "CONFIRMED")
             await add_log(f"✅ {mode} — {display} — PRESENZA CONFERMATA dopo esito precedente incerto")
+            await welcome_confirmed_invite(destination, user)
             return ("confirmed", display)
         await increment_stat("already")
         await save_processed(user, "ALREADY")
@@ -1713,6 +1725,7 @@ async def invite_one(destination, user, mode):
             await increment_stat("migrated")
             await save_processed(user, "CONFIRMED")
             await add_log(f"✅ {mode} — {display} — AGGIUNTO AL GRUPPO — presenza verificata")
+            await welcome_confirmed_invite(destination, user)
             return ("confirmed", display)
         if verify_error != "UserNotParticipantError":
             # Mantiene VERIFY_PENDING: al prossimo controllo non invia un altro invito.
@@ -2306,6 +2319,16 @@ async def start(
 # CALLBACK BUTTONS
 # =========================================================
 
+async def callback_notice(query, text, show_alert=False):
+    """L'ack iniziale chiude lo spinner; gli avvisi successivi restano in chat."""
+    rows = []
+    if state["running"] or (worker_task is not None and not worker_task.done()):
+        rows.append([InlineKeyboardButton("🛑 FERMA AUTO", callback_data="stop")])
+    rows.append([InlineKeyboardButton("⬅️ HOME", callback_data="home")])
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    await add_log(f"ℹ️ Pannello — {text}", "WARNING")
+
+
 @serialized_control
 async def buttons(
     update: Update,
@@ -2333,14 +2356,14 @@ async def buttons(
         try:
             await select_session(account_id)
         except ValueError as exc:
-            await query.answer(str(exc), show_alert=True)
+            await callback_notice(query, str(exc), show_alert=True)
             return
         await query.edit_message_text(await home_text(), reply_markup=main_keyboard())
         return
     if data.startswith("check_session:"):
         account_id = int(data.split(":", 1)[1])
         if operation_busy():
-            await query.answer("Ferma le operazioni prima di verificare la connessione.", show_alert=True)
+            await callback_notice(query, "Ferma le operazioni prima di verificare la connessione.", show_alert=True)
             return
         await connect_session(account_id)
         await add_log("🔎 Connessione verificata: " + session_info[account_id]["error"],
@@ -2349,29 +2372,29 @@ async def buttons(
         return
     if data.startswith("unlock:"):
         if data != f"unlock:{state['active_session']}":
-            await query.answer("La sessione è cambiata: riapri lo sblocco dalla Home.", show_alert=True)
+            await callback_notice(query, "La sessione è cambiata: riapri lo sblocco dalla Home.", show_alert=True)
             return
         data = "unlock"
     elif data == "unlock":
-        await query.answer("Riapri lo sblocco dalla Home per confermare la sessione.", show_alert=True)
+        await callback_notice(query, "Riapri lo sblocco dalla Home per confermare la sessione.", show_alert=True)
         return
     if data == "unlock":
         if operation_busy():
-            await query.answer("Attendi la fine delle operazioni prima dello sblocco.", show_alert=True)
+            await callback_notice(query, "Attendi la fine delle operazioni prima dello sblocco.", show_alert=True)
             return
     if data in {"confirm_run", "start_now", "manual_confirm", "contacts_confirm"}:
         if not session_info[current_session_id()]["ready"]:
-            await query.answer("Sessione non disponibile. Apri SELEZIONA SESSIONE.", show_alert=True)
+            await callback_notice(query, "Sessione non disponibile. Apri SELEZIONA SESSIONE.", show_alert=True)
             return
         if operation_busy():
-            await query.answer("Un'operazione è già in corso: attendi la fine o ferma il ciclo AUTO.", show_alert=True)
+            await callback_notice(query, "Un'operazione è già in corso: attendi la fine o ferma il ciclo AUTO.", show_alert=True)
             return
         if data in {"manual_confirm", "contacts_confirm", "confirm_run"}:
             if state.get("prepared_session") != current_session_id():
-                await query.answer("Conferma scaduta: prepara di nuovo l'operazione con la sessione attiva.", show_alert=True)
+                await callback_notice(query, "Conferma scaduta: prepara di nuovo l'operazione con la sessione attiva.", show_alert=True)
                 return
     if data in {"set_a", "set_b"} and operation_busy():
-        await query.answer("Non puoi cambiare gruppi durante un'operazione.", show_alert=True)
+        await callback_notice(query, "Non puoi cambiare gruppi durante un'operazione.", show_alert=True)
         return
 
     # =====================================================
@@ -2525,7 +2548,7 @@ async def buttons(
 
         if state["telegram_locked"]:
 
-            await query.answer(
+            await callback_notice(query, 
                 "🔒 Inviti sospesi.",
                 show_alert=True,
             )
@@ -2534,7 +2557,7 @@ async def buttons(
 
         if state["running"]:
 
-            await query.answer(
+            await callback_notice(query, 
                 "AUTO già attivo.",
                 show_alert=True,
             )
@@ -2546,7 +2569,7 @@ async def buttons(
             or not state["group_b"]
         ):
 
-            await query.answer(
+            await callback_notice(query, 
                 "Imposta prima A e B.",
                 show_alert=True,
             )
@@ -2597,7 +2620,7 @@ async def buttons(
             or state["running"]
             or (worker_task is not None and not worker_task.done())
         ):
-            await query.answer(
+            await callback_notice(query, 
                 "🟢 Un ciclo automatico è già in esecuzione." if not state["telegram_locked"] else "🔒 Inviti sospesi.",
                 show_alert=True,
             )
@@ -2639,7 +2662,7 @@ async def buttons(
     elif data == "auto_status_menu":
 
         if state["telegram_locked"]:
-            await query.answer(
+            await callback_notice(query, 
                 "🔒 Inviti sospesi.",
                 show_alert=True,
             )
@@ -2678,23 +2701,23 @@ async def buttons(
     elif data == "start_now":
 
         if state["telegram_locked"]:
-            await query.answer("🔒 Inviti sospesi.", show_alert=True)
+            await callback_notice(query, "🔒 Inviti sospesi.", show_alert=True)
             return
 
         if state["running"] or (worker_task is not None and not worker_task.done()):
-            await query.answer(
+            await callback_notice(query, 
                 "🟢 Automatico già in esecuzione. Non è stato avviato un secondo ciclo.",
                 show_alert=True,
             )
             return
 
         if not state["group_a"] or not state["group_b"]:
-            await query.answer("Imposta prima A e B.", show_alert=True)
+            await callback_notice(query, "Imposta prima A e B.", show_alert=True)
             return
 
         stats = await get_today_stats()
         if stats["migrated"] >= state["daily_target"]:
-            await query.answer(
+            await callback_notice(query, 
                 "🎯 Target giornaliero già raggiunto.",
                 show_alert=True,
             )
@@ -2747,7 +2770,7 @@ async def buttons(
 
         if not state["group_a"]:
 
-            await query.answer(
+            await callback_notice(query, 
                 "Imposta prima "
                 "il gruppo A.",
                 show_alert=True,
@@ -2955,7 +2978,7 @@ async def buttons(
 
     elif data == "contacts_add":
         if not state["group_b"]:
-            await query.answer("Imposta prima il gruppo B.", show_alert=True)
+            await callback_notice(query, "Imposta prima il gruppo B.", show_alert=True)
             return
 
         # La rubrica viene usata come sorgente manuale: l'admin copia una
@@ -2992,14 +3015,14 @@ async def buttons(
 
     elif data == "contacts_confirm":
         if state["telegram_locked"]:
-            await query.answer("🔒 Inviti sospesi.", show_alert=True)
+            await callback_notice(query, "🔒 Inviti sospesi.", show_alert=True)
             return
         if state.get("contact_queue_running"):
-            await query.answer("📒 Una coda Rubrica è già in esecuzione.", show_alert=True)
+            await callback_notice(query, "📒 Una coda Rubrica è già in esecuzione.", show_alert=True)
             return
         refs = list(state.get("manual_refs") or [])
         if not refs:
-            await query.answer("Nessun contatto preparato.", show_alert=True)
+            await callback_notice(query, "Nessun contatto preparato.", show_alert=True)
             return
         state["contact_queue_running"] = True
         contact_task = asyncio.create_task(run_contact_queue(context.bot, query.message.chat_id, refs))
@@ -3021,7 +3044,7 @@ async def buttons(
         # a rispettare telegram_locked.
         if not state["group_b"]:
 
-            await query.answer(
+            await callback_notice(query, 
                 "Imposta prima "
                 "il gruppo B.",
                 show_alert=True,
@@ -3057,7 +3080,7 @@ async def buttons(
 
         if state["telegram_locked"]:
 
-            await query.answer(
+            await callback_notice(query, 
                 "🔒 Inviti sospesi.",
                 show_alert=True,
             )
@@ -3576,6 +3599,8 @@ async def post_init(
     application,
 ):
 
+    global welcome_bot
+    welcome_bot = application.bot
     await init_db()
     await load_settings()
     await ensure_today()
@@ -3593,7 +3618,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.6.1 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.6.3 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -3609,6 +3634,7 @@ async def post_shutdown(
     state["running"] = False
     state["stop_requested"] = True
     tasks = [task for task in (scheduler_task, worker_task, contact_task) if task is not None]
+    tasks.extend(list(welcome_tasks))
     for task in tasks:
         task.cancel()
     if tasks:
@@ -3636,11 +3662,12 @@ def _same_telegram_chat_id(a, b):
     if a == b:
         return True
 
-    # Un Channel Telethon può essere salvato come ID positivo, mentre
-    # il Bot API lo espone nel formato -100xxxxxxxxxx.
-    a_abs = str(abs(a))
-    b_abs = str(abs(b))
-    return a_abs.removeprefix("100") == b_abs.removeprefix("100")
+    # Il prefisso -100 è una marcatura Bot API, non parte dell'ID positivo.
+    def unmarked(value):
+        if value <= -1000000000000:
+            return -value - 1000000000000
+        return abs(value)
+    return unmarked(a) == unmarked(b)
 
 
 async def _delete_welcome_later(bot, chat_id, message_id):
@@ -3666,6 +3693,12 @@ async def delete_left_member_notice(update: Update, context: ContextTypes.DEFAUL
     ):
         return
 
+    async with welcome_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM welcome_sent WHERE chat_id = ? AND user_id = ?",
+                             (chat.id, message.left_chat_member.id))
+            await db.commit()
+
     try:
         await context.bot.delete_message(
             chat_id=chat.id,
@@ -3679,69 +3712,115 @@ async def delete_left_member_notice(update: Update, context: ContextTypes.DEFAUL
         )
 
 
+async def send_welcome_once(bot, chat_id, member, origin, session_id=0):
+    """Unica funzione per evento d'ingresso e fallback dopo invito confermato."""
+    if getattr(member, "is_bot", False) or getattr(member, "bot", False):
+        return False
+    user_id = int(member.id)
+    try:
+        async with welcome_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT sent_at FROM welcome_sent WHERE chat_id = ? AND user_id = ?",
+                    (chat_id, user_id),
+                )
+                row = await cursor.fetchone()
+            if row:
+                stamp = datetime.fromisoformat(row[0])
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=ITALY_TZ)
+                if (now_it() - stamp).total_seconds() < 24 * 60 * 60:
+                    await add_log(
+                        f"↪️ Benvenuto già inviato — ID {user_id} — {origin}; duplicato evitato",
+                        session_id=session_id,
+                    )
+                    return False
+            username = getattr(member, "username", None)
+            if username:
+                person = f"@{html.escape(username)}"
+            else:
+                name = getattr(member, "full_name", None) or " ".join(
+                    value for value in (getattr(member, "first_name", None),
+                                        getattr(member, "last_name", None)) if value
+                ) or "nuovo membro"
+                person = f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+            text = (
+                f"👋 <b>Benvenuto {person} nella Community BestPrice24h!</b>\n\n"
+                "🔥 Sei nel posto giusto per scoprire <b>offerte, ribassi di prezzo e occasioni Amazon</b> "
+                "selezionate ogni giorno.\n\n"
+                "📲 Le offerte vengono pubblicate sul nostro <b>canale ufficiale BestPrice24h</b>, "
+                "così puoi trovarle subito senza perderti tra centinaia di prodotti.\n\n"
+                "💡 <b>Il consiglio:</b> entra nel canale e attiva le notifiche per non perdere "
+                "le occasioni migliori.\n\n"
+                "👇 <b>Ci vediamo nel canale!</b>"
+            )
+            sent = await bot.send_message(
+                chat_id=chat_id, text=text, parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔥 SCOPRI LE OFFERTE", url=CHANNEL_URL)]
+                ]),
+            )
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO welcome_sent(chat_id, user_id, sent_at, message_id) VALUES (?, ?, ?, ?)",
+                    (chat_id, user_id, now_it().isoformat(), sent.message_id),
+                )
+                await db.commit()
+            task = asyncio.create_task(_delete_welcome_later(bot, chat_id, sent.message_id))
+            welcome_tasks.add(task)
+            task.add_done_callback(welcome_tasks.discard)
+            await add_log(
+                f"👋 BENVENUTO INVIATO — ID {user_id} — {origin} — messaggio {sent.message_id}",
+                session_id=session_id,
+            )
+            return True
+    except Exception as exc:
+        logger.exception("Errore benvenuto per ID %s", user_id)
+        await add_log(
+            f"❌ BENVENUTO FALLITO — ID {user_id} — {origin} — "
+            f"{type(exc).__name__}: {str(exc)[:220]}", "ERROR", session_id=session_id,
+        )
+        return False
+
+
+async def welcome_confirmed_invite(destination, user):
+    """L'errore del benvenuto non deve annullare un'aggiunta già confermata."""
+    try:
+        if welcome_bot is None:
+            await add_log("❌ BENVENUTO FALLITO — bot non inizializzato", "ERROR")
+            return
+        try:
+            chat_id = utils.get_peer_id(destination)
+        except (TypeError, ValueError):
+            # Il gruppo B usato da InviteToChannelRequest è un supergruppo.
+            saved_id = int(state["group_b"]["id"])
+            chat_id = saved_id if saved_id < 0 else -1000000000000 - saved_id
+        await send_welcome_once(
+            welcome_bot, chat_id, user, "aggiunta confermata", session_id=current_session_id(),
+        )
+    except Exception as exc:
+        logger.exception("Errore fallback benvenuto")
+        await add_log(f"❌ BENVENUTO FALLITO — {type(exc).__name__}: {str(exc)[:220]}", "ERROR")
+
+
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Invia un solo benvenuto personale ai nuovi membri del Gruppo B."""
     message = update.effective_message
     chat = update.effective_chat
-
     if not message or not chat or not message.new_chat_members:
         return
-
-    # La funzione deve lavorare esclusivamente nel Gruppo B configurato.
-    if not state.get("group_b") or not _same_telegram_chat_id(
-        chat.id,
-        state["group_b"].get("id"),
-    ):
+    if not state.get("group_b") or not _same_telegram_chat_id(chat.id, state["group_b"].get("id")):
         return
-
-    # Elimina subito il messaggio di servizio Telegram
-    # (es. "Mario si è unito al gruppo").
+    await add_log("📥 Evento nuovi membri ricevuto nel gruppo B", session_id=0)
     try:
-        await context.bot.delete_message(
-            chat_id=chat.id,
-            message_id=message.message_id,
+        await context.bot.delete_message(chat_id=chat.id, message_id=message.message_id)
+    except Exception as exc:
+        await add_log(
+            f"⚠️ Messaggio di ingresso non eliminato — {type(exc).__name__}: {str(exc)[:160]}",
+            "WARNING", session_id=0,
         )
-    except Exception as e:
-        logger.warning(
-            "Impossibile eliminare il messaggio di ingresso %s: %s",
-            message.message_id,
-            e,
-        )
-
     for member in message.new_chat_members:
-        if member.is_bot:
-            continue
-
-        if member.username:
-            person = f"@{html.escape(member.username)}"
-        else:
-            visible_name = html.escape(member.full_name or "nuovo membro")
-            person = f'<a href="tg://user?id={member.id}">{visible_name}</a>'
-
-        text = (
-            f"👋 <b>Benvenuto {person} nella Community BestPrice24h!</b>\n\n"
-            "🔥 Sei nel posto giusto per scoprire <b>offerte, ribassi di prezzo e occasioni Amazon</b> "
-            "selezionate ogni giorno.\n\n"
-            "📲 Le offerte vengono pubblicate sul nostro <b>canale ufficiale BestPrice24h</b>, "
-            "così puoi trovarle subito senza perderti tra centinaia di prodotti.\n\n"
-            "💡 <b>Il consiglio:</b> entra nel canale e attiva le notifiche per non perdere "
-            "le occasioni migliori.\n\n"
-            "👇 <b>Ci vediamo nel canale!</b>"
-        )
-
-        sent = await context.bot.send_message(
-            chat_id=chat.id,
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔥 SCOPRI LE OFFERTE", url=CHANNEL_URL)]
-            ]),
-        )
-
-        asyncio.create_task(
-            _delete_welcome_later(context.bot, chat.id, sent.message_id)
-        )
+        await send_welcome_once(context.bot, chat.id, member, "evento Telegram", session_id=0)
 
 
 
@@ -3870,7 +3949,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.6.1 avviato"
+        "V4.6.3 avviato"
     )
 
     application.run_polling()
