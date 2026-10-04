@@ -4,6 +4,8 @@ import logging
 import math
 import re
 import html
+from contextvars import ContextVar
+from functools import wraps
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -45,6 +47,10 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 TELEGRAM_SESSION = os.environ["TELEGRAM_SESSION"]
 ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
+# L'accesso al pannello è indipendente dagli account Telethon.
+ADMIN_USER_IDS = {ADMIN_USER_ID}
+if os.environ.get("ADMIN_USER_ID_2", "").strip():
+    ADMIN_USER_IDS.add(int(os.environ["ADMIN_USER_ID_2"]))
 
 DB_PATH = "/data/manager.db"
 ITALY_TZ = ZoneInfo("Europe/Rome")
@@ -62,11 +68,87 @@ logger = logging.getLogger(__name__)
 # TELETHON
 # =========================================================
 
-user_client = TelegramClient(
-    StringSession(TELEGRAM_SESSION),
-    API_ID,
-    API_HASH,
-)
+session_clients = {}
+session_info = {}
+session_context = ContextVar("telegram_account", default=None)
+control_lock = asyncio.Lock()
+contact_task = None
+
+for account_id in (1, 2):
+    suffix = "" if account_id == 1 else "_2"
+    session_string = os.environ.get(f"TELEGRAM_SESSION{suffix}", "").strip()
+    info = {"ready": False, "name": f"ACCOUNT {account_id}", "user_id": None,
+            "error": "Sessione non configurata", "telegram_locked": False,
+            "telegram_restriction_detected": False}
+    session_info[account_id] = info
+    if session_string:
+        try:
+            session_clients[account_id] = TelegramClient(
+                StringSession(session_string),
+                int(os.environ.get(f"API_ID{suffix}") or API_ID),
+                os.environ.get(f"API_HASH{suffix}") or API_HASH,
+                flood_sleep_threshold=0,
+            )
+            info["error"] = "Connessione da verificare"
+        except Exception as exc:
+            info["error"] = f"Configurazione non valida ({type(exc).__name__})"
+
+
+def current_session_id():
+    return session_context.get() or state["active_session"]
+
+
+def session_label(account_id=None):
+    account_id = account_id or current_session_id()
+    return f"ACCOUNT {account_id} — {session_info[account_id]['name']}"
+
+
+class SelectedClient:
+    """Ogni task usa la sessione fissata all'avvio dell'operazione."""
+    def _client(self):
+        account_id = current_session_id()
+        if not session_info[account_id]["ready"]:
+            raise RuntimeError(f"ACCOUNT {account_id}: sessione non disponibile")
+        return session_clients[account_id]
+
+    def __getattr__(self, name):
+        return getattr(self._client(), name)
+
+    async def __call__(self, request):
+        return await self._client()(request)
+
+
+user_client = SelectedClient()
+
+
+def operation_busy():
+    return (state["running"] or state["contact_queue_running"]
+            or state["manual_running"]
+            or (worker_task is not None and not worker_task.done())
+            or (contact_task is not None and not contact_task.done()))
+
+
+def pinned_session(func):
+    @wraps(func)
+    async def wrapped(*args, **kwargs):
+        token = session_context.set(current_session_id())
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            session_context.reset(token)
+    return wrapped
+
+
+def serialized_control(func):
+    @wraps(func)
+    async def wrapped(*args, **kwargs):
+        async with control_lock:
+            token = session_context.set(state["active_session"])
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                session_context.reset(token)
+    return wrapped
 
 
 # =========================================================
@@ -74,6 +156,8 @@ user_client = TelegramClient(
 # =========================================================
 
 state = {
+    "active_session": 1,
+    "manual_running": False,
     "group_a": None,
     "group_b": None,
 
@@ -204,6 +288,26 @@ async def init_db():
             )
         """)
 
+        cursor = await db.execute("PRAGMA table_info(logs)")
+        if "session_id" not in {row[1] for row in await cursor.fetchall()}:
+            await db.execute("ALTER TABLE logs ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
+        await db.execute("CREATE INDEX IF NOT EXISTS logs_session_id ON logs(session_id, id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_contacts (
+                session_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                username TEXT, display_name TEXT, phone TEXT, extracted_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, user_id)
+            )
+        """)
+        cursor = await db.execute("SELECT value FROM settings WHERE key = 'contacts_sessions_migrated'")
+        if not await cursor.fetchone():
+            await db.execute("""
+                INSERT OR IGNORE INTO session_contacts
+                SELECT 1, user_id, username, display_name, phone, extracted_at
+                FROM extracted_contacts
+            """)
+            await db.execute("INSERT INTO settings(key, value) VALUES ('contacts_sessions_migrated', '1')")
+
         # Compatibilità con database precedenti
         try:
             await db.execute(
@@ -223,6 +327,10 @@ async def init_db():
 # =========================================================
 
 async def set_setting(key, value):
+    if key in {"telegram_locked", "telegram_restriction_detected"}:
+        account_id = current_session_id()
+        session_info[account_id][key] = str(value) == "1"
+        key = f"session_{account_id}_{key}"
 
     async with aiosqlite.connect(DB_PATH) as db:
 
@@ -314,19 +422,16 @@ async def load_settings():
         "",
     )
 
-    state["telegram_locked"] = (
-        await get_setting(
-            "telegram_locked",
-            "0",
-        ) == "1"
-    )
-
-    state["telegram_restriction_detected"] = (
-        await get_setting(
-            "telegram_restriction_detected",
-            "0",
-        ) == "1"
-    )
+    for account_id in (1, 2):
+        for key in ("telegram_locked", "telegram_restriction_detected"):
+            value = await get_setting(f"session_{account_id}_{key}")
+            if value is None:
+                value = await get_setting(key, "0") if account_id == 1 else "0"
+                await set_setting(f"session_{account_id}_{key}", value)
+            session_info[account_id][key] = value == "1"
+    selected = await get_setting("active_session", "1")
+    state["active_session"] = int(selected) if selected in {"1", "2"} else 1
+    sync_session_state()
 
     for prefix in (
         "group_a",
@@ -491,8 +596,11 @@ async def get_total_stats():
 async def add_log(
     message,
     level="INFO",
+    session_id=None,
 ):
-
+    account_id = current_session_id() if session_id is None else session_id
+    if account_id:
+        message = f"[{session_label(account_id)}] {message}"
     state["last_event"] = message
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -502,14 +610,16 @@ async def add_log(
             INSERT INTO logs(
                 created_at,
                 level,
-                message
+                message,
+                session_id
             )
-            VALUES (?, ?, ?)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 now_it().isoformat(),
                 level,
                 message,
+                account_id,
             ),
         )
 
@@ -625,6 +735,92 @@ async def was_processed(user_id):
     return row is not None
 
 
+def sync_session_state():
+    info = session_info[state["active_session"]]
+    state["telegram_locked"] = info["telegram_locked"]
+    state["telegram_restriction_detected"] = info["telegram_restriction_detected"]
+
+
+async def connect_session(account_id):
+    info = session_info[account_id]
+    client = session_clients.get(account_id)
+    if client is None:
+        return
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30)
+        if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
+            raise ValueError("Sessione non autorizzata: rigenera la stringa")
+        me = await asyncio.wait_for(client.get_me(), timeout=15)
+        if me is None or getattr(me, "bot", False):
+            raise ValueError("È necessario un account utente Telegram")
+        for other_id, other in session_info.items():
+            if other_id != account_id and other["ready"] and other["user_id"] == me.id:
+                raise ValueError("Le due sessioni appartengono allo stesso account: usa il secondo numero")
+        info.update(ready=True, user_id=me.id,
+                    name=(f"@{me.username}" if me.username else me.first_name or str(me.id)),
+                    error="Connessa e autorizzata")
+    except Exception as exc:
+        info["ready"] = False
+        info["error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
+        logger.warning("ACCOUNT %s: %s", account_id, info["error"])
+        await client.disconnect()
+
+
+async def select_session(account_id):
+    if account_id not in session_info:
+        raise ValueError("Sessione non valida")
+    if operation_busy():
+        raise ValueError("Attendi la fine delle operazioni prima di cambiare sessione")
+    if not session_info[account_id]["ready"]:
+        raise ValueError("Sessione non disponibile: verifica connessione e variabili Railway")
+    if account_id == state["active_session"]:
+        return
+    old_label = session_label(state["active_session"])
+    # Il cambio richiede una nuova attivazione esplicita dell'automatico.
+    state["auto_enabled"] = False
+    await set_setting("auto_enabled", "0")
+    state["active_session"] = account_id
+    session_context.set(account_id)
+    sync_session_state()
+    await set_setting("active_session", account_id)
+    state["waiting_for"] = None
+    state["manual_ids"] = []
+    state["manual_refs"] = []
+    state["prepared_session"] = None
+    state["member_page"] = 0
+    state["contact_page"] = 0
+    await add_log(f"👤 Sessione selezionata — precedente: {old_label}. Automatico disattivato: riattivalo esplicitamente.")
+
+
+async def sessions_text():
+    lines = ["👤 GESTIONE SESSIONI", f"Attiva: {session_label(state['active_session'])}", ""]
+    for account_id in (1, 2):
+        info = session_info[account_id]
+        lines.extend([session_label(account_id),
+                      f"ID: {info['user_id'] or 'non disponibile'}",
+                      f"🔌 {info['error']}",
+                      "🔒 Inviti bloccati localmente" if info["telegram_locked"] else "🔓 Nessun blocco locale", ""])
+    lines.append("La verifica controlla l'accesso alla sessione, non l'assenza di limitazioni Telegram.\n"
+                 "Il cambio disattiva la programmazione AUTO e annulla le liste preparate.")
+    return "\n".join(lines)
+
+
+def sessions_keyboard():
+    rows = []
+    for account_id in (1, 2):
+        rows.append([InlineKeyboardButton(
+            f"{'✅' if account_id == state['active_session'] else '👤'} USA ACCOUNT {account_id}",
+            callback_data=f"select_session:{account_id}"),
+            InlineKeyboardButton("🔎 VERIFICA", callback_data=f"check_session:{account_id}")])
+    rows.append([InlineKeyboardButton("⬅️ HOME", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_message:
+        await update.effective_message.reply_text(f"Il tuo ID Telegram è: {update.effective_user.id}")
+
+
 # =========================================================
 # SICUREZZA BOT
 # =========================================================
@@ -635,7 +831,7 @@ def is_admin(update):
 
     return (
         user is not None
-        and user.id == ADMIN_USER_ID
+        and user.id in ADMIN_USER_IDS
     )
 
 
@@ -644,14 +840,14 @@ async def deny_access(update):
     if update.callback_query:
 
         await update.callback_query.answer(
-            "⛔ Accesso non autorizzato.",
+            "⛔ Accesso non autorizzato al pannello. Usa /myid per conoscere il tuo ID.",
             show_alert=True,
         )
 
     elif update.effective_message:
 
         await update.effective_message.reply_text(
-            "⛔ Accesso non autorizzato."
+            "⛔ Accesso non autorizzato al pannello. Usa /myid per conoscere il tuo ID."
         )
 
 
@@ -1176,15 +1372,15 @@ async def extract_contacts():
         username = getattr(user, "username", None)
         display_name = " ".join(v for v in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if v)
         phone = getattr(user, "phone", None)
-        rows.append((user.id, username, display_name, phone, now_it().isoformat()))
+        rows.append((current_session_id(), user.id, username, display_name, phone, now_it().isoformat()))
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM extracted_contacts")
+        await db.execute("DELETE FROM session_contacts WHERE session_id = ?", (current_session_id(),))
         if rows:
             await db.executemany("""
-                INSERT OR REPLACE INTO extracted_contacts
-                (user_id, username, display_name, phone, extracted_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO session_contacts
+                (session_id, user_id, username, display_name, phone, extracted_at)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, rows)
         await db.commit()
 
@@ -1194,7 +1390,7 @@ async def extract_contacts():
 
 async def contacts_count():
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM extracted_contacts")
+        cur = await db.execute("SELECT COUNT(*) FROM session_contacts WHERE session_id = ?", (current_session_id(),))
         row = await cur.fetchone()
     return int(row[0] if row else 0)
 
@@ -1204,12 +1400,13 @@ async def get_contacts_page(page):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT user_id, username, display_name
-            FROM extracted_contacts
+            FROM session_contacts
+            WHERE session_id = ?
             ORDER BY CASE WHEN display_name IS NULL OR display_name = '' THEN 1 ELSE 0 END,
                      display_name COLLATE NOCASE,
                      username COLLATE NOCASE
             LIMIT ? OFFSET ?
-        """, (PAGE_SIZE, offset))
+        """, (current_session_id(), PAGE_SIZE, offset))
         return await cur.fetchall()
 
 
@@ -1275,6 +1472,7 @@ def group_label(group):
 def main_keyboard():
 
     keyboard = [
+        [InlineKeyboardButton("👤 SELEZIONA SESSIONE", callback_data="sessions")],
         [
             InlineKeyboardButton("📥 GRUPPO A", callback_data="set_a"),
             InlineKeyboardButton("📤 GRUPPO B", callback_data="set_b"),
@@ -1354,7 +1552,9 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.5.0\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.6.0\n\n"
+        f"👤 SESSIONE ATTIVA: {session_label()}\n"
+        f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
         f"📤 GRUPPO B: {group_label(state['group_b'])}\n\n"
         f"{status}"
@@ -1615,48 +1815,32 @@ async def invite_one(
 
 async def daily_scheduler(application):
     global worker_task
-
     while True:
         try:
-            if (
-                state["auto_enabled"]
-                and not state["running"]
-                and not (worker_task is not None and not worker_task.done())
-                and not state["telegram_locked"]
-                and state["group_a"]
-                and state["group_b"]
-            ):
-                now = now_it()
-                today = now.date().isoformat()
-                current_hm = now.strftime("%H:%M")
-                stats = await get_today_stats()
-
-                if (
-                    current_hm >= state["start_time"]
-                    and state["last_autostart_day"] != today
-                    and stats["migrated"] < state["daily_target"]
-                ):
-                    state["last_autostart_day"] = today
-                    await set_setting("last_autostart_day", today)
-                    state["running"] = True
-                    state["stop_requested"] = False
-                    await add_log(
-                        f"⏰ Partenza automatica programmata delle {state['start_time']}"
-                    )
-                    worker_task = asyncio.create_task(
-                        migration_worker(application)
-                    )
-
+            if not control_lock.locked():
+                async with control_lock:
+                    if (state["auto_enabled"] and not operation_busy()
+                            and not state["telegram_locked"]
+                            and session_info[state["active_session"]]["ready"]
+                            and state["group_a"] and state["group_b"]):
+                        now = now_it()
+                        today = now.date().isoformat()
+                        stats = await get_today_stats()
+                        if (now.strftime("%H:%M") >= state["start_time"]
+                                and state["last_autostart_day"] != today
+                                and stats["migrated"] < state["daily_target"]):
+                            state["last_autostart_day"] = today
+                            await set_setting("last_autostart_day", today)
+                            state["running"] = True
+                            state["stop_requested"] = False
+                            await add_log(f"⏰ Partenza automatica programmata delle {state['start_time']}")
+                            worker_task = asyncio.create_task(migration_worker(application))
             await asyncio.sleep(15)
-
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as exc:
             logger.exception("Errore daily_scheduler")
-            await add_log(
-                f"❌ Scheduler — {type(e).__name__}: {str(e)[:180]}",
-                "ERROR",
-            )
+            await add_log(f"❌ Scheduler — {type(exc).__name__}: {str(exc)[:180]}", "ERROR")
             await asyncio.sleep(30)
 
 
@@ -1664,6 +1848,7 @@ async def daily_scheduler(application):
 # WORKER AUTOMATICO
 # =========================================================
 
+@pinned_session
 async def migration_worker(
     application,
 ):
@@ -1897,8 +2082,8 @@ async def resolve_manual_user(user_id=None, username=None):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    "SELECT username FROM extracted_contacts WHERE user_id = ? LIMIT 1",
-                    (int(user_id),),
+                    "SELECT username FROM session_contacts WHERE session_id = ? AND user_id = ? LIMIT 1",
+                    (current_session_id(), int(user_id)),
                 )
                 row = await cursor.fetchone()
             if row and row[0]:
@@ -1998,6 +2183,7 @@ async def run_manual_invites():
     return results
 
 
+@pinned_session
 async def run_contact_queue(bot, chat_id, refs):
     """Aggiunge il blocco Rubrica in background rispettando il timing dedicato."""
     try:
@@ -2039,6 +2225,7 @@ async def run_contact_queue(bot, chat_id, refs):
 # /START
 # =========================================================
 
+@serialized_control
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2059,12 +2246,13 @@ async def start(
 # CALLBACK BUTTONS
 # =========================================================
 
+@serialized_control
 async def buttons(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    global worker_task
+    global worker_task, contact_task
 
     if not is_admin(update):
 
@@ -2076,6 +2264,55 @@ async def buttons(
     await query.answer()
 
     data = query.data
+
+    if data == "sessions":
+        await query.edit_message_text(await sessions_text(), reply_markup=sessions_keyboard())
+        return
+    if data.startswith("select_session:"):
+        account_id = int(data.split(":", 1)[1])
+        try:
+            await select_session(account_id)
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+        await query.edit_message_text(await home_text(), reply_markup=main_keyboard())
+        return
+    if data.startswith("check_session:"):
+        account_id = int(data.split(":", 1)[1])
+        if operation_busy():
+            await query.answer("Ferma le operazioni prima di verificare la connessione.", show_alert=True)
+            return
+        await connect_session(account_id)
+        await add_log("🔎 Connessione verificata: " + session_info[account_id]["error"],
+                      session_id=account_id)
+        await query.edit_message_text(await sessions_text(), reply_markup=sessions_keyboard())
+        return
+    if data.startswith("unlock:"):
+        if data != f"unlock:{state['active_session']}":
+            await query.answer("La sessione è cambiata: riapri lo sblocco dalla Home.", show_alert=True)
+            return
+        data = "unlock"
+    elif data == "unlock":
+        await query.answer("Riapri lo sblocco dalla Home per confermare la sessione.", show_alert=True)
+        return
+    if data == "unlock":
+        if operation_busy():
+            await query.answer("Attendi la fine delle operazioni prima dello sblocco.", show_alert=True)
+            return
+    if data in {"confirm_run", "start_now", "manual_confirm", "contacts_confirm"}:
+        if not session_info[current_session_id()]["ready"]:
+            await query.answer("Sessione non disponibile. Apri SELEZIONA SESSIONE.", show_alert=True)
+            return
+        if operation_busy():
+            await query.answer("Un'operazione è già in corso: attendi la fine o ferma il ciclo AUTO.", show_alert=True)
+            return
+        if data in {"manual_confirm", "contacts_confirm", "confirm_run"}:
+            if state.get("prepared_session") != current_session_id():
+                await query.answer("Conferma scaduta: prepara di nuovo l'operazione con la sessione attiva.", show_alert=True)
+                return
+    if data in {"set_a", "set_b"} and operation_busy():
+        await query.answer("Non puoi cambiare gruppi durante un'operazione.", show_alert=True)
+        return
 
     # =====================================================
     # GRUPPO A
@@ -2224,6 +2461,7 @@ async def buttons(
     # =====================================================
 
     elif data == "start_run":
+        state["prepared_session"] = current_session_id()
 
         if state["telegram_locked"]:
 
@@ -2704,7 +2942,7 @@ async def buttons(
             await query.answer("Nessun contatto preparato.", show_alert=True)
             return
         state["contact_queue_running"] = True
-        asyncio.create_task(run_contact_queue(context.bot, query.message.chat_id, refs))
+        contact_task = asyncio.create_task(run_contact_queue(context.bot, query.message.chat_id, refs))
         await query.edit_message_text(
             f"▶️ CODA RUBRICA AVVIATA\n\nContatti: {len(refs)}\n"
             f"⏱ Intervallo: {state['contact_interval_minutes']} minuti\n\n"
@@ -2770,9 +3008,11 @@ async def buttons(
             "⏳ Elaborazione manuale..."
         )
 
-        results = (
-            await run_manual_invites()
-        )
+        state["manual_running"] = True
+        try:
+            results = await run_manual_invites()
+        finally:
+            state["manual_running"] = False
 
         text = (
             "👤 RISULTATO MANUALE\n\n"
@@ -2867,98 +3107,50 @@ async def buttons(
     # LOG
     # =====================================================
 
-    elif data == "logs":
-
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
-
-            cursor = await db.execute(
-                """
-                SELECT
-                    created_at,
-                    message
-                FROM logs
-                ORDER BY id DESC
-                LIMIT 20
-                """
-            )
-
-            rows = (
-                await cursor.fetchall()
-            )
-
+    elif data == "logs" or data.startswith("logs:"):
+        selected_filter = data.split(":", 1)[1] if ":" in data else "all"
+        if selected_filter not in {"all", "1", "2"}:
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            if selected_filter == "all":
+                cursor = await db.execute("SELECT created_at, message FROM logs ORDER BY id DESC LIMIT 20")
+            else:
+                cursor = await db.execute(
+                    "SELECT created_at, message FROM logs WHERE session_id = ? ORDER BY id DESC LIMIT 20",
+                    (int(selected_filter),),
+                )
+            rows = await cursor.fetchall()
         lines = []
-
-        for (
-            created_at,
-            message,
-        ) in reversed(rows):
-
+        budget = 0
+        for created_at, message in rows:
             try:
-
-                dt = datetime.fromisoformat(
-                    created_at
-                )
-
-                if dt.tzinfo is None:
-
-                    dt = dt.replace(
-                        tzinfo=ITALY_TZ
-                    )
-
-                else:
-
-                    dt = dt.astimezone(
-                        ITALY_TZ
-                    )
-
-                stamp = dt.strftime(
-                    "%H:%M:%S"
-                )
-
-            except Exception:
-
+                dt = datetime.fromisoformat(created_at)
+                dt = dt.replace(tzinfo=ITALY_TZ) if dt.tzinfo is None else dt.astimezone(ITALY_TZ)
+                stamp = dt.strftime("%H:%M:%S")
+            except (ValueError, TypeError):
                 stamp = "--:--:--"
-
-            lines.append(
-                f"{stamp}  {message}"
-            )
-
+            line = f"{stamp}  {message}"
+            if budget + len(line) + 1 > 3700:
+                break
+            lines.append(line)
+            budget += len(line) + 1
+        title = "TUTTE LE SESSIONI" if selected_filter == "all" else f"ACCOUNT {selected_filter}"
         await query.edit_message_text(
-            "📋 ULTIMI EVENTI\n\n"
-            + (
-                "\n".join(lines)
-                if lines
-                else "Nessun evento."
-            ),
-
+            f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n".join(reversed(lines)) or "Nessun evento."),
             reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔄 AGGIORNA",
-                        callback_data="logs",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🗑 PULISCI LOG",
-                        callback_data="clear_logs_confirm",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ INDIETRO",
-                        callback_data="home",
-                    )
-                ],
+                [InlineKeyboardButton("TUTTE", callback_data="logs:all"),
+                 InlineKeyboardButton("ACCOUNT 1", callback_data="logs:1"),
+                 InlineKeyboardButton("ACCOUNT 2", callback_data="logs:2")],
+                [InlineKeyboardButton("🔄 AGGIORNA", callback_data=f"logs:{selected_filter}")],
+                [InlineKeyboardButton("🗑 PULISCI TUTTI I LOG", callback_data="clear_logs_confirm")],
+                [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
             ]),
         )
 
     elif data == "clear_logs_confirm":
 
         await query.edit_message_text(
-            "⚠️ Cancellare il LOG?",
+            "⚠️ Cancellare tutti i log, di entrambe le sessioni e quelli precedenti?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🗑 SÌ",
@@ -2992,7 +3184,7 @@ async def buttons(
     elif data == "unlock_confirm":
 
         await query.edit_message_text(
-            "⚠️ RIABILITARE GLI INVITI?\n\n"
+            f"⚠️ RIABILITARE GLI INVITI?\n{session_label()}\n\n"
             "Il blocco locale è stato attivato perché Telegram ha segnalato una limitazione.\n\n"
             "Sblocca solo dopo aver verificato (ad esempio con @SpamBot) "
             "che l'account non sia più limitato. Lo sblocco del bot non rimuove "
@@ -3001,7 +3193,7 @@ async def buttons(
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🔓 CONFERMA",
-                    callback_data="unlock",
+                    callback_data=f"unlock:{state['active_session']}",
                 ),
                 InlineKeyboardButton(
                     "❌ ANNULLA",
@@ -3028,7 +3220,7 @@ async def buttons(
 
         await add_log(
             "🔓 Blocco locale rimosso manualmente — "
-            "limitazione Telegram marcata come verificata/risolta dall'amministratore"
+            "su conferma dell’amministratore; nessuna verifica automatica della limitazione Telegram"
         )
 
         await query.edit_message_text(
@@ -3059,6 +3251,7 @@ async def buttons(
 # INPUT TESTUALE
 # =========================================================
 
+@serialized_control
 async def text_input(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3172,6 +3365,7 @@ async def text_input(
 
         members = members[:20]
         is_contact_batch = (target == "contact_ids")
+        state["prepared_session"] = current_session_id()
         state["manual_refs"] = members
         state["manual_ids"] = [
             item["id"] for item in members if item["id"] is not None
@@ -3228,6 +3422,10 @@ async def text_input(
         "a",
         "b",
     ):
+        return
+
+    if operation_busy():
+        await update.message.reply_text("Attendi la fine delle operazioni prima di cambiare gruppo.")
         return
 
     try:
@@ -3322,30 +3520,20 @@ async def post_init(
     await load_settings()
     await ensure_today()
 
-    await user_client.connect()
-
-    if not (
-        await user_client.is_user_authorized()
-    ):
-
-        raise RuntimeError(
-            "TELEGRAM_SESSION "
-            "non autorizzata."
-        )
-
-    me = await user_client.get_me()
-
-    logger.info(
-        "Account operativo: "
-        "%s (%s)",
-        me.first_name,
-        me.id,
-    )
-
-    logger.info(
-        "BestPrice Member Manager "
-        "V4.4.3"
-    )
+    for account_id in (1, 2):
+        await connect_session(account_id)
+    available = [account_id for account_id in (1, 2) if session_info[account_id]["ready"]]
+    if not available:
+        logger.warning("Nessuna sessione disponibile: il pannello resta accessibile per la diagnostica")
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+    elif state["active_session"] not in available:
+        state["active_session"] = available[0]
+        sync_session_state()
+        await set_setting("active_session", state["active_session"])
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+    await add_log("⚙️ Avvio V4.6.0 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -3357,14 +3545,16 @@ async def post_shutdown(
     application,
 ):
 
-    global scheduler_task
-    if scheduler_task:
-        scheduler_task.cancel()
-
+    global scheduler_task, worker_task, contact_task
     state["running"] = False
     state["stop_requested"] = True
-
-    await user_client.disconnect()
+    tasks = [task for task in (scheduler_task, worker_task, contact_task) if task is not None]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for client in session_clients.values():
+        await client.disconnect()
 
 
 # =========================================================
@@ -3550,14 +3740,14 @@ async def moderate_group_b_links(update: Update, context: ContextTypes.DEFAULT_T
             if user and user.username
             else (user.full_name if user else "utente")
         )
-        await add_log(f"🗑 Link eliminato nel Gruppo B — {who}")
+        await add_log(f"🗑 Link eliminato nel Gruppo B — {who}", session_id=0)
     except Exception as e:
         logger.warning(
             "Impossibile eliminare messaggio con link nel Gruppo B %s: %s",
             message.message_id,
             e,
         )
-        await add_log("⚠️ Link rilevato nel Gruppo B ma eliminazione non riuscita")
+        await add_log("⚠️ Link rilevato nel Gruppo B ma eliminazione non riuscita", session_id=0)
 
 # =========================================================
 # MAIN
@@ -3572,6 +3762,8 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
+
+    application.add_handler(CommandHandler("myid", myid, filters=filters.ChatType.PRIVATE))
 
     application.add_handler(
         CommandHandler(
@@ -3618,7 +3810,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.5.2 avviato"
+        "V4.6.0 avviato"
     )
 
     application.run_polling()
