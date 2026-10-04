@@ -319,6 +319,15 @@ async def init_db():
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS invitation_recovery (
+                session_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                source_id INTEGER NOT NULL, destination_id INTEGER NOT NULL,
+                attempted_at TEXT NOT NULL,
+                PRIMARY KEY(session_id, user_id, source_id, destination_id)
+            )
+        """)
+
         # Compatibilità con database precedenti
         try:
             await db.execute(
@@ -743,7 +752,11 @@ async def was_processed(user_id):
 
         row = await cursor.fetchone()
 
-    return row is not None and row[0] not in {"UNCONFIRMED", "VERIFY_PENDING"}
+    if row is None or row[0] in {"UNCONFIRMED", "VERIFY_PENDING"}:
+        return False
+    if row[0] == "NOT_ADDED":
+        return await recovery_used(user_id)
+    return True
 
 
 async def processed_status(user_id):
@@ -754,6 +767,26 @@ async def processed_status(user_id):
         )
         row = await cursor.fetchone()
     return row[0] if row else None
+
+
+async def recovery_used(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM invitation_recovery WHERE session_id = ? AND user_id = ? AND source_id = ? AND destination_id = ?",
+            (current_session_id(), user_id, state["group_a"]["id"], state["group_b"]["id"]),
+        )
+        return await cursor.fetchone() is not None
+
+
+async def reserve_recovery(user_id):
+    """Un solo nuovo tentativo di recupero per sessione, utente e coppia di gruppi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO invitation_recovery VALUES (?, ?, ?, ?, ?)",
+            (current_session_id(), user_id, state["group_a"]["id"], state["group_b"]["id"], now_it().isoformat()),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 def sync_session_state():
@@ -1573,7 +1606,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.6.3\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.6.4\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -1666,9 +1699,10 @@ async def invite_one(destination, user, mode):
     display = f"@{user.username}" if getattr(user, "username", None) else f"ID {user.id}"
     previous_status = await processed_status(user.id)
     pending = previous_status in {"UNCONFIRMED", "VERIFY_PENDING"}
+    recovery = pending or previous_status == "NOT_ADDED"
     await add_log(
         f"🔍 {mode} — {display} — "
-        + ("Esito precedente incerto: solo verifica, nessun nuovo invito" if pending
+        + ("Recupero esito precedente: verifica presenza prima di un eventuale unico nuovo tentativo" if recovery
            else "Controllo presenza nel gruppo B prima dell'invito")
     )
     confirmed, error_name, error_message = await verify_in_destination(destination, user)
@@ -1685,14 +1719,22 @@ async def invite_one(destination, user, mode):
         return ("already", display)
     if error_name != "UserNotParticipantError":
         return await report_verification_problem(display, mode, error_name, error_message)
-    if pending:
-        # Vecchi UNCONFIRMED vengono recuperati come verifiche, non nuovi inviti.
-        await save_processed(user, "NOT_ADDED")
-        await add_log(
-            f"⚠️ {mode} — {display} — NON PRESENTE dopo il precedente tentativo — "
-            f"{error_name}: {(error_message or '')[:220]} — nessun nuovo invito automatico", "WARNING",
-        )
+    if previous_status in {"PRIVACY", "INVITE_REJECTED"}:
+        await add_log(f"🔒 {mode} — {display} — precedente rifiuto privacy/invito: nessun nuovo tentativo", "WARNING")
         return ("unconfirmed", display)
+    if recovery:
+        # L'assenza è certa (UserNotParticipantError), non un errore tecnico.
+        if not await reserve_recovery(user.id):
+            await save_processed(user, "NOT_ADDED")
+            await add_log(
+                f"↪️ {mode} — {display} — assenza verificata; unico tentativo di recupero già usato. "
+                "Nessun nuovo invito e nessuna attesa di invio", "WARNING",
+            )
+            return ("unconfirmed", display)
+        await add_log(
+            f"🔄 {mode} — {display} — ASSENZA VERIFICATA — nuovo tentativo di recupero 1/1 con questa sessione"
+        )
+
 
     await increment_stat("attempts")
     await add_log(f"{mode} — Tentativo: {display}")
@@ -2020,7 +2062,7 @@ async def migration_worker(
                 ):
                     continue
 
-                attempts_cycle += 1
+                attempts_before = stats["attempts"]
 
                 result, display = (
                     await invite_one(
@@ -2033,9 +2075,10 @@ async def migration_worker(
                 if result in STOP_INVITE_RESULTS:
                     break
 
-                stats = (
-                    await get_today_stats()
-                )
+                stats = await get_today_stats()
+                sent_attempt = stats["attempts"] > attempts_before
+                if sent_attempt:
+                    attempts_cycle += 1
 
                 if (
                     stats["migrated"]
@@ -2047,6 +2090,13 @@ async def migration_worker(
                         "giornaliero raggiunto"
                     )
 
+                    break
+
+                if not sent_attempt:
+                    # Un controllo di presenza non è un invito: passa al prossimo utente.
+                    continue
+                if attempts_cycle >= state["max_attempts"]:
+                    await add_log("🛑 MAX tentativi raggiunto")
                     break
 
                 if state["running"]:
@@ -3618,7 +3668,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.6.3 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.6.4 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -3949,7 +3999,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.6.3 avviato"
+        "V4.6.4 avviato"
     )
 
     application.run_polling()
