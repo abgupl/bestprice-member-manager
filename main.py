@@ -32,6 +32,7 @@ from telethon.tl.functions.channels import (
     InviteToChannelRequest,
     GetParticipantRequest,
 )
+from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.tl.types import Channel, Chat
 
 
@@ -91,6 +92,7 @@ state = {
     "waiting_for": None,
 
     "member_page": 0,
+    "contact_page": 0,
     "manual_ids": [],
     "manual_refs": [],
 
@@ -187,6 +189,16 @@ async def init_db():
                     source_id,
                     user_id
                 )
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS extracted_contacts (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                display_name TEXT,
+                phone TEXT,
+                extracted_at TEXT NOT NULL
             )
         """)
 
@@ -1140,6 +1152,94 @@ def members_keyboard():
 
 
 # =========================================================
+# RUBRICA TELEGRAM
+# =========================================================
+
+async def extract_contacts():
+    """Legge la rubrica Telegram della sessione utente e la salva localmente."""
+    result = await user_client(GetContactsRequest(hash=0))
+    me = await user_client.get_me()
+    rows = []
+    seen = set()
+    for user in getattr(result, "users", []) or []:
+        if user.id == me.id or getattr(user, "bot", False) or getattr(user, "deleted", False):
+            continue
+        if user.id in seen:
+            continue
+        seen.add(user.id)
+        username = getattr(user, "username", None)
+        display_name = " ".join(v for v in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if v)
+        phone = getattr(user, "phone", None)
+        rows.append((user.id, username, display_name, phone, now_it().isoformat()))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM extracted_contacts")
+        if rows:
+            await db.executemany("""
+                INSERT OR REPLACE INTO extracted_contacts
+                (user_id, username, display_name, phone, extracted_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, rows)
+        await db.commit()
+
+    await add_log(f"📒 RUBRICA — contatti estratti: {len(rows)}")
+    return len(rows)
+
+
+async def contacts_count():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM extracted_contacts")
+        row = await cur.fetchone()
+    return int(row[0] if row else 0)
+
+
+async def get_contacts_page(page):
+    offset = page * PAGE_SIZE
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT user_id, username, display_name
+            FROM extracted_contacts
+            ORDER BY CASE WHEN display_name IS NULL OR display_name = '' THEN 1 ELSE 0 END,
+                     display_name COLLATE NOCASE,
+                     username COLLATE NOCASE
+            LIMIT ? OFFSET ?
+        """, (PAGE_SIZE, offset))
+        return await cur.fetchall()
+
+
+async def contacts_page_text(page):
+    total = await contacts_count()
+    if total == 0:
+        return "📒 RUBRICA TELEGRAM\n\nNessun contatto estratto.\n\nPremi 🔄 ESTRAI/AGGIORNA."
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    state["contact_page"] = page
+    rows = await get_contacts_page(page)
+    lines = []
+    start = page * PAGE_SIZE + 1
+    for i, (user_id, username, name) in enumerate(rows, start=start):
+        label = name or (f"@{username}" if username else "Senza nome")
+        if username and name:
+            label += f" (@{username})"
+        lines.append(f"{i}. {label} — {user_id}")
+    return f"📒 RUBRICA TELEGRAM\n\nTotale: {total}\nPagina: {page + 1}/{pages}\n\n" + "\n".join(lines)
+
+
+def contacts_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("◀️", callback_data="contacts_prev"),
+            InlineKeyboardButton("🔄 ESTRAI/AGGIORNA", callback_data="extract_contacts"),
+            InlineKeyboardButton("▶️", callback_data="contacts_next"),
+        ],
+        [InlineKeyboardButton("➕ AGGIUNGI CONTATTI", callback_data="contacts_add")],
+        [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
+    ])
+
+
+
+
+# =========================================================
 # INTERFACCIA
 # =========================================================
 
@@ -1208,6 +1308,9 @@ def main_keyboard():
             InlineKeyboardButton("➕ INVITA PER ID", callback_data="manual_invite"),
         ],
         [
+            InlineKeyboardButton("📒 RUBRICA", callback_data="contacts"),
+        ],
+        [
             InlineKeyboardButton("📊 STATISTICHE", callback_data="statistics"),
             InlineKeyboardButton("📋 LOG", callback_data="logs"),
         ],
@@ -1240,7 +1343,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.4.7\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.5.0\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
         f"📤 GRUPPO B: {group_label(state['group_b'])}\n\n"
         f"{status}"
@@ -1750,6 +1853,25 @@ async def resolve_manual_user(user_id=None, username=None):
     if user_id is not None:
         try:
             return await user_client.get_entity(int(user_id))
+        except Exception:
+            pass
+
+    # Se l'ID arriva dalla rubrica estratta, recupera l'eventuale username
+    # salvato. Questo rende affidabile l'incolla delle pagine RUBRICA anche
+    # dopo un riavvio del bot, senza dipendere solo dalla cache Telethon.
+    if user_id is not None:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT username FROM extracted_contacts WHERE user_id = ? LIMIT 1",
+                    (int(user_id),),
+                )
+                row = await cursor.fetchone()
+            if row and row[0]:
+                try:
+                    return await user_client.get_entity("@" + row[0].lstrip("@"))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2422,6 +2544,72 @@ async def buttons(
         )
 
     # =====================================================
+    # RUBRICA TELEGRAM
+    # =====================================================
+
+    elif data == "contacts":
+        state["contact_page"] = 0
+        await query.edit_message_text(
+            await contacts_page_text(0),
+            reply_markup=contacts_keyboard(),
+        )
+
+    elif data == "extract_contacts":
+        await query.edit_message_text("⏳ Lettura rubrica Telegram in corso...")
+        try:
+            total = await extract_contacts()
+            state["contact_page"] = 0
+            await query.edit_message_text(
+                f"✅ RUBRICA AGGIORNATA\n\nContatti trovati: {total}\n\n"
+                "La lista serve per preparare gli inviti dei contatti che hanno già dato il consenso.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📒 MOSTRA RUBRICA", callback_data="contacts")],
+                    [InlineKeyboardButton("⬅️ HOME", callback_data="home")],
+                ]),
+            )
+        except Exception as e:
+            await add_log(f"❌ RUBRICA — {type(e).__name__}: {e}", "ERROR")
+            await query.edit_message_text(
+                f"❌ Impossibile leggere la rubrica.\n\n{type(e).__name__}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ HOME", callback_data="home")]]),
+            )
+
+    elif data == "contacts_prev":
+        page = max(0, state["contact_page"] - 1)
+        await query.edit_message_text(await contacts_page_text(page), reply_markup=contacts_keyboard())
+
+    elif data == "contacts_next":
+        total = await contacts_count()
+        pages = max(1, math.ceil(total / PAGE_SIZE))
+        page = min(pages - 1, state["contact_page"] + 1)
+        await query.edit_message_text(await contacts_page_text(page), reply_markup=contacts_keyboard())
+
+    elif data == "contacts_add":
+        if not state["group_b"]:
+            await query.answer("Imposta prima il gruppo B.", show_alert=True)
+            return
+
+        # La rubrica viene usata come sorgente manuale: l'admin copia una
+        # pagina da 20 contatti e la incolla qui. Nessun contatto dell'intera
+        # rubrica viene messo automaticamente in coda.
+        state["waiting_for"] = "manual_ids"
+
+        await query.edit_message_text(
+            "➕ AGGIUNGI CONTATTI RUBRICA\n\n"
+            "Incolla qui un blocco della 📒 RUBRICA TELEGRAM.\n\n"
+            "Puoi incollare direttamente la pagina da 20 contatti, ad esempio:\n"
+            "1. Mario Rossi (@mario) — 123456789\n"
+            "2. @luca — 987654321\n\n"
+            "Il bot riconoscerà al massimo 20 contatti per volta e, dopo la tua "
+            "conferma, proverà ad aggiungerli direttamente al Gruppo B.\n\n"
+            "Usa questa funzione solo per contatti che hanno già dato il consenso.\n"
+            "Nessuna operazione partirà finché non premi CONFERMA.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ ANNULLA", callback_data="contacts")
+            ]]),
+        )
+
+    # =====================================================
     # MANUALE
     # =====================================================
 
@@ -2449,7 +2637,7 @@ async def buttons(
 
             "Incolla gli utenti da invitare.\n\n"
             "Puoi incollare direttamente una pagina di "
-            "👥 MEMBRI GRUPPO A, ad esempio:\n"
+            "👥 MEMBRI GRUPPO A oppure 📒 RUBRICA TELEGRAM, ad esempio:\n"
             "1. @utente — 123456789\n"
             "2. @utente2 — 987654321\n\n"
             "Oppure puoi inserire semplicemente gli ID, "
@@ -3109,6 +3297,34 @@ async def _delete_welcome_later(bot, chat_id, message_id):
         logger.warning("Impossibile eliminare il benvenuto %s: %s", message_id, e)
 
 
+async def delete_left_member_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Elimina il messaggio di servizio quando qualcuno lascia il Gruppo B."""
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message or not chat or not message.left_chat_member:
+        return
+
+    # Agisce esclusivamente nel Gruppo B configurato.
+    if not state.get("group_b") or not _same_telegram_chat_id(
+        chat.id,
+        state["group_b"].get("id"),
+    ):
+        return
+
+    try:
+        await context.bot.delete_message(
+            chat_id=chat.id,
+            message_id=message.message_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "Impossibile eliminare il messaggio di uscita %s: %s",
+            message.message_id,
+            e,
+        )
+
+
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Invia un solo benvenuto personale ai nuovi membri del Gruppo B."""
     message = update.effective_message
@@ -3275,6 +3491,13 @@ def main():
 
     application.add_handler(
         MessageHandler(
+            filters.StatusUpdate.LEFT_CHAT_MEMBER,
+            delete_left_member_notice,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
             filters.ChatType.GROUPS,
             moderate_group_b_links,
         )
@@ -3291,7 +3514,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.4.8 avviato"
+        "V4.5.1 avviato"
     )
 
     application.run_polling()
