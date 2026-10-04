@@ -86,6 +86,7 @@ state = {
     "running": False,
     "stop_requested": False,
     "telegram_locked": False,
+    "telegram_restriction_detected": False,
 
     "waiting_for": None,
 
@@ -298,6 +299,13 @@ async def load_settings():
     state["telegram_locked"] = (
         await get_setting(
             "telegram_locked",
+            "0",
+        ) == "1"
+    )
+
+    state["telegram_restriction_detected"] = (
+        await get_setting(
+            "telegram_restriction_detected",
             "0",
         ) == "1"
     )
@@ -1179,7 +1187,8 @@ def main_keyboard():
         [
             InlineKeyboardButton(
                 (
-                    "🔒 INVITI SOSPESI" if state["telegram_locked"]
+                    "🛑 LIMITAZIONE TELEGRAM" if state["telegram_locked"] and state["telegram_restriction_detected"]
+                    else "🔒 INVITI SOSPESI" if state["telegram_locked"]
                     else "🟢 AUTOMATICO ATTIVO" if state["running"]
                     else f"🟡 PROGRAMMATO {state['start_time']}" if state["auto_enabled"]
                     else "🤖 ATTIVA AUTOMATICO"
@@ -1217,43 +1226,24 @@ def main_keyboard():
 
 async def home_text():
 
-    stats = await get_today_stats()
-    remaining = max(0, state["daily_target"] - stats["migrated"])
-
-    if state["telegram_locked"]:
-        status = "🔒 INVITI SOSPESI"
+    # La HOME mostra solo le informazioni essenziali.
+    # Le statistiche dettagliate restano disponibili dal pulsante STATISTICHE.
+    if state["telegram_locked"] and state["telegram_restriction_detected"]:
+        status = "🛑 LIMITAZIONE TELEGRAM RILEVATA — INVITI BLOCCATI"
+    elif state["telegram_locked"]:
+        status = "🔒 INVITI SOSPESI DAL BLOCCO LOCALE"
     elif state["running"]:
-        status = "🟢 AUTOMATICO ATTIVO"
-    elif state["auto_enabled"] and remaining == 0:
-        status = (
-            f"🌙 IN ATTESA — prossima partenza domani "
-            f"{state['start_time']}"
-        )
+        status = "🟢 AUTOMATICO IN ESECUZIONE"
     elif state["auto_enabled"]:
-        status = f"🌙 PROGRAMMATO — partenza {state['start_time']}"
+        status = f"🟡 AUTOMATICO PROGRAMMATO — {state['start_time']}"
     else:
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.4.4\n"
-        f"{status}\n\n"
-        f"📥 A: {group_label(state['group_a'])}\n"
-        f"📤 B: {group_label(state['group_b'])}\n\n"
-        "🤖 AUTOMATICO\n"
-        f"🎯 Target: {state['daily_target']}/giorno\n"
-        f"🕐 Partenza: {state['start_time']}\n"
-        f"⏱ Intervallo: {state['interval_minutes']} min\n\n"
-        "📅 OGGI\n"
-        f"✅ Confermati: {stats['migrated']}\n"
-        f"🎯 Rimanenti: {remaining}\n"
-        f"🔎 Tentativi: {stats['attempts']}\n"
-        f"🔒 Privacy: {stats['privacy']}\n"
-        f"↪️ Già presenti: {stats['already']}\n"
-        f"⚠️ Non aggiunti: {stats['unconfirmed']}\n"
-        f"❌ Errori: {stats['errors']}\n\n"
-        f"🕐 {now_it().strftime('%H:%M:%S')}\n"
-        "Ultimo evento:\n"
-        f"{state['last_event']}"
+        "👥 BESTPRICE MEMBER MANAGER V4.4.7\n\n"
+        f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
+        f"📤 GRUPPO B: {group_label(state['group_b'])}\n\n"
+        f"{status}"
     )
 
 
@@ -1439,9 +1429,11 @@ async def invite_one(
 
         state["running"] = False
         state["telegram_locked"] = True
+        state["telegram_restriction_detected"] = True
         state["auto_enabled"] = False
 
         await set_setting("telegram_locked", "1")
+        await set_setting("telegram_restriction_detected", "1")
         await set_setting("auto_enabled", "0")
 
         await add_log(
@@ -1492,6 +1484,7 @@ async def daily_scheduler(application):
             if (
                 state["auto_enabled"]
                 and not state["running"]
+                and not (worker_task is not None and not worker_task.done())
                 and not state["telegram_locked"]
                 and state["group_a"]
                 and state["group_b"]
@@ -1701,13 +1694,16 @@ async def migration_worker(
 
         finally:
 
-            state["running"] = False
+            # Solo il task proprietario può liberare lo stato globale.
+            # Evita che un vecchio task azzeri il riferimento di un ciclo più recente.
+            current_task = asyncio.current_task()
+            if worker_task is current_task:
+                state["running"] = False
+                worker_task = None
 
             await add_log(
                 "🏁 Ciclo AUTO terminato"
             )
-
-            worker_task = None
 
 
 # =========================================================
@@ -2108,7 +2104,12 @@ async def buttons(
         if (
             state["telegram_locked"]
             or state["running"]
+            or (worker_task is not None and not worker_task.done())
         ):
+            await query.answer(
+                "🟢 Un ciclo automatico è già in esecuzione." if not state["telegram_locked"] else "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
             return
 
         state["auto_enabled"] = True
@@ -2189,8 +2190,11 @@ async def buttons(
             await query.answer("🔒 Inviti sospesi.", show_alert=True)
             return
 
-        if state["running"]:
-            await query.answer("🟢 Automatico già attivo.", show_alert=True)
+        if state["running"] or (worker_task is not None and not worker_task.done()):
+            await query.answer(
+                "🟢 Automatico già in esecuzione. Non è stato avviato un secondo ciclo.",
+                show_alert=True,
+            )
             return
 
         if not state["group_a"] or not state["group_b"]:
@@ -2698,9 +2702,10 @@ async def buttons(
 
         await query.edit_message_text(
             "⚠️ RIABILITARE GLI INVITI?\n\n"
-            "Usalo solo dopo aver verificato "
-            "che Telegram consenta nuovamente "
-            "gli inviti.",
+            "Il blocco locale è stato attivato perché Telegram ha segnalato una limitazione.\n\n"
+            "Sblocca solo dopo aver verificato (ad esempio con @SpamBot) "
+            "che l'account non sia più limitato. Lo sblocco del bot non rimuove "
+            "una limitazione applicata da Telegram.",
 
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
@@ -2719,15 +2724,20 @@ async def buttons(
         state[
             "telegram_locked"
         ] = False
+        state["telegram_restriction_detected"] = False
 
         await set_setting(
             "telegram_locked",
             "0",
         )
+        await set_setting(
+            "telegram_restriction_detected",
+            "0",
+        )
 
         await add_log(
-            "🔓 Blocco inviti "
-            "rimosso manualmente"
+            "🔓 Blocco locale rimosso manualmente — "
+            "limitazione Telegram marcata come verificata/risolta dall'amministratore"
         )
 
         await query.edit_message_text(
