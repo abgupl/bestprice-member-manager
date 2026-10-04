@@ -1507,7 +1507,8 @@ async def invite_one(
 
         await add_log(
             f"🔒 {mode} — {display} — PRIVACY UTENTE — "
-            "le impostazioni privacy non consentono l'aggiunta",
+            "le impostazioni privacy non consentono l'aggiunta — "
+            f"{type(e).__name__}: {str(e)[:220]}",
             "WARNING",
         )
 
@@ -1520,7 +1521,8 @@ async def invite_one(
 
         await add_log(
             f"🔒 {mode} — {display} — PRIVACY/CONTATTO — "
-            "Telegram richiede che l'utente sia un contatto reciproco",
+            "Telegram richiede che l'utente sia un contatto reciproco — "
+            f"{type(e).__name__}: {str(e)[:220]}",
             "WARNING",
         )
 
@@ -1533,7 +1535,8 @@ async def invite_one(
         await add_log(
             f"⏳ {mode} — {display} — PAUSA RICHIESTA DA TELEGRAM — "
             f"attesa richiesta: {e.seconds}s. Ciclo fermato; "
-            "nessun blocco locale PeerFlood impostato.",
+            "nessun blocco locale PeerFlood impostato — "
+            f"{type(e).__name__}: {str(e)[:220]}",
             "WARNING",
         )
 
@@ -1551,8 +1554,11 @@ async def invite_one(
         await set_setting("auto_enabled", "0")
 
         await add_log(
-            f"🛑 {mode} — {display} — LIMITAZIONE TELEGRAM — "
-            "automatico fermato e blocco locale di sicurezza attivato.",
+            f"🛑 {mode} — {display} (ID {user.id}) — LIMITAZIONE INVITI TELEGRAM — "
+            f"{type(e).__name__}: {str(e)[:220]} — "
+            "automatico fermato e blocco locale di sicurezza attivato. "
+            "Questo errore non dimostra un problema del solo destinatario; "
+            "può riguardare gli inviti anche se @SpamBot non segnala limitazioni.",
             "WARNING",
         )
 
@@ -1562,12 +1568,29 @@ async def invite_one(
 
         error_name = type(e).__name__
 
-        if error_name in {"UserChannelsTooMuchError", "ChannelsTooMuchError"}:
+        # Solo errori riferiti esplicitamente al destinatario vengono salvati
+        # come processati. Errori generici o del gruppo restano riprovabili.
+        recipient_errors = {
+            "UserIdInvalidError": "ID utente non valido",
+            "InputUserDeactivatedError": "account eliminato",
+            "UserDeactivatedError": "account disattivato",
+            "UserDeactivatedBanError": "account disattivato da Telegram",
+            "UserBlockedError": "utente bloccato",
+            "UserKickedError": "utente espulso dal gruppo",
+            "UserChannelsTooMuchError": "utente già in troppi gruppi/canali",
+        }
+
+        if error_name in recipient_errors:
             await increment_stat("errors")
-            await save_processed(user, "CHANNEL_LIMIT")
+            await save_processed(
+                user,
+                "CHANNEL_LIMIT" if error_name == "UserChannelsTooMuchError"
+                else "RECIPIENT_ERROR",
+            )
             await add_log(
-                f"🚫 {mode} — {display} — TROPPI GRUPPI/CANALI — "
-                "Telegram non consente l'aggiunta perché è stato raggiunto un limite",
+                f"↪️ {mode} — {display} (ID {user.id}) — DESTINATARIO SALTATO — "
+                f"{recipient_errors[error_name]} — "
+                f"{error_name}: {str(e)[:220]}",
                 "WARNING",
             )
             return ("error", display)
