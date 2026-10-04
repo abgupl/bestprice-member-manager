@@ -1178,8 +1178,16 @@ def main_keyboard():
         ],
         [
             InlineKeyboardButton(
-                "🤖 ATTIVA AUTOMATICO",
-                callback_data="start_run",
+                (
+                    "🔒 INVITI SOSPESI" if state["telegram_locked"]
+                    else "🟢 AUTOMATICO ATTIVO" if state["running"]
+                    else f"🟡 PROGRAMMATO {state['start_time']}" if state["auto_enabled"]
+                    else "🤖 ATTIVA AUTOMATICO"
+                ),
+                callback_data=(
+                    "noop" if (state["telegram_locked"] or state["running"] or state["auto_enabled"])
+                    else "start_run"
+                ),
             )
         ],
         [
@@ -1226,7 +1234,8 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.4.3\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.4.4\n"
+        f"{status}\n\n"
         f"📥 A: {group_label(state['group_a'])}\n"
         f"📤 B: {group_label(state['group_b'])}\n\n"
         "🤖 AUTOMATICO\n"
@@ -1241,7 +1250,6 @@ async def home_text():
         f"↪️ Già presenti: {stats['already']}\n"
         f"⚠️ Non aggiunti: {stats['unconfirmed']}\n"
         f"❌ Errori: {stats['errors']}\n\n"
-        f"{status}\n\n"
         f"🕐 {now_it().strftime('%H:%M:%S')}\n"
         "Ultimo evento:\n"
         f"{state['last_event']}"
