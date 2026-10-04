@@ -1185,7 +1185,8 @@ def main_keyboard():
                     else "🤖 ATTIVA AUTOMATICO"
                 ),
                 callback_data=(
-                    "noop" if (state["telegram_locked"] or state["running"] or state["auto_enabled"])
+                    "noop" if state["telegram_locked"]
+                    else "auto_status_menu" if (state["running"] or state["auto_enabled"])
                     else "start_run"
                 ),
             )
@@ -2133,6 +2134,90 @@ async def buttons(
             await add_log(
                 f"🌙 Automatico giornaliero attivato — partenza {state['start_time']}"
             )
+
+        await query.edit_message_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+
+    # =====================================================
+    # PANNELLO STATO AUTOMATICO
+    # =====================================================
+
+    elif data == "auto_status_menu":
+
+        if state["telegram_locked"]:
+            await query.answer(
+                "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
+            return
+
+        if state["running"]:
+            stato = "🟢 AUTOMATICO ATTIVO\n\nIl ciclo è in esecuzione in questo momento."
+            keyboard = [
+                [InlineKeyboardButton("🛑 FERMA AUTOMATICO", callback_data="stop")],
+                [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
+            ]
+        else:
+            stato = (
+                f"🟡 AUTOMATICO PROGRAMMATO\n\n"
+                f"🕐 Partenza giornaliera: {state['start_time']}\n"
+                f"🎯 Target: {state['daily_target']}/giorno\n"
+                f"⏱ Intervallo: {state['interval_minutes']} min\n\n"
+                "Puoi lasciarlo programmato oppure avviarlo subito."
+            )
+            keyboard = [
+                [InlineKeyboardButton("▶️ AVVIA ORA", callback_data="start_now")],
+                [InlineKeyboardButton("🕐 CAMBIA ORARIO", callback_data="set_start_time")],
+                [InlineKeyboardButton("⛔ DISATTIVA AUTOMATICO", callback_data="stop")],
+                [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
+            ]
+
+        await query.edit_message_text(
+            stato,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    # =====================================================
+    # AVVIA SUBITO IL CICLO PROGRAMMATO
+    # =====================================================
+
+    elif data == "start_now":
+
+        if state["telegram_locked"]:
+            await query.answer("🔒 Inviti sospesi.", show_alert=True)
+            return
+
+        if state["running"]:
+            await query.answer("🟢 Automatico già attivo.", show_alert=True)
+            return
+
+        if not state["group_a"] or not state["group_b"]:
+            await query.answer("Imposta prima A e B.", show_alert=True)
+            return
+
+        stats = await get_today_stats()
+        if stats["migrated"] >= state["daily_target"]:
+            await query.answer(
+                "🎯 Target giornaliero già raggiunto.",
+                show_alert=True,
+            )
+            return
+
+        state["auto_enabled"] = True
+        state["stop_requested"] = False
+        state["running"] = True
+        await set_setting("auto_enabled", "1")
+
+        today = now_it().date().isoformat()
+        state["last_autostart_day"] = today
+        await set_setting("last_autostart_day", today)
+
+        await add_log("▶️ Automatico avviato manualmente dal pannello PROGRAMMATO")
+        worker_task = asyncio.create_task(
+            migration_worker(context.application)
+        )
 
         await query.edit_message_text(
             await home_text(),
