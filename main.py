@@ -1226,7 +1226,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.4.2\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.4.3\n\n"
         f"📥 A: {group_label(state['group_a'])}\n"
         f"📤 B: {group_label(state['group_b'])}\n\n"
         "🤖 AUTOMATICO\n"
@@ -1237,9 +1237,9 @@ async def home_text():
         f"✅ Confermati: {stats['migrated']}\n"
         f"🎯 Rimanenti: {remaining}\n"
         f"🔎 Tentativi: {stats['attempts']}\n"
-        f"🛡 Privacy: {stats['privacy']}\n"
+        f"🔒 Privacy: {stats['privacy']}\n"
         f"↪️ Già presenti: {stats['already']}\n"
-        f"⚠️ Non confermati: {stats['unconfirmed']}\n"
+        f"⚠️ Non aggiunti: {stats['unconfirmed']}\n"
         f"❌ Errori: {stats['errors']}\n\n"
         f"{status}\n\n"
         f"🕐 {now_it().strftime('%H:%M:%S')}\n"
@@ -1288,7 +1288,7 @@ async def invite_one(
 
         await add_log(
             f"📨 {mode} — {display} — "
-            "InviteToChannelRequest completata senza eccezioni"
+            "Richiesta inviata a Telegram — verifica in corso"
         )
 
         await add_log(
@@ -1311,7 +1311,7 @@ async def invite_one(
 
             await add_log(
                 f"🔍 {mode} — {display} — "
-                "GetParticipantRequest: PRESENTE"
+                "Verifica completata: utente presente"
             )
 
             await increment_stat(
@@ -1324,9 +1324,8 @@ async def invite_one(
             )
 
             await add_log(
-                f"✅ {mode} — "
-                f"Confermato: "
-                f"{display}"
+                f"✅ {mode} — {display} — "
+                "AGGIUNTO AL GRUPPO"
             )
 
             return (
@@ -1343,14 +1342,21 @@ async def invite_one(
             "UNCONFIRMED",
         )
 
+        # La richiesta Telegram non equivale a un'aggiunta riuscita:
+        # il successo viene conteggiato solo dopo la verifica effettiva.
+        if verify_error == "UserNotParticipantError":
+            dettaglio_verifica = (
+                "Telegram ha accettato la richiesta, ma l'utente "
+                "non risulta nel gruppo"
+            )
+        else:
+            dettaglio_verifica = (
+                f"Verifica non riuscita ({verify_error or 'errore sconosciuto'})"
+            )
+
         await add_log(
-            f"⚠️ {mode} — {display} — "
-            f"verifica fallita: {verify_error or 'Sconosciuto'}"
-            + (
-                f": {verify_message}"
-                if verify_message
-                else ""
-            ),
+            f"⚠️ {mode} — {display} — NON AGGIUNTO — "
+            f"{dettaglio_verifica}",
             "WARNING",
         )
 
@@ -1387,8 +1393,8 @@ async def invite_one(
         await save_processed(user, "PRIVACY")
 
         await add_log(
-            f"🛡 {mode} — {display} — "
-            f"UserPrivacyRestrictedError: {str(e)[:180]}",
+            f"🔒 {mode} — {display} — PRIVACY UTENTE — "
+            "le impostazioni privacy non consentono l'aggiunta",
             "WARNING",
         )
 
@@ -1400,8 +1406,8 @@ async def invite_one(
         await save_processed(user, "PRIVACY")
 
         await add_log(
-            f"🛡 {mode} — {display} — "
-            f"UserNotMutualContactError: {str(e)[:180]}",
+            f"🔒 {mode} — {display} — PRIVACY/CONTATTO — "
+            "Telegram richiede che l'utente sia un contatto reciproco",
             "WARNING",
         )
 
@@ -1412,9 +1418,9 @@ async def invite_one(
         state["running"] = False
 
         await add_log(
-            f"⏳ {mode} — {display} — FloodWaitError — "
-            f"Telegram richiede attesa di {e.seconds}s. "
-            "Ciclo fermato; nessun blocco locale PeerFlood impostato.",
+            f"⏳ {mode} — {display} — PAUSA RICHIESTA DA TELEGRAM — "
+            f"attesa richiesta: {e.seconds}s. Ciclo fermato; "
+            "nessun blocco locale PeerFlood impostato.",
             "WARNING",
         )
 
@@ -1430,9 +1436,8 @@ async def invite_one(
         await set_setting("auto_enabled", "0")
 
         await add_log(
-            f"🚫 {mode} — {display} — PeerFloodError — "
-            f"risposta Telegram: {str(e)[:180]} — "
-            "STOP e blocco locale del bot attivato.",
+            f"🛑 {mode} — {display} — LIMITAZIONE TELEGRAM — "
+            "automatico fermato e blocco locale di sicurezza attivato.",
             "WARNING",
         )
 
@@ -1440,11 +1445,23 @@ async def invite_one(
 
     except Exception as e:
 
+        error_name = type(e).__name__
+
+        if error_name in {"UserChannelsTooMuchError", "ChannelsTooMuchError"}:
+            await increment_stat("errors")
+            await save_processed(user, "CHANNEL_LIMIT")
+            await add_log(
+                f"🚫 {mode} — {display} — TROPPI GRUPPI/CANALI — "
+                "Telegram non consente l'aggiunta perché è stato raggiunto un limite",
+                "WARNING",
+            )
+            return ("error", display)
+
         await increment_stat("errors")
 
         await add_log(
-            f"❌ {mode} — {display} — "
-            f"{type(e).__name__}: {str(e)[:220]}",
+            f"❌ {mode} — {display} — ERRORE TELEGRAM — "
+            f"{error_name}: {str(e)[:160]}",
             "ERROR",
         )
 
@@ -2932,7 +2949,7 @@ async def post_init(
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.4.2"
+        "V4.4.3"
     )
 
     global scheduler_task
@@ -3098,7 +3115,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.4.2 avviato"
+        "V4.4.3 avviato"
     )
 
     application.run_polling()
