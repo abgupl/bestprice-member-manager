@@ -4,6 +4,7 @@ import logging
 import math
 import re
 import html
+import json
 from contextvars import ContextVar
 from functools import wraps
 from datetime import datetime
@@ -1063,6 +1064,208 @@ async def check_telegram_ip(account_id):
     return result
 
 
+async def diagnostic_group(client, group, label):
+    if not group:
+        return [f"📂 {label}: non configurato"]
+    lines = [f"📂 {label}: {str(group.get('name', group['id']))[:80]}"]
+    try:
+        entity = await asyncio.wait_for(client.get_entity(group["input"]), timeout=10)
+        permissions = await asyncio.wait_for(client.get_permissions(entity, "me"), timeout=10)
+        if permissions is None:
+            lines.append("⚠️ Permessi personali non disponibili")
+        elif permissions.has_left or getattr(getattr(getattr(permissions, "participant", None), "banned_rights", None), "view_messages", False):
+            lines.append("❌ Non membro oppure escluso dal gruppo")
+        else:
+            role = "proprietario" if permissions.is_creator else "amministratore" if permissions.is_admin else "membro"
+            lines.append(f"✅ Presenza verificata — ruolo: {role}")
+            if permissions.is_creator or permissions.is_admin:
+                allowed = bool(permissions.is_creator or permissions.invite_users)
+            else:
+                personal = getattr(getattr(permissions, "participant", None), "banned_rights", None)
+                defaults = getattr(entity, "default_banned_rights", None)
+                allowed = not (getattr(personal, "invite_users", False) or getattr(defaults, "invite_users", False))
+            lines.append("Invita utenti (permessi del gruppo): " + ("✅ consentito" if allowed else "❌ non consentito"))
+            if permissions.is_banned:
+                lines.append("⚠️ Account con restrizioni personali nel gruppo")
+            if label == "GRUPPO B" and not allowed:
+                lines.append("Azione: controlla i permessi del gruppo per questo account.")
+        if getattr(entity, "participants_count", None) is not None:
+            lines.append(f"Membri riportati: {entity.participants_count}")
+    except Exception as exc:
+        if type(exc).__name__ == "UserNotParticipantError":
+            lines.append("❌ Account non membro: deve prima entrare nel gruppo.")
+        else:
+            lines.append("⚠️ Accesso/permessi non verificabili — " + safe_connection_error(exc))
+    return lines
+
+
+def classify_spambot_reply(reply):
+    """Riconosce soltanto risposte esplicite; non deduce uno stato da una parola."""
+    text = " ".join(reply.lower().replace("’", "'").split())
+    clear = any(phrase in text for phrase in (
+        "good news, no limits are currently applied to your account",
+        "nessuna limitazione è attualmente applicata al tuo account",
+        "nessun limite è attualmente applicato al tuo account",
+    ))
+    limited = any(phrase in text for phrase in (
+        "your account is now limited", "your account is limited",
+        "your account has been limited", "your account will be automatically released",
+        "il tuo account è attualmente limitato", "il tuo account è stato limitato",
+    ))
+    if clear and not limited:
+        return "NO_LIMITS_REPORTED"
+    if limited and not clear:
+        return "LIMITED"
+    return "UNKNOWN"
+
+
+async def spambot_record(account_id):
+    owner = session_info[account_id]["user_id"]
+    if not owner:
+        return {}
+    try:
+        record = json.loads(await get_setting(f"spambot_check_{owner}", "{}"))
+        return record if isinstance(record, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+async def query_spambot(account_id):
+    """Richiesta esplicita dal pannello; nessun appello, invito o sblocco automatico."""
+    info = session_info[account_id]
+    if not info["ready"] or not info["user_id"]:
+        return
+    record = await spambot_record(account_id)
+    attempted = now_it().timestamp()
+    if attempted - float(record.get("attempted_at", 0)) < 60:
+        return  # Il report mantiene l'ora originale: non presenta una cache come nuova risposta.
+    record = {"status": "UNKNOWN", "attempted_at": attempted,
+              "checked_at": "", "reply": "", "error": "Risposta non ancora ricevuta"}
+    key = f"spambot_check_{info['user_id']}"
+    await set_setting(key, json.dumps(record, ensure_ascii=False))
+    client = session_clients[account_id]
+    try:
+        entity = await asyncio.wait_for(client.get_entity("@SpamBot"), timeout=10)
+        if not getattr(entity, "bot", False) or (getattr(entity, "username", None) or "").lower() != "spambot":
+            raise ValueError("Identità di @SpamBot non verificata")
+        async with client.conversation(entity, timeout=20, total_timeout=25, exclusive=True) as conversation:
+            sent = await conversation.send_message("/start")
+            response = await conversation.get_response(sent)
+        if (getattr(response, "sender_id", None) != entity.id
+                or getattr(response, "out", False)
+                or response.id <= sent.id):
+            raise ValueError("Risposta non valida o non successiva alla richiesta")
+        reply = getattr(response, "message", None) or ""
+        record.update(status=classify_spambot_reply(reply), checked_at=now_it().isoformat(),
+                      reply=reply[:2000], error="")
+        if record["status"] == "LIMITED":
+            for flag in ("telegram_locked", "telegram_restriction_detected"):
+                info[flag] = True
+                await set_setting(f"session_{account_id}_{flag}", "1")
+            if account_id == state["active_session"]:
+                sync_session_state()
+                state["auto_enabled"] = False
+                await set_setting("auto_enabled", "0")
+        await add_log("🤖 SPAMBOT — verifica aggiornata: " + record["status"] +
+                      "; blocco locale mantenuto se già presente", session_id=account_id)
+    except Exception as exc:
+        record["error"] = ("Nessuna risposta entro il tempo previsto" if isinstance(exc, asyncio.TimeoutError)
+                           else safe_connection_error(exc))
+        await add_log("⚠️ SPAMBOT — stato non determinabile: " + record["error"], session_id=account_id)
+    await set_setting(key, json.dumps(record, ensure_ascii=False))
+
+
+async def spambot_report(account_id):
+    record = await spambot_record(account_id)
+    lines = ["", "🤖 SPAMBOT — controllo su richiesta con /start"]
+    if not record:
+        return lines + ["Stato non determinabile: nessun controllo disponibile per questo account."]
+    stamp = datetime.fromtimestamp(record["attempted_at"], ITALY_TZ).strftime("%d/%m/%Y %H:%M:%S")
+    lines.append("Ultima richiesta: " + stamp + " (richieste distanziate di almeno 60 secondi)")
+    labels = {"LIMITED": "🔒 LIMITATO secondo @SpamBot",
+              "NO_LIMITS_REPORTED": "✅ NESSUNA LIMITAZIONE SEGNALATA da @SpamBot",
+              "UNKNOWN": "⚠️ STATO NON DETERMINABILE"}
+    lines.append(labels.get(record.get("status"), labels["UNKNOWN"]))
+    if record.get("checked_at"):
+        lines.append("Risposta ricevuta: " + datetime.fromisoformat(record["checked_at"]).astimezone(ITALY_TZ).strftime("%d/%m/%Y %H:%M:%S"))
+    if record.get("reply"):
+        lines.append("Testo di @SpamBot: " + record["reply"])
+    if record.get("error"):
+        lines.append("Dettaglio: " + record["error"])
+    lines.append("Lo stato di @SpamBot non certifica che gli inviti siano consentiti. Nessun blocco precedente viene rimosso automaticamente.")
+    return lines
+
+
+async def session_diagnostic_text(account_id):
+    info = session_info[account_id]
+    lines = [f"🔎 VERIFICA DETTAGLIATA — ACCOUNT {account_id}",
+             "Controllo: " + now_it().strftime("%d/%m/%Y %H:%M:%S"),
+             "Connessione: " + info["error"],
+             "ID Telegram: " + str(info["user_id"] or "non disponibile"),
+             "Blocco locale antispam: " + ("🔒 ATTIVO" if info["telegram_locked"] else "nessuno registrato"), ""]
+    slot = info["proxy_slot"]
+    if slot:
+        lines.append(f"🌐 Proxy assegnato: {slot} — SOCKS5")
+        await test_proxy_connection(slot)
+        lines.append(proxy_checks[slot])
+    else:
+        lines.append("❌ Proxy non configurato: controlla le variabili Railway.")
+    if info["ready"]:
+        client = session_clients[account_id]
+        try:
+            me = await asyncio.wait_for(client.get_me(), timeout=10)
+            if me is None:
+                raise ValueError("Identita account non disponibile")
+            lines.extend(["", "👤 IDENTITÀ",
+                          "Nome: " + " ".join(x for x in (getattr(me, "first_name", None), getattr(me, "last_name", None)) if x)[:100],
+                          "Username: " + ("@" + me.username if getattr(me, "username", None) else "non impostato"),
+                          "Numero: " + ("+" + me.phone if getattr(me, "phone", None) else "non disponibile"),
+                          "Premium: " + ("sì" if getattr(me, "premium", False) else "no"),
+                          "Account eliminato: " + ("sì" if getattr(me, "deleted", False) else "no"),
+                          "Flag restricted: " + ("sì" if getattr(me, "restricted", False) else "no"),
+                          "Flag scam/fake: " + ("sì" if getattr(me, "scam", False) or getattr(me, "fake", False) else "no")])
+            reasons = getattr(me, "restriction_reason", None) or []
+            for reason in reasons[:2]:
+                lines.append("Restrizione contenuti: " + str(getattr(reason, "text", "non specificata"))[:160])
+            lines.append("I flag dell'identità non certificano l'assenza di limiti sugli inviti.")
+        except Exception as exc:
+            lines.append("⚠️ Lettura identità fallita — " + safe_connection_error(exc))
+        lines.extend(["", "🌐 CONNESSIONE DELLA SESSIONE"])
+        lines.append(await check_telegram_ip(account_id))
+        lines.append("L'IP riportato può aggiornarsi con ritardo o differire dall'IP del server proxy.")
+        suffix = account_suffix(account_id)
+        for name, label in (("DEVICE_MODEL", "Dispositivo configurato"), ("SYSTEM_VERSION", "Sistema"), ("APP_VERSION", "Versione client")):
+            lines.append(label + ": " + os.environ.get(name + suffix, "predefinito Telethon")[:80])
+        for key, label in (("group_a", "GRUPPO A"), ("group_b", "GRUPPO B")):
+            lines.append("")
+            lines.extend(await diagnostic_group(client, state[key], label))
+    lines.extend(await spambot_report(account_id))
+    owner = info["user_id"] or ('slot_' + str(account_id))
+    deadline = float(await get_setting(f"auto_next_invite_{owner}", "0"))
+    remaining = max(0, deadline - now_it().timestamp())
+    lines.extend(["", "⏱ Pausa AUTO residua: " + (f"circa {math.ceil(remaining / 60)} minuti" if remaining else "nessuna")])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT created_at, message FROM logs WHERE session_id = ? AND "
+            "(message LIKE '%PeerFlood%' OR message LIKE '%FloodWait%' OR message LIKE '%PROBLEMA GRUPPO B%') ORDER BY id DESC LIMIT 1",
+            (account_id,),
+        )
+        row = await cursor.fetchone()
+    if row:
+        lines.extend(["", "📋 Ultimo errore rilevante registrato: " + row[0], row[1][:450]])
+    lines.extend(["", "⚠️ Nessun test d'invito eseguito. Telegram non fornisce qui una certificazione preventiva dell'assenza di limiti antispam.",
+                  "PeerFlood indica una limitazione sugli inviti, non necessariamente un ban completo. Non rimuovere il blocco per riprovare."])
+    return "\n".join(lines)
+
+
+def diagnostic_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 SESSIONI", callback_data="sessions")],
+        [InlineKeyboardButton("🌐 PROXY", callback_data="proxy_status")],
+        [InlineKeyboardButton("⬅️ HOME", callback_data="home")],
+    ])
+
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_message:
         await update.effective_message.reply_text(f"Il tuo ID Telegram è: {update.effective_user.id}")
@@ -1800,7 +2003,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.7.2\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.7.4\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -2641,7 +2844,7 @@ async def buttons(
         if operation_busy():
             await callback_notice(query, "Ferma le operazioni prima di eseguire la diagnostica proxy.")
             return
-        await query.edit_message_text("🌐 Verifica in corso… Nessun invito verrà inviato.")
+        await query.edit_message_text("🌐 Verifica in corso… Contatto @SpamBot con /start; nessun invito verrà inviato.")
         if data == "proxy_ip":
             await check_telegram_ip(current_session_id())
         else:
@@ -2669,10 +2872,28 @@ async def buttons(
         if operation_busy():
             await callback_notice(query, "Ferma le operazioni prima di verificare la connessione.", show_alert=True)
             return
+        if account_id not in ACCOUNT_IDS:
+            await callback_notice(query, "Sessione non valida.")
+            return
+        await query.edit_message_text(f"🔎 Verifica dettagliata ACCOUNT {account_id} in corso… Contatto @SpamBot con /start; nessun invito verrà inviato.")
         await connect_session(account_id)
         await add_log("🔎 Connessione verificata: " + session_info[account_id]["error"],
                       session_id=account_id)
-        await query.edit_message_text(await sessions_text(), reply_markup=sessions_keyboard())
+        await query_spambot(account_id)
+        report = await session_diagnostic_text(account_id)
+        # Mantiene tutte le informazioni anche quando il report supera il limite Telegram.
+        chunks = []
+        current = ""
+        for line in report.splitlines():
+            if len(current) + len(line) + 1 > 3800:
+                chunks.append(current)
+                current = ""
+            current += line + "\n"
+        if current:
+            chunks.append(current)
+        await query.edit_message_text(chunks[0], reply_markup=diagnostic_keyboard())
+        for chunk in chunks[1:]:
+            await query.message.reply_text(chunk, reply_markup=diagnostic_keyboard())
         return
     if data.startswith("unlock:"):
         if data != f"unlock:{state['active_session']}":
@@ -3923,7 +4144,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.7.2 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.7.4 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -4294,7 +4515,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.7.2 avviato"
+        "V4.7.4 avviato"
     )
 
     application.run_polling()
