@@ -36,6 +36,7 @@ from telethon.tl.functions.channels import (
     GetParticipantRequest,
 )
 from telethon.tl.functions.contacts import GetContactsRequest
+from telethon.tl.functions.account import GetAuthorizationsRequest
 from telethon.tl.types import Channel, Chat
 
 
@@ -470,12 +471,12 @@ async def load_settings():
 
     state["max_attempts"] = 3
 
-    state["interval_minutes"] = int(
+    state["interval_minutes"] = max(15, int(
         await get_setting(
             "interval_minutes",
             "10",
         )
-    )
+    ))
 
     state["contact_interval_minutes"] = int(
         await get_setting("contact_interval_minutes", "5")
@@ -964,8 +965,102 @@ def sessions_keyboard():
             f"{'✅' if account_id == state['active_session'] else '👤'} USA ACCOUNT {account_id}",
             callback_data=f"select_session:{account_id}"),
             InlineKeyboardButton("🔎 VERIFICA", callback_data=f"check_session:{account_id}")])
+    rows.append([InlineKeyboardButton("🌐 PROXY / DIAGNOSTICA", callback_data="proxy_status")])
     rows.append([InlineKeyboardButton("⬅️ HOME", callback_data="home")])
     return InlineKeyboardMarkup(rows)
+
+
+proxy_checks = {}
+ip_checks = {}
+
+
+def proxy_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 TEST PROXY 1", callback_data="proxy_test:1"),
+         InlineKeyboardButton("🧪 TEST PROXY 2", callback_data="proxy_test:2")],
+        [InlineKeyboardButton("🔎 IP TELEGRAM — SESSIONE ATTIVA", callback_data="proxy_ip")],
+        [InlineKeyboardButton("🔄 AGGIORNA", callback_data="proxy_status")],
+        [InlineKeyboardButton("👤 SESSIONI", callback_data="sessions")],
+        [InlineKeyboardButton("⬅️ HOME", callback_data="home")],
+    ])
+
+
+async def proxy_status_text():
+    lines = ["🌐 PROXY / DIAGNOSTICA", ""]
+    for slot in (1, 2):
+        host = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
+        port = os.environ.get(f"PROXY_{slot}_PORT", "50101")
+        accounts = [str(i) for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot]
+        lines.extend([f"PROXY {slot} — SOCKS5 {host or 'non configurato'}:{port}",
+                      "Account configurati: " + (", ".join(accounts) or "nessuno"),
+                      proxy_checks.get(slot, "⚪ Non ancora testato in questo avvio"), ""])
+    account_id = state["active_session"]
+    lines.extend(["Sessione attiva: " + session_label(account_id),
+                  ip_checks.get(account_id, "⚪ IP visto da Telegram non ancora verificato"), "",
+                  "Il test verifica autenticazione SOCKS5 e apertura di una connessione verso Telegram.",
+                  "L'IP è quello riportato da Telegram per l'autorizzazione corrente: può essere aggiornato con ritardo.",
+                  "Un risultato positivo non certifica l'assenza di limitazioni antispam.",
+                  "Questi controlli non inviano inviti e non rimuovono i blocchi locali."])
+    return "\n".join(lines)
+
+
+async def test_proxy_connection(slot):
+    if slot not in (1, 2):
+        raise ValueError("Proxy non valido")
+    sock = None
+    stamp = now_it().strftime("%H:%M:%S")
+    try:
+        from python_socks import ProxyType
+        from python_socks.async_.asyncio import Proxy
+        candidates = [i for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot]
+        if not candidates:
+            raise ValueError("Nessuna sessione configurata per questo proxy")
+        account_id = candidates[0]
+        _, config = proxy_for_account(account_id)
+        client = session_clients.get(account_id)
+        if client is None:
+            raise ValueError("Client della sessione non disponibile")
+        target = client.session.server_address
+        target_port = client.session.port
+        proxy = Proxy(proxy_type=ProxyType.SOCKS5, host=config["addr"], port=config["port"],
+                      username=config["username"], password=config["password"], rdns=True)
+        started = asyncio.get_running_loop().time()
+        sock = await asyncio.wait_for(proxy.connect(dest_host=target, dest_port=target_port, timeout=10), timeout=12)
+        elapsed = int((asyncio.get_running_loop().time() - started) * 1000)
+        result = f"✅ {stamp} — SOCKS5 autenticato; connessione verso Telegram aperta ({elapsed} ms)"
+    except Exception as exc:
+        result = f"❌ {stamp} — TEST FALLITO — {safe_connection_error(exc)}"
+    finally:
+        if sock is not None:
+            sock.close()
+    proxy_checks[slot] = result
+    await add_log(f"🌐 PROXY {slot} — {result}", session_id=0)
+    return result
+
+
+async def check_telegram_ip(account_id):
+    stamp = now_it().strftime("%H:%M:%S")
+    info = session_info[account_id]
+    if not info["ready"]:
+        result = f"⚠️ {stamp} — Sessione non connessa: usa VERIFICA nel menu SESSIONI"
+    else:
+        try:
+            response = await asyncio.wait_for(session_clients[account_id](GetAuthorizationsRequest()), timeout=15)
+            current = next((a for a in response.authorizations if getattr(a, "current", False)), None)
+            if current is None or not getattr(current, "ip", None):
+                raise ValueError("IP dell'autorizzazione corrente non disponibile")
+            slot = info["proxy_slot"]
+            expected = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
+            result = f"🔎 {stamp} — IP riportato da Telegram: {current.ip}"
+            if current.ip == expected:
+                result += f" — coincide con il server proxy {slot}"
+            else:
+                result += " — diverso dal server proxy configurato; può essere un IP di uscita distinto o un dato non ancora aggiornato"
+        except Exception as exc:
+            result = f"❌ {stamp} — VERIFICA IP FALLITA — {safe_connection_error(exc)}"
+    ip_checks[account_id] = result
+    await add_log(result, session_id=account_id)
+    return result
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1625,6 +1720,7 @@ def main_keyboard():
 
     keyboard = [
         [InlineKeyboardButton("👤 SELEZIONA SESSIONE", callback_data="sessions")],
+        [InlineKeyboardButton("🌐 PROXY / DIAGNOSTICA", callback_data="proxy_status")],
         [
             InlineKeyboardButton("📥 GRUPPO A", callback_data="set_a"),
             InlineKeyboardButton("📤 GRUPPO B", callback_data="set_b"),
@@ -1704,7 +1800,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.7.0\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.7.2\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -1722,7 +1818,7 @@ DESTINATION_ERRORS = {
     "ChannelInvalidError", "ChatInvalidError", "UserBannedInChannelError",
     "UsersTooMuchError",
 }
-STOP_INVITE_RESULTS = {"peer_flood", "flood_wait", "destination_error", "verification_error"}
+STOP_INVITE_RESULTS = {"peer_flood", "flood_wait", "destination_error", "verification_error", "cooldown_stopped"}
 
 
 async def stop_invites_for_destination(display, mode, error_name, message):
@@ -1793,6 +1889,28 @@ def missing_invitee_detail(item):
             f"premium_required_for_pm={premium_pm}")
 
 
+def auto_deadline_key():
+    owner = session_info[current_session_id()].get("user_id")
+    return f"auto_next_invite_{owner or ('slot_' + str(current_session_id()))}"
+
+
+async def record_auto_deadline(seconds):
+    key = auto_deadline_key()
+    existing = float(await get_setting(key, "0"))
+    deadline = max(existing, now_it().timestamp() + seconds)
+    await set_setting(key, str(deadline))
+
+
+async def wait_auto_deadline():
+    deadline = float(await get_setting(auto_deadline_key(), "0"))
+    remaining = max(0, deadline - now_it().timestamp())
+    if not remaining:
+        return True
+    minutes = math.ceil(remaining / 60)
+    await add_log(f"⏱ AUTO — pausa precedente ancora attiva: attesa fino a {minutes} minuti prima di un nuovo invito")
+    return await interruptible_wait(minutes)
+
+
 async def invite_one(destination, user, mode):
     if await invitation_opted_out(user.id):
         await add_log(f"🚪 {mode} — ID {user.id} — uscita richiesta dall'utente: invito escluso")
@@ -1823,6 +1941,12 @@ async def invite_one(destination, user, mode):
     if previous_status in {"PRIVACY", "INVITE_REJECTED"}:
         await add_log(f"🔒 {mode} — {display} — precedente rifiuto privacy/invito: nessun nuovo tentativo", "WARNING")
         return ("unconfirmed", display)
+    if recovery and await recovery_used(user.id):
+        await save_processed(user, "NOT_ADDED")
+        await add_log(f"↪️ {mode} — {display} — recupero già usato; nessun nuovo invito")
+        return ("unconfirmed", display)
+    if "AUTO" in mode and not await wait_auto_deadline():
+        return ("cooldown_stopped", display)
     if recovery:
         # L'assenza è certa (UserNotParticipantError), non un errore tecnico.
         if not await reserve_recovery(user.id):
@@ -1837,6 +1961,8 @@ async def invite_one(destination, user, mode):
         )
 
 
+    if "AUTO" in mode:
+        await record_auto_deadline(max(15, state["interval_minutes"]) * 60)
     await increment_stat("attempts")
     await add_log(f"{mode} — Tentativo: {display}")
     try:
@@ -1935,6 +2061,9 @@ async def invite_one(destination, user, mode):
     except FloodWaitError as e:
 
         state["running"] = False
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+        await record_auto_deadline(e.seconds)
 
         await add_log(
             f"⏳ {mode} — {display} — PAUSA RICHIESTA DA TELEGRAM — "
@@ -2200,16 +2329,16 @@ async def migration_worker(
                 if attempts_cycle >= state["max_attempts"]:
                     await add_log("🛑 MAX tentativi raggiunto")
                     break
-                if result != "confirmed":
+                if not sent_attempt:
                     await add_log(
-                        f"↪️ 🤖 AUTO — {display} — nessuna aggiunta confermata; passo al prossimo utente senza attesa"
+                        f"↪️ 🤖 AUTO — {display} — solo controllo, nessun invito inviato; passo al prossimo utente"
                     )
                     continue
 
                 if state["running"]:
 
                     await add_log(
-                        "⏱ Prossima operazione "
+                        "⏱ Richiesta d'invito effettuata: prossimo tentativo "
                         f"tra "
                         f"{state['interval_minutes']} "
                         "minuti"
@@ -2505,6 +2634,24 @@ async def buttons(
 
     data = query.data
 
+    if data == "proxy_status":
+        await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
+        return
+    if data.startswith("proxy_test:") or data == "proxy_ip":
+        if operation_busy():
+            await callback_notice(query, "Ferma le operazioni prima di eseguire la diagnostica proxy.")
+            return
+        await query.edit_message_text("🌐 Verifica in corso… Nessun invito verrà inviato.")
+        if data == "proxy_ip":
+            await check_telegram_ip(current_session_id())
+        else:
+            value = data.split(":", 1)[1]
+            if value not in {"1", "2"}:
+                await callback_notice(query, "Proxy non valido.")
+                return
+            await test_proxy_connection(int(value))
+        await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
+        return
     if data == "sessions":
         await query.edit_message_text(await sessions_text(), reply_markup=sessions_keyboard())
         return
@@ -2654,7 +2801,7 @@ async def buttons(
 
         if (
             state["interval_minutes"]
-            > 10
+            > 15
         ):
 
             state[
@@ -3776,7 +3923,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.7.0 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.7.2 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -4147,7 +4294,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.7.0 avviato"
+        "V4.7.2 avviato"
     )
 
     application.run_polling()
