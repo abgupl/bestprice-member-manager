@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from functools import wraps
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import importlib.util
 
 import aiosqlite
 
@@ -68,6 +69,7 @@ logger = logging.getLogger(__name__)
 # TELETHON
 # =========================================================
 
+ACCOUNT_IDS = tuple(range(1, 7))
 session_clients = {}
 session_info = {}
 session_context = ContextVar("telegram_account", default=None)
@@ -77,24 +79,71 @@ welcome_bot = None
 welcome_lock = asyncio.Lock()
 welcome_tasks = set()
 
-for account_id in (1, 2):
-    suffix = "" if account_id == 1 else "_2"
+def account_suffix(account_id):
+    return "" if account_id == 1 else f"_{account_id}"
+
+
+def proxy_for_account(account_id):
+    slot = int(os.environ.get(f"SESSION_PROXY_{account_id}", "1" if account_id <= 3 else "2"))
+    if slot not in (1, 2):
+        raise ValueError("SESSION_PROXY deve essere 1 oppure 2")
+    host = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
+    if not host:
+        raise ValueError(f"PROXY_{slot}_HOST mancante")
+    port = int(os.environ.get(f"PROXY_{slot}_PORT", "50101"))
+    if not 1 <= port <= 65535:
+        raise ValueError("Porta proxy non valida")
+    if importlib.util.find_spec("python_socks") is None:
+        raise ValueError("Installa python-socks[asyncio] in requirements.txt")
+    username = os.environ.get(f"PROXY_{slot}_USERNAME", "")
+    password = os.environ.get(f"PROXY_{slot}_PASSWORD", "")
+    if bool(username) != bool(password):
+        raise ValueError("Username e password proxy devono essere entrambi presenti")
+    return slot, {
+        "proxy_type": "socks5", "addr": host, "port": port, "rdns": True,
+        "username": username or None, "password": password or None,
+    }
+
+
+for account_id in ACCOUNT_IDS:
+    suffix = account_suffix(account_id)
     session_string = os.environ.get(f"TELEGRAM_SESSION{suffix}", "").strip()
     info = {"ready": False, "name": f"ACCOUNT {account_id}", "user_id": None,
             "error": "Sessione non configurata", "telegram_locked": False,
-            "telegram_restriction_detected": False}
+            "telegram_restriction_detected": False, "proxy_slot": None}
     session_info[account_id] = info
     if session_string:
         try:
+            slot, proxy = proxy_for_account(account_id)
+            info["proxy_slot"] = slot
+            options = {}
+            for env_name, argument in (("DEVICE_MODEL", "device_model"),
+                                       ("SYSTEM_VERSION", "system_version"),
+                                       ("APP_VERSION", "app_version"),
+                                       ("LANG_CODE", "lang_code"),
+                                       ("SYSTEM_LANG_CODE", "system_lang_code")):
+                value = os.environ.get(f"{env_name}{suffix}", "").strip()
+                if value:
+                    options[argument] = value
             session_clients[account_id] = TelegramClient(
                 StringSession(session_string),
                 int(os.environ.get(f"API_ID{suffix}") or API_ID),
                 os.environ.get(f"API_HASH{suffix}") or API_HASH,
-                flood_sleep_threshold=0,
+                proxy=proxy, flood_sleep_threshold=0, **options,
             )
             info["error"] = "Connessione da verificare"
         except Exception as exc:
             info["error"] = f"Configurazione non valida ({type(exc).__name__})"
+
+
+def safe_connection_error(exc):
+    message = str(exc)
+    for slot in (1, 2):
+        for field in ("PASSWORD", "USERNAME"):
+            value = os.environ.get(f"PROXY_{slot}_{field}", "")
+            if value:
+                message = message.replace(value, "[riservato]")
+    return f"{type(exc).__name__}: {message[:180]}"
 
 
 def current_session_id():
@@ -449,7 +498,7 @@ async def load_settings():
         "",
     )
 
-    for account_id in (1, 2):
+    for account_id in ACCOUNT_IDS:
         for key in ("telegram_locked", "telegram_restriction_detected"):
             value = await get_setting(f"session_{account_id}_{key}")
             if value is None:
@@ -457,7 +506,7 @@ async def load_settings():
                 await set_setting(f"session_{account_id}_{key}", value)
             session_info[account_id][key] = value == "1"
     selected = await get_setting("active_session", "1")
-    state["active_session"] = int(selected) if selected in {"1", "2"} else 1
+    state["active_session"] = int(selected) if selected in {str(i) for i in ACCOUNT_IDS} else 1
     sync_session_state()
 
     for prefix in (
@@ -817,7 +866,32 @@ def sync_session_state():
     state["telegram_restriction_detected"] = info["telegram_restriction_detected"]
 
 
+async def bind_session_owner(account_id, user_id):
+    """Lo stato account segue l'identità Telegram, non il numero dello slot."""
+    key = f"session_{account_id}_owner"
+    previous = await get_setting(key)
+    if previous == str(user_id):
+        return
+    # Primo binding della V4.7: le sessioni precedenti vengono sostituite.
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM session_contacts WHERE session_id = ?", (account_id,))
+        await db.execute("DELETE FROM invitation_recovery WHERE session_id = ?", (account_id,))
+        for flag in ("telegram_locked", "telegram_restriction_detected"):
+            await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, '0')",
+                             (f"session_{account_id}_{flag}",))
+            session_info[account_id][flag] = False
+        await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, str(user_id)))
+        await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('auto_enabled', '0')")
+        await db.commit()
+    state["auto_enabled"] = False
+    if account_id == state["active_session"]:
+        sync_session_state()
+    await add_log(f"👤 ACCOUNT {account_id} associato all'ID {user_id}; rubriche e blocchi locali del precedente slot azzerati. AUTO disattivato.", session_id=0)
+
+
 async def connect_session(account_id):
+    if account_id not in session_info:
+        raise ValueError("Sessione non valida")
     info = session_info[account_id]
     client = session_clients.get(account_id)
     if client is None:
@@ -831,13 +905,14 @@ async def connect_session(account_id):
             raise ValueError("È necessario un account utente Telegram")
         for other_id, other in session_info.items():
             if other_id != account_id and other["ready"] and other["user_id"] == me.id:
-                raise ValueError("Le due sessioni appartengono allo stesso account: usa il secondo numero")
+                raise ValueError("Questo account è già presente in un altro slot: usa sei account distinti")
+        await bind_session_owner(account_id, me.id)
         info.update(ready=True, user_id=me.id,
                     name=(f"@{me.username}" if me.username else me.first_name or str(me.id)),
                     error="Connessa e autorizzata")
     except Exception as exc:
         info["ready"] = False
-        info["error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
+        info["error"] = safe_connection_error(exc)
         logger.warning("ACCOUNT %s: %s", account_id, info["error"])
         await client.disconnect()
 
@@ -870,11 +945,12 @@ async def select_session(account_id):
 
 async def sessions_text():
     lines = ["👤 GESTIONE SESSIONI", f"Attiva: {session_label(state['active_session'])}", ""]
-    for account_id in (1, 2):
+    for account_id in ACCOUNT_IDS:
         info = session_info[account_id]
         lines.extend([session_label(account_id),
                       f"ID: {info['user_id'] or 'non disponibile'}",
                       f"🔌 {info['error']}",
+                      f"🌐 Proxy: {info['proxy_slot'] or 'non configurato'} (SOCKS5)",
                       "🔒 Inviti bloccati localmente" if info["telegram_locked"] else "🔓 Nessun blocco locale", ""])
     lines.append("La verifica controlla l'accesso alla sessione, non l'assenza di limitazioni Telegram.\n"
                  "Il cambio disattiva la programmazione AUTO e annulla le liste preparate.")
@@ -883,7 +959,7 @@ async def sessions_text():
 
 def sessions_keyboard():
     rows = []
-    for account_id in (1, 2):
+    for account_id in ACCOUNT_IDS:
         rows.append([InlineKeyboardButton(
             f"{'✅' if account_id == state['active_session'] else '👤'} USA ACCOUNT {account_id}",
             callback_data=f"select_session:{account_id}"),
@@ -1628,7 +1704,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.6.6\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.7.0\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -3273,7 +3349,7 @@ async def buttons(
 
     elif data == "logs" or data.startswith("logs:"):
         selected_filter = data.split(":", 1)[1] if ":" in data else "all"
-        if selected_filter not in {"all", "1", "2"}:
+        if selected_filter not in {"all", *(str(i) for i in ACCOUNT_IDS)}:
             return
         async with aiosqlite.connect(DB_PATH) as db:
             if selected_filter == "all":
@@ -3302,9 +3378,9 @@ async def buttons(
         await query.edit_message_text(
             f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n".join(reversed(lines)) or "Nessun evento."),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("TUTTE", callback_data="logs:all"),
-                 InlineKeyboardButton("ACCOUNT 1", callback_data="logs:1"),
-                 InlineKeyboardButton("ACCOUNT 2", callback_data="logs:2")],
+                [InlineKeyboardButton("TUTTE", callback_data="logs:all")],
+                *[[InlineKeyboardButton(f"ACCOUNT {i}", callback_data=f"logs:{i}")
+                   for i in ACCOUNT_IDS[start:start + 3]] for start in (0, 3)],
                 [InlineKeyboardButton("🔄 AGGIORNA", callback_data=f"logs:{selected_filter}")],
                 [InlineKeyboardButton("🗑 PULISCI TUTTI I LOG", callback_data="clear_logs_confirm")],
                 [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
@@ -3314,7 +3390,7 @@ async def buttons(
     elif data == "clear_logs_confirm":
 
         await query.edit_message_text(
-            "⚠️ Cancellare tutti i log, di entrambe le sessioni e quelli precedenti?",
+            "⚠️ Cancellare tutti i log, di tutte le sei sessioni e quelli precedenti?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🗑 SÌ",
@@ -3686,9 +3762,10 @@ async def post_init(
     await load_settings()
     await ensure_today()
 
-    for account_id in (1, 2):
+    for account_id in ACCOUNT_IDS:
         await connect_session(account_id)
-    available = [account_id for account_id in (1, 2) if session_info[account_id]["ready"]]
+        await add_log("🔌 Connessione iniziale — " + session_info[account_id]["error"], session_id=account_id)
+    available = [account_id for account_id in ACCOUNT_IDS if session_info[account_id]["ready"]]
     if not available:
         logger.warning("Nessuna sessione disponibile: il pannello resta accessibile per la diagnostica")
         state["auto_enabled"] = False
@@ -3699,7 +3776,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.6.6 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.7.0 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -4070,7 +4147,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.6.6 avviato"
+        "V4.7.0 avviato"
     )
 
     application.run_polling()
