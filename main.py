@@ -1761,11 +1761,10 @@ async def bot_membership_check(chat_id, user_id):
 
 async def observe_invite_membership(destination, user, mode, started_at):
     chat_id = diagnostic_chat_id(destination)
-    began = asyncio.get_running_loop().time()
     ever_present = False
     final = "unknown"
-    for offset in (10, 30, 60):
-        await asyncio.sleep(max(0, offset - (asyncio.get_running_loop().time() - began)))
+    for offset in (10, 20):
+        await asyncio.sleep(10)
         telethon_result, bot_result = await asyncio.gather(
             asyncio.wait_for(verify_in_destination(destination, user), timeout=8),
             bot_membership_check(chat_id, user.id), return_exceptions=True)
@@ -1793,6 +1792,8 @@ async def observe_invite_membership(destination, user, mode, started_at):
             final = "absent"
         else:
             final = "unknown"
+        if final != "unknown":
+            break  # Il secondo controllo serve soltanto per un esito incerto.
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT event, actor_id, event_date FROM membership_events WHERE chat_id=? AND user_id=? AND observed_at>=? ORDER BY id DESC LIMIT 3", (chat_id, user.id, started_at))
         events = await cursor.fetchall()
@@ -1801,7 +1802,7 @@ async def observe_invite_membership(destination, user, mode, started_at):
     if final == "confirmed":
         await increment_stat("migrated")
         await save_processed(user, "CONFIRMED")
-        await add_log(f"✅ {mode} — ID {user.id} — gruppo {chat_id} — PRESENZA CONFERMATA all'ultimo controllo")
+        await add_log(f"✅ {mode} — ID {user.id} — gruppo {chat_id} — PRESENZA CONFERMATA al controllo +{offset}s")
         await welcome_confirmed_invite(destination, user)
         return "confirmed", str(user.id)
     await increment_stat("unconfirmed")
@@ -1815,7 +1816,7 @@ async def observe_invite_membership(destination, user, mode, started_at):
         return "unconfirmed", str(user.id)
     # Discordanza o dati insufficienti non autorizzano un nuovo invito.
     await save_processed(user, "VERIFY_PENDING")
-    return await report_verification_problem(str(user.id), mode, "MembershipUncertain", "Sessione e bot discordanti o stato non verificabile dopo 60 secondi; nessun reinvito")
+    return await report_verification_problem(str(user.id), mode, "MembershipUncertain", "Sessione e bot discordanti o stato non verificabile dopo due controlli con attese di 10 secondi; nessun reinvito")
 
 
 # =========================================================
@@ -2504,30 +2505,54 @@ def groups_keyboard():
 
 
 def invites_keyboard():
-    automatic_label = (
-        "🛑 Limitazione Telegram" if state["telegram_locked"] and state["telegram_restriction_detected"]
-        else "🔒 Inviti sospesi" if state["telegram_locked"]
-        else "🟢 Gestisci automatico" if state["running"]
-        else f"🟡 Programmato {state['start_time']}" if state["auto_enabled"]
-        else "🤖 Attiva automatico"
-    )
     automatic_callback = ("noop" if state["telegram_locked"] else
                           "auto_status_menu" if state["running"] or state["auto_enabled"] else "start_run")
     return panel_markup([
-        [InlineKeyboardButton("➕ Invito manuale per id", callback_data="manual_invite")],
-        [InlineKeyboardButton(automatic_label, callback_data=automatic_callback)],
-        [InlineKeyboardButton(f"🕐 Orario {state['start_time']}", callback_data="set_start_time")],
-        [InlineKeyboardButton("➖", callback_data="target_minus"),
-         InlineKeyboardButton(f"🎯 {state['daily_target']}/giorno", callback_data="noop"),
-         InlineKeyboardButton("➕", callback_data="target_plus")],
-        [InlineKeyboardButton("➖", callback_data="interval_minus"),
-         InlineKeyboardButton(f"⏱ Automatico: {state['interval_minutes']} min", callback_data="noop"),
-         InlineKeyboardButton("➕", callback_data="interval_plus")],
-        [InlineKeyboardButton("➖", callback_data="contacts_interval_minus"),
-         InlineKeyboardButton(f"⏱ Rubrica: {state['contact_interval_minutes']} min", callback_data="noop"),
-         InlineKeyboardButton("➕", callback_data="contacts_interval_plus")],
-        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
+        [InlineKeyboardButton("➕ Invito manuale", callback_data="manual_invite"),
+         InlineKeyboardButton("🤖 Automatico", callback_data=automatic_callback)],
+        [InlineKeyboardButton("⚙️ Impostazioni", callback_data="invite_settings"),
+         InlineKeyboardButton("⬅️ Menu", callback_data="home")],
     ])
+
+
+def invite_settings_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("🕐 Orario di partenza", callback_data="set_start_time")],
+        [InlineKeyboardButton("🎯 Persone al giorno", callback_data="set_invite_value:daily_target")],
+        [InlineKeyboardButton("⏱ Pausa automatico", callback_data="set_invite_value:interval_minutes")],
+        [InlineKeyboardButton("📒 Pausa rubrica", callback_data="set_invite_value:contact_interval_minutes")],
+        [InlineKeyboardButton("⬅️ Inviti", callback_data="menu_invites")],
+    ])
+
+
+INVITE_VALUE_RULES = {
+    "daily_target": (1, 50, "PERSONE AL GIORNO", "persone"),
+    "interval_minutes": (15, 120, "PAUSA AUTOMATICO", "minuti"),
+    "contact_interval_minutes": (1, 120, "PAUSA RUBRICA", "minuti"),
+}
+
+
+async def invites_text(settings=False):
+    if state["telegram_locked"] and state["telegram_restriction_detected"]:
+        status = "🛑 Limitazione Telegram — inviti bloccati"
+    elif state["telegram_locked"]:
+        status = "🔒 Inviti sospesi"
+    elif state["running"]:
+        status = "🟢 Automatico in esecuzione"
+    elif state["auto_enabled"]:
+        status = "🟡 Automatico programmato"
+    else:
+        status = "🔴 Automatico disattivato"
+    return (
+        ("⚙️ IMPOSTAZIONI INVITI\n\n" if settings else "📤 INVITI\n\n")
+        + f"👤 {session_label()}\n"
+        + f"📥 Destinazione: {group_label(state['group_b'])}\n\n"
+        + f"{status}\n"
+        + f"🕐 Partenza: {state['start_time']}\n"
+        + f"🎯 Obiettivo: {state['daily_target']} persone al giorno\n"
+        + f"⏱ Pausa automatico: {state['interval_minutes']} minuti\n"
+        + f"📒 Pausa inviti rubrica: {state['contact_interval_minutes']} minuti"
+    )
 
 
 def diagnostics_menu_keyboard():
@@ -2544,6 +2569,8 @@ def diagnostics_menu_keyboard():
 
 
 async def section_text(section):
+    if section == "menu_invites":
+        return await invites_text()
     titles = {"menu_groups": "👥 GRUPPI E MEMBRI", "menu_invites": "📤 INVITI", "menu_diagnostics": "⚙️ DIAGNOSTICA"}
     return await home_text() + "\n\n" + titles[section]
 
@@ -2564,7 +2591,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.8.12\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.8.14\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -2759,7 +2786,7 @@ async def invite_one(destination, user, mode):
             )
             return ("unconfirmed", display)
 
-        await add_log(f"🔍 {mode} — ID {user.id} — gruppo {diagnostic_chat_id(destination)} — controlli presenza a 10, 30 e 60 secondi; nessun nuovo invito")
+        await add_log(f"🔍 {mode} — ID {user.id} — gruppo {diagnostic_chat_id(destination)} — controllo presenza dopo 10 secondi; secondo controllo dopo altri 10 solo se incerto; nessun nuovo invito")
         return await observe_invite_membership(destination, user, mode, started_at)
 
     except UserAlreadyParticipantError:
@@ -3389,6 +3416,25 @@ async def buttons(
     await query.answer()
 
     data = query.data
+    if data == "invite_settings":
+        state["waiting_for"] = None
+        await query.edit_message_text(await invites_text(settings=True), reply_markup=invite_settings_keyboard())
+        return
+    if data.startswith("set_invite_value:"):
+        key = data.split(":", 1)[1]
+        if key not in INVITE_VALUE_RULES:
+            return
+        if operation_busy():
+            await callback_notice(query, "Attendi la fine delle operazioni o premi Ferma inviti prima di cambiare le impostazioni.")
+            return
+        minimum, maximum, title, unit = INVITE_VALUE_RULES[key]
+        state["waiting_for"] = "invite_value:" + key
+        await query.edit_message_text(
+            f"⚙️ {title}\n\nValore attuale: {state[key]} {unit}.\n"
+            f"Scrivi un numero intero da {minimum} a {maximum}.",
+            reply_markup=panel_markup([[InlineKeyboardButton("❌ Annulla", callback_data="invite_settings")]]),
+        )
+        return
     if data.startswith("delete_session:"):
         if update.effective_chat.type != "private":
             await callback_notice(query, "Usa la chat privata con il bot.")
@@ -3720,13 +3766,16 @@ async def buttons(
 
     elif data == "set_start_time":
 
+        if operation_busy():
+            await callback_notice(query, "Attendi la fine delle operazioni o premi Ferma inviti prima di cambiare l'orario.")
+            return
         state["waiting_for"] = "start_time"
         await query.edit_message_text(
             "🕐 ORARIO PARTENZA\n\n"
             "Scrivi l'orario giornaliero nel formato HH:MM.\n"
             "Esempio: 09:00",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ ANNULLA", callback_data="home")
+                InlineKeyboardButton("❌ Annulla", callback_data="invite_settings")
             ]]),
         )
 
@@ -4670,6 +4719,26 @@ async def text_input(
         "waiting_for"
     ]
 
+    if target and target.startswith("invite_value:"):
+        key = target.split(":", 1)[1]
+        if key not in INVITE_VALUE_RULES:
+            state["waiting_for"] = None
+            return
+        if operation_busy():
+            await update.message.reply_text("Attendi la fine delle operazioni o premi Ferma inviti prima di cambiare le impostazioni.")
+            return
+        minimum, maximum, title, unit = INVITE_VALUE_RULES[key]
+        value = update.message.text.strip()
+        if not re.fullmatch(r"[0-9]{1,3}", value) or not minimum <= int(value) <= maximum:
+            await update.message.reply_text(f"❌ Scrivi un numero intero da {minimum} a {maximum}.")
+            return
+        state[key] = int(value)
+        state["waiting_for"] = None
+        await set_setting(key, state[key])
+        await add_log(f"⚙️ {title} impostato: {state[key]} {unit}")
+        await update.message.reply_text(await invites_text(settings=True), reply_markup=invite_settings_keyboard())
+        return
+
     if target == "add_session_phone":
         if not context.user_data.get("adding_session_phone"):
             await update.message.reply_text("Premi AGGIUNGI SESSIONE dal tuo pannello per iniziare.")
@@ -4743,8 +4812,8 @@ async def text_input(
         await add_log(f"🕐 Orario partenza impostato: {value}")
 
         await update.message.reply_text(
-            await section_text("menu_invites"),
-            reply_markup=invites_keyboard(),
+            await invites_text(settings=True),
+            reply_markup=invite_settings_keyboard(),
         )
         return
 
@@ -5423,7 +5492,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.8.12 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.8.14 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -5801,7 +5870,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.8.12 avviato"
+        "V4.8.14 avviato"
     )
 
     application.run_polling()
