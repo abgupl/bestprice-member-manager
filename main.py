@@ -1127,7 +1127,7 @@ async def profile_action(update, context):
                        + '\n\nProfilo del progetto. Modifiche solo dopo APPLICA; nessun invito.')
             await query.message.reply_photo(photo=avatar, caption=caption)
             nonce = pending['nonce']
-            await query.edit_message_text(f'Anteprima pronta per ACCOUNT {account_id}. APPLICA sostituirà nome, bio, foto e lo username disponibile. La vecchia foto resterà nello storico Telegram.',
+            await query.message.reply_text(f'Anteprima pronta per ACCOUNT {account_id}. Premi ✅ APPLICA qui sotto per sostituire nome, bio, foto e lo username disponibile. La vecchia foto resterà nello storico Telegram.',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('🔄 RIGENERA', callback_data=f'profile_regen:{nonce}'), InlineKeyboardButton('✅ APPLICA', callback_data=f'profile_apply:{nonce}')],
                     [InlineKeyboardButton('❌ ANNULLA', callback_data='profile_cancel')]]))
@@ -2460,7 +2460,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.8.5\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.8.6\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -4705,7 +4705,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.8.5 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.8.6 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -5078,7 +5078,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.8.5 avviato"
+        "V4.8.6 avviato"
     )
 
     application.run_polling()
