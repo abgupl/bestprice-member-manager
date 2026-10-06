@@ -2557,7 +2557,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.8.8\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.8.9\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -5142,6 +5142,33 @@ def render_login_page(stage, note, token):
             f"<main><h2>{title}</h2><p>{html.escape(note)}</p>{form}</main></html>")
 
 
+def canonical_https_origin(value):
+    """Confronta dominio e porta senza differenze di maiuscole o porta 443."""
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return None
+        return (parsed.hostname.lower(), parsed.port or 443)
+    except (TypeError, ValueError):
+        return None
+
+
+def login_origin_allowed(origin, referer, token, form_token):
+    # La pagina usa un link riservato non prevedibile e un token nel modulo.
+    if not token or not secrets.compare_digest(form_token or "", token):
+        return False
+    expected = canonical_https_origin(public_login_base())
+    if expected is None:
+        return False
+    if origin and origin.strip().lower() != "null":
+        return canonical_https_origin(origin) == expected
+    # Alcuni browser interni inviano un'origine opaca (null) o nessuna origine.
+    # Se presente, il Referer deve comunque appartenere al dominio configurato.
+    if referer:
+        return canonical_https_origin(referer) == expected
+    return True  # Rimangono necessari token valido, scadenza e sessione pendente.
+
+
 class SessionLoginHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # Il percorso contiene un token riservato.
@@ -5163,13 +5190,16 @@ class SessionLoginHandler(BaseHTTPRequestHandler):
                 if not 0 < size <= 4096:
                     self.respond(400, "Richiesta non valida")
                     return
-                origin = self.headers.get("Origin")
-                expected = urlsplit(public_login_base())
-                if origin and origin != f"{expected.scheme}://{expected.netloc}":
-                    self.respond(403, "Origine non valida")
-                    return
                 values = parse_qs(self.rfile.read(size).decode("utf-8"), max_num_fields=5)
                 form = {key: value[0] for key, value in values.items()}
+                if not login_origin_allowed(self.headers.get("Origin"), self.headers.get("Referer"),
+                                            token, form.get("token", "")):
+                    expected = urlsplit(public_login_base()).netloc
+                    note = ("La pagina non corrisponde al dominio configurato oppure il modulo non è valido. "
+                            "Torna al bot e riparti da Aggiungi sessione. "
+                            f"Su Railway, SESSION_LOGIN_BASE_URL deve indicare il dominio HTTPS effettivo: {expected}.")
+                    self.respond(403, render_login_page("expired", note, ""))
+                    return
             except (ValueError, UnicodeError):
                 self.respond(400, "Richiesta non valida")
                 return
@@ -5270,7 +5300,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.8.8 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.8.9 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -5648,7 +5678,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.8.8 avviato"
+        "V4.8.9 avviato"
     )
 
     application.run_polling()
