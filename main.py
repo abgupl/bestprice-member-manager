@@ -1023,8 +1023,10 @@ def sessions_keyboard():
                 f"{'✅' if account_id == state['active_session'] else '👤'} Account {account_id}",
                 callback_data=f"select_session:{account_id}"),
             InlineKeyboardButton("🔎 Verifica", callback_data=f"check_session:{account_id}"),
-            InlineKeyboardButton("🎲 Profilo", callback_data=f"profile_new:{account_id}"),
-            InlineKeyboardButton("🗑 Elimina", callback_data=f"delete_session:{account_id}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(f"🎲 Genera profilo {account_id}", callback_data=f"profile_new:{account_id}"),
+            InlineKeyboardButton(f"🗑 Elimina {account_id}", callback_data=f"delete_session:{account_id}"),
         ])
     rows.append([
         InlineKeyboardButton("➕ Aggiungi", callback_data="add_session"),
@@ -2562,7 +2564,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.8.11\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.8.12\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -5421,7 +5423,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.8.11 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.8.12 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -5799,7 +5801,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.8.11 avviato"
+        "V4.8.12 avviato"
     )
 
     application.run_polling()
