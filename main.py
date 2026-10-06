@@ -5,6 +5,10 @@ import math
 import re
 import html
 import json
+import secrets
+import io
+import struct
+import zlib
 from contextvars import ContextVar
 from functools import wraps
 from datetime import datetime, timedelta
@@ -40,7 +44,8 @@ from telethon.tl.functions.channels import (
 )
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.functions.contacts import GetContactsRequest
-from telethon.tl.functions.account import GetAuthorizationsRequest
+from telethon.tl.functions.account import GetAuthorizationsRequest, CheckUsernameRequest, UpdateProfileRequest, UpdateUsernameRequest
+from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.tl.types import Channel, Chat, User, ChannelParticipantsAdmins, UserStatusOnline, UserStatusOffline
 
 
@@ -986,10 +991,153 @@ def sessions_keyboard():
             f"{'✅' if account_id == state['active_session'] else '👤'} USA ACCOUNT {account_id}",
             callback_data=f"select_session:{account_id}"),
             InlineKeyboardButton("🔎 VERIFICA", callback_data=f"check_session:{account_id}")])
+        rows.append([InlineKeyboardButton(f"🎲 GENERA PROFILO — ACCOUNT {account_id}", callback_data=f"profile_new:{account_id}")])
     rows.append([InlineKeyboardButton("📥 TUTTE LE SESSIONI NEL GRUPPO A", callback_data="join_a_setup")])
     rows.append([InlineKeyboardButton("🌐 PROXY / DIAGNOSTICA", callback_data="proxy_status")])
     rows.append([InlineKeyboardButton("⬅️ HOME", callback_data="home")])
     return InlineKeyboardMarkup(rows)
+
+
+PROFILE_COLORS = ((211, 45, 55), (25, 112, 182), (32, 143, 106), (111, 67, 174), (202, 112, 26), (35, 127, 145))
+PROFILE_NAMES = ("Community", "Supporto", "Assistente")
+PROFILE_BIOS = ("Account gestito dal team BestPrice24 per la community.",
+                "Account di supporto della community BestPrice24.",
+                "Account del team BestPrice24: assistenza alla community.")
+
+def profile_avatar(account_id, color):
+    """Avatar grafico originale B24 + slot, PNG senza dipendenze esterne."""
+    size = 512
+    pixels = bytearray(bytes(color) * (size * size))
+    def rect(x, y, w, h, rgb):
+        for row in range(max(0, y), min(size, y + h)):
+            start = (row * size + max(0, x)) * 3
+            end = (row * size + min(size, x + w)) * 3
+            pixels[start:end] = bytes(rgb) * ((end - start) // 3)
+    glyphs = {
+        'B': ('11110','10001','10001','11110','10001','10001','11110'),
+        '0': ('01110','10001','10011','10101','11001','10001','01110'),
+        '1': ('00100','01100','00100','00100','00100','00100','01110'),
+        '2': ('01110','10001','00001','00010','00100','01000','11111'),
+        '3': ('11110','00001','00001','01110','00001','00001','11110'),
+        '4': ('00010','00110','01010','10010','11111','00010','00010'),
+        '5': ('11111','10000','10000','11110','00001','00001','11110'),
+        '6': ('01110','10000','10000','11110','10001','10001','01110')}
+    def text(value, y, scale):
+        x = (size - (len(value) * 6 - 1) * scale) // 2
+        for char in value:
+            for row, bits in enumerate(glyphs[char]):
+                for col, bit in enumerate(bits):
+                    if bit == '1': rect(x + col * scale, y + row * scale, scale, scale, (255,255,255))
+            x += 6 * scale
+    rect(64, 64, 384, 5, (255,255,255))
+    text('B24', 130, 20)
+    text(str(account_id).zfill(2), 330, 12)
+    def chunk(kind, payload):
+        return struct.pack('>I', len(payload)) + kind + payload + struct.pack('>I', zlib.crc32(kind + payload) & 0xffffffff)
+    raw = b''.join(b'\x00' + pixels[row*size*3:(row+1)*size*3] for row in range(size))
+    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB',size,size,8,2,0,0,0)) + chunk(b'IDAT',zlib.compress(raw)) + chunk(b'IEND',b'')
+
+async def profile_action(update, context):
+    query = update.callback_query
+    data = query.data
+    if data == 'profile_cancel':
+        context.user_data.pop('profile_pending', None)
+        await query.edit_message_text('Profilo annullato.', reply_markup=sessions_keyboard())
+        return
+    if operation_busy() or state['auto_enabled']:
+        await callback_notice(query, 'Disattiva AUTO e attendi la fine delle operazioni prima di modificare i profili.')
+        return
+    if data.startswith('profile_new:') or data.startswith('profile_regen:'):
+        if data.startswith('profile_regen:'):
+            old = context.user_data.get('profile_pending')
+            if not old or old['nonce'] != data.split(':',1)[1]:
+                await callback_notice(query, 'Anteprima scaduta: riapri GENERA PROFILO.')
+                return
+            account_id = old['account_id']
+        else:
+            value = data.split(':',1)[1]
+            account_id = int(value) if value.isdigit() else 0
+        context.user_data.pop('profile_pending', None)
+        if account_id not in ACCOUNT_IDS or not session_info[account_id]['ready']:
+            await callback_notice(query, 'Sessione non disponibile: usa VERIFICA.')
+            return
+        if await get_setting(f'profile_pause_{account_id}', '0') and float(await get_setting(f'profile_pause_{account_id}', '0')) > now_it().timestamp():
+            await callback_notice(query, 'Telegram ha richiesto una pausa per il profilo di questo account. Attendi prima di riprovare.')
+            return
+        client = session_clients[account_id]
+        try:
+            me = await asyncio.wait_for(client.get_me(), 15)
+            if not me or me.id != session_info[account_id]['user_id']:
+                raise ValueError('Identità della sessione cambiata: esegui VERIFICA')
+            role = secrets.choice(PROFILE_NAMES)
+            username = f'bestprice24_{account_id}_{secrets.token_hex(3)}'
+            available = bool(await asyncio.wait_for(client(CheckUsernameRequest(username)), 15))
+            pending = {'account_id': account_id, 'owner_id': me.id,
+                       'admin_id': update.effective_user.id, 'created_at': now_it().timestamp(),
+                       'nonce': secrets.token_hex(6), 'first_name': 'BestPrice24',
+                       'last_name': role, 'bio': secrets.choice(PROFILE_BIOS),
+                       'username': username if available else None,
+                       'color': secrets.choice(PROFILE_COLORS)}
+            avatar = profile_avatar(account_id, pending['color'])
+            caption = (f"🎲 ANTEPRIMA ACCOUNT {account_id} — ID {me.id}\n\n"
+                       f"Nome: {pending['first_name']} • {role}\n"
+                       f"Bio: {pending['bio']}\n"
+                       + (f"Username: @{username} — disponibile al controllo" if available else 'Username proposto non disponibile: quello attuale sarà mantenuto')
+                       + '\n\nProfilo del progetto. Modifiche solo dopo APPLICA; nessun invito.')
+            await query.message.reply_photo(photo=avatar, caption=caption)
+            nonce = pending['nonce']
+            await query.edit_message_text(f'Anteprima pronta per ACCOUNT {account_id}. APPLICA sostituirà nome, bio, foto e lo username disponibile. La vecchia foto resterà nello storico Telegram.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('🔄 RIGENERA', callback_data=f'profile_regen:{nonce}'), InlineKeyboardButton('✅ APPLICA', callback_data=f'profile_apply:{nonce}')],
+                    [InlineKeyboardButton('❌ ANNULLA', callback_data='profile_cancel')]]))
+            context.user_data['profile_pending'] = pending
+        except Exception as exc:
+            if isinstance(exc, FloodWaitError):
+                await set_setting(f'profile_pause_{account_id}', now_it().timestamp() + exc.seconds)
+            await add_log('👤 ANTEPRIMA PROFILO FALLITA — ' + safe_connection_error(exc), session_id=account_id)
+            await callback_notice(query, 'Anteprima non creata — ' + safe_connection_error(exc))
+        return
+    pending = context.user_data.get('profile_pending')
+    if (not pending or pending['nonce'] != data.split(':',1)[1]
+            or pending['admin_id'] != update.effective_user.id
+            or now_it().timestamp() - pending['created_at'] > 600):
+        await callback_notice(query, 'Anteprima scaduta o già utilizzata: genera un nuovo profilo.')
+        return
+    account_id = pending['account_id']
+    client = session_clients[account_id]
+    context.user_data.pop('profile_pending', None)  # nessuna replica tramite doppio clic
+    lines = [f'👤 AGGIORNAMENTO PROFILO — ACCOUNT {account_id}']
+    try:
+        me = await asyncio.wait_for(client.get_me(), 15)
+        if not session_info[account_id]['ready'] or not me or me.id != pending['owner_id']:
+            raise ValueError('Identità della sessione cambiata: nessuna modifica eseguita')
+        pause_until = float(await get_setting(f'profile_pause_{account_id}', '0'))
+        if pause_until > now_it().timestamp():
+            raise ValueError('Pausa Telegram ancora attiva per questo profilo')
+        await asyncio.wait_for(client(UpdateProfileRequest(first_name=pending['first_name'], last_name=pending['last_name'], about=pending['bio'])), 20)
+        lines.append('✅ Nome e bio aggiornati')
+        await add_log('👤 PROFILO — nome e bio aggiornati', session_id=account_id)
+        session_info[account_id]['name'] = f"@{me.username}" if me.username else pending['first_name'] + ' ' + pending['last_name']
+        if pending['username']:
+            await asyncio.wait_for(client(UpdateUsernameRequest(pending['username'])), 20)
+            session_info[account_id]['name'] = '@' + pending['username']
+            lines.append('✅ Username aggiornato: @' + pending['username'])
+            await add_log('👤 PROFILO — username aggiornato', session_id=account_id)
+        else:
+            lines.append('ℹ️ Username attuale mantenuto')
+        photo = io.BytesIO(profile_avatar(account_id, pending['color']))
+        photo.name = f'bestprice24_account_{account_id}.png'
+        uploaded = await asyncio.wait_for(client.upload_file(photo), 30)
+        await asyncio.wait_for(client(UploadProfilePhotoRequest(file=uploaded)), 20)
+        lines.append('✅ Avatar aggiornato')
+        await add_log('👤 PROFILO — avatar aggiornato su conferma amministratore', session_id=account_id)
+    except Exception as exc:
+        if isinstance(exc, FloodWaitError):
+            await set_setting(f'profile_pause_{account_id}', now_it().timestamp() + exc.seconds)
+        lines.append('⚠️ Operazione interrotta — ' + safe_connection_error(exc))
+        lines.append('Le modifiche già riuscite restano applicate. In caso di timeout verifica il profilo su Telegram prima di riprovare.')
+        await add_log('👤 PROFILO INTERROTTO — ' + safe_connection_error(exc), session_id=account_id)
+    await query.edit_message_text('\n'.join(lines), reply_markup=sessions_keyboard())
 
 
 proxy_checks = {}
@@ -2274,7 +2422,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.8.2\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.8.3\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -3099,7 +3247,11 @@ async def buttons(
     await query.answer()
 
     data = query.data
+    if data.startswith(("profile_new:", "profile_regen:", "profile_apply:")) or data == "profile_cancel":
+        await profile_action(update, context)
+        return
     if data == "home":
+        context.user_data.pop("profile_pending", None)
         context.user_data.pop("join_a_pending", None)
 
     if data == "clean_members":
@@ -4515,7 +4667,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.8.2 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.8.3 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -4888,7 +5040,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.8.2 avviato"
+        "V4.8.3 avviato"
     )
 
     application.run_polling()
