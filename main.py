@@ -564,7 +564,7 @@ async def load_settings():
                 await set_setting(f"session_{account_id}_{key}", value)
             session_info[account_id][key] = value == "1"
     selected = await get_setting("active_session", "1")
-    state["active_session"] = int(selected) if selected in {str(i) for i in ACCOUNT_IDS} else 1
+    state["active_session"] = int(selected) if selected in {str(i) for i in ACCOUNT_IDS} else ACCOUNT_IDS[0]
     sync_session_state()
 
     for prefix in (
@@ -1018,13 +1018,18 @@ async def sessions_text():
 def sessions_keyboard():
     rows = []
     for account_id in ACCOUNT_IDS:
-        rows.append([InlineKeyboardButton(
-            f"{'✅' if account_id == state['active_session'] else '👤'} USA ACCOUNT {account_id}",
-            callback_data=f"select_session:{account_id}"),
-            InlineKeyboardButton("🔎 VERIFICA", callback_data=f"check_session:{account_id}")])
-        rows.append([InlineKeyboardButton(f"🎲 GENERA PROFILO — ACCOUNT {account_id}", callback_data=f"profile_new:{account_id}")])
-    rows.append([InlineKeyboardButton("➕ AGGIUNGI SESSIONE", callback_data="add_session")])
-    rows.append([InlineKeyboardButton("⬅️ Menu principale", callback_data="home")])
+        rows.append([
+            InlineKeyboardButton(
+                f"{'✅' if account_id == state['active_session'] else '👤'} Account {account_id}",
+                callback_data=f"select_session:{account_id}"),
+            InlineKeyboardButton("🔎 Verifica", callback_data=f"check_session:{account_id}"),
+            InlineKeyboardButton("🎲 Profilo", callback_data=f"profile_new:{account_id}"),
+            InlineKeyboardButton("🗑 Elimina", callback_data=f"delete_session:{account_id}"),
+        ])
+    rows.append([
+        InlineKeyboardButton("➕ Aggiungi", callback_data="add_session"),
+        InlineKeyboardButton("⬅️ Menu", callback_data="home"),
+    ])
     return panel_markup(rows)
 
 
@@ -2557,7 +2562,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.8.9\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.8.11\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -3382,6 +3387,60 @@ async def buttons(
     await query.answer()
 
     data = query.data
+    if data.startswith("delete_session:"):
+        if update.effective_chat.type != "private":
+            await callback_notice(query, "Usa la chat privata con il bot.")
+            return
+        if operation_busy() or state["auto_enabled"]:
+            await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni prima di eliminare una sessione.")
+            return
+        try:
+            account_id = int(data.split(":", 1)[1])
+            if account_id not in ACCOUNT_IDS:
+                raise ValueError("Sessione non disponibile.")
+            if len(ACCOUNT_IDS) <= 1:
+                raise ValueError("Mantieni almeno una sessione: aggiungine un'altra prima di eliminare questa.")
+        except ValueError as exc:
+            await callback_notice(query, str(exc))
+            return
+        nonce = secrets.token_hex(8)
+        context.user_data["delete_session_pending"] = {
+            "account_id": account_id, "user_id": session_info[account_id]["user_id"],
+            "nonce": nonce, "created_at": time.monotonic(),
+        }
+        await query.edit_message_text(
+            f"🗑 ELIMINA SESSIONE\n\n{session_label(account_id)}\n\n"
+            "La sessione verrà rimossa dal bot e non ricomparirà ai riavvii. "
+            "L'account Telegram non verrà eliminato. "
+            "Se è la sessione attiva, verrà selezionato un altro account.\n\nConfermi?",
+            reply_markup=panel_markup([
+                [InlineKeyboardButton("🗑 Conferma", callback_data=f"delete_session_confirm:{nonce}"),
+                 InlineKeyboardButton("❌ Annulla", callback_data="delete_session_cancel")],
+            ]),
+        )
+        return
+    if data == "delete_session_cancel":
+        context.user_data.pop("delete_session_pending", None)
+        await query.edit_message_text(await sessions_text(), reply_markup=sessions_keyboard())
+        return
+    if data.startswith("delete_session_confirm:"):
+        pending = context.user_data.pop("delete_session_pending", None)
+        if (not pending or data.split(":", 1)[1] != pending["nonce"]
+                or time.monotonic() - pending["created_at"] > 300
+                or pending["account_id"] not in session_info
+                or session_info[pending["account_id"]]["user_id"] != pending["user_id"]):
+            await callback_notice(query, "Conferma scaduta: riapri Account e profili.")
+            return
+        try:
+            await remove_session_from_bot(pending["account_id"])
+        except Exception as exc:
+            await callback_notice(query, str(exc) if isinstance(exc, ValueError) else "Rimozione non completata. Controlla le sessioni e riprova.")
+            return
+        context.user_data.pop("profile_pending", None)
+        await query.edit_message_text(await sessions_text(), reply_markup=sessions_keyboard())
+        return
+    if data in {"home", "sessions"}:
+        context.user_data.pop("delete_session_pending", None)
     if data in {"menu_groups", "menu_invites", "menu_diagnostics"}:
         state["waiting_for"] = None
         context.user_data["menu_section"] = data
@@ -5274,6 +5333,67 @@ async def export_contacts(message):
     await add_log(f"📄 Rubrica esportata: {len(rows)} contatti", session_id=account_id)
 
 
+async def restore_removed_sessions():
+    global ACCOUNT_IDS
+    try:
+        removed = json.loads(await get_setting("removed_env_sessions", "[]"))
+    except (ValueError, TypeError):
+        removed = []
+    if not isinstance(removed, list):
+        removed = []
+    for account_id in removed:
+        if isinstance(account_id, int) and 1 <= account_id <= 6:
+            session_clients.pop(account_id, None)
+            session_info.pop(account_id, None)
+    ACCOUNT_IDS = tuple(sorted(session_info))
+
+
+async def remove_session_from_bot(account_id):
+    global ACCOUNT_IDS
+    if operation_busy() or state["auto_enabled"]:
+        raise ValueError("Disattiva AUTO e attendi la fine delle operazioni prima di eliminare una sessione.")
+    if account_id not in ACCOUNT_IDS:
+        raise ValueError("Sessione già rimossa.")
+    if len(ACCOUNT_IDS) <= 1:
+        raise ValueError("Mantieni almeno una sessione nel bot. Aggiungine un'altra prima di eliminare questa.")
+    # Conserva i dati delle altre sessioni e lo storico delle operazioni.
+    if account_id <= 6:
+        removed = json.loads(await get_setting("removed_env_sessions", "[]"))
+        if not isinstance(removed, list):
+            raise ValueError("Configurazione delle sessioni rimosse non valida.")
+        await set_setting("removed_env_sessions", json.dumps(sorted(set(removed + [account_id]))))
+    else:
+        previous = added_sessions.pop(str(account_id), None)
+        try:
+            persist_added_sessions()
+        except Exception:
+            if previous is not None:
+                added_sessions[str(account_id)] = previous
+            raise
+    # Le credenziali nelle variabili Railway rimangono gestite da Railway,
+    # ma lo slot eliminato non viene più caricato dal bot ai riavvii.
+    client = session_clients.pop(account_id, None)
+    if client is not None:
+        try:
+            await client.disconnect()
+        except Exception:
+            logger.warning("Disconnessione sessione rimossa non completata (%s)", account_id)
+    session_info.pop(account_id)
+    ACCOUNT_IDS = tuple(sorted(session_info))
+    if state["active_session"] == account_id:
+        state["active_session"] = next((i for i in ACCOUNT_IDS if session_info[i]["ready"]), ACCOUNT_IDS[0])
+        session_context.set(state["active_session"])
+        sync_session_state()
+        await set_setting("active_session", state["active_session"])
+    state["waiting_for"] = None
+    state["manual_refs"] = []
+    state["manual_ids"] = []
+    state["prepared_session"] = None
+    state["member_page"] = 0
+    state["contact_page"] = 0
+    await add_log(f"🗑 Sessione ACCOUNT {account_id} rimossa dal bot; account Telegram conservato.", session_id=0)
+
+
 async def post_init(
     application,
 ):
@@ -5281,6 +5401,7 @@ async def post_init(
     global welcome_bot
     welcome_bot = application.bot
     await init_db()
+    await restore_removed_sessions()
     load_added_sessions()
     await load_settings()
     await start_login_service()
@@ -5300,7 +5421,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.8.9 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.8.11 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -5678,7 +5799,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.8.9 avviato"
+        "V4.8.11 avviato"
     )
 
     application.run_polling()
