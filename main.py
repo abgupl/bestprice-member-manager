@@ -21,7 +21,7 @@ import importlib.util
 
 import aiosqlite
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
@@ -60,6 +60,29 @@ from telethon.tl.types import Channel, Chat, User, ChannelParticipantsAdmins, Us
 # =========================================================
 # CONFIG
 # =========================================================
+
+def button_label(text):
+    """Uniforma soltanto le etichette dei pulsanti."""
+    text = str(text).lower()
+    for index, character in enumerate(text):
+        if character.isalpha():
+            return text[:index] + character.upper() + text[index + 1:]
+    return text
+
+
+def InlineKeyboardButton(text, *args, **kwargs):
+    return TelegramInlineKeyboardButton(button_label(text), *args, **kwargs)
+
+
+def panel_markup(rows):
+    """Lascia lo stop accessibile nei pannelli amministrativi."""
+    rows = [list(row) for row in rows]
+    if operation_busy() or state["auto_enabled"]:
+        if not any(getattr(button, "callback_data", None) == "stop" for row in rows for button in row):
+            rows.insert(0, [InlineKeyboardButton("🛑 Ferma inviti", callback_data="stop")])
+    return InlineKeyboardMarkup(rows)
+
+
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
@@ -1001,10 +1024,8 @@ def sessions_keyboard():
             InlineKeyboardButton("🔎 VERIFICA", callback_data=f"check_session:{account_id}")])
         rows.append([InlineKeyboardButton(f"🎲 GENERA PROFILO — ACCOUNT {account_id}", callback_data=f"profile_new:{account_id}")])
     rows.append([InlineKeyboardButton("➕ AGGIUNGI SESSIONE", callback_data="add_session")])
-    rows.append([InlineKeyboardButton("📥 TUTTE LE SESSIONI NEL GRUPPO A", callback_data="join_a_setup")])
-    rows.append([InlineKeyboardButton("🌐 PROXY / DIAGNOSTICA", callback_data="proxy_status")])
-    rows.append([InlineKeyboardButton("⬅️ HOME", callback_data="home")])
-    return InlineKeyboardMarkup(rows)
+    rows.append([InlineKeyboardButton("⬅️ Menu principale", callback_data="home")])
+    return panel_markup(rows)
 
 
 PROFILE_COLORS = ((211, 45, 55), (25, 112, 182), (32, 143, 106), (111, 67, 174), (202, 112, 26), (35, 127, 145))
@@ -1195,13 +1216,12 @@ ip_checks = {}
 
 
 def proxy_keyboard():
-    return InlineKeyboardMarkup([
+    return panel_markup([
         [InlineKeyboardButton("🧪 TEST PROXY 1", callback_data="proxy_test:1"),
          InlineKeyboardButton("🧪 TEST PROXY 2", callback_data="proxy_test:2")],
         [InlineKeyboardButton("🔎 IP TELEGRAM — SESSIONE ATTIVA", callback_data="proxy_ip")],
         [InlineKeyboardButton("🔄 AGGIORNA", callback_data="proxy_status")],
-        [InlineKeyboardButton("👤 SESSIONI", callback_data="sessions")],
-        [InlineKeyboardButton("⬅️ HOME", callback_data="home")],
+        [InlineKeyboardButton("⬅️ Diagnostica", callback_data="menu_diagnostics")],
     ])
 
 
@@ -1478,10 +1498,10 @@ async def session_diagnostic_text(account_id):
 
 
 def diagnostic_keyboard():
-    return InlineKeyboardMarkup([
+    return panel_markup([
         [InlineKeyboardButton("👤 SESSIONI", callback_data="sessions")],
-        [InlineKeyboardButton("🌐 PROXY", callback_data="proxy_status")],
-        [InlineKeyboardButton("⬅️ HOME", callback_data="home")],
+        [InlineKeyboardButton("⬅️ Diagnostica", callback_data="menu_diagnostics")],
+        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
     ])
 
 
@@ -1996,7 +2016,7 @@ async def member_filters_keyboard():
         [InlineKeyboardButton("🔄 ESTRAI/AGGIORNA", callback_data="extract_members")],
         [InlineKeyboardButton("👥 LISTA SALVATA", callback_data="members_show")],
     ])
-    return InlineKeyboardMarkup(rows)
+    return panel_markup(rows)
 
 
 async def extract_members_a():
@@ -2237,7 +2257,7 @@ async def members_page_text(page):
 
 def members_keyboard():
 
-    return InlineKeyboardMarkup([
+    return panel_markup([
         [InlineKeyboardButton("⚙️ FILTRI E FONTE", callback_data="member_filters")],
         [InlineKeyboardButton("🧹 PULISCI LISTA PER GRUPPO B", callback_data="clean_members")],
         [
@@ -2263,7 +2283,7 @@ def members_keyboard():
         [
             InlineKeyboardButton(
                 "⬅️ INDIETRO",
-                callback_data="home",
+                callback_data="menu_groups",
             )
         ],
     ])
@@ -2301,7 +2321,7 @@ async def contact_filters_screen():
             "La lista visualizzata ed esportata contiene i risultati dell'ultima estrazione.\n\n"
             "Bot, account eliminati e duplicati sono sempre esclusi. "
             "Il filtro ultimo accesso esclude anche gli stati nascosti o approssimativi.")
-    return text, InlineKeyboardMarkup(rows)
+    return text, panel_markup(rows)
 
 
 async def extract_contacts():
@@ -2419,7 +2439,7 @@ async def contacts_page_text(page):
 
 
 def contacts_keyboard():
-    return InlineKeyboardMarkup([
+    return panel_markup([
         [
             InlineKeyboardButton("◀️", callback_data="contacts_prev"),
             InlineKeyboardButton("🔄 ESTRAI/AGGIORNA", callback_data="extract_contacts"),
@@ -2428,12 +2448,7 @@ def contacts_keyboard():
         [InlineKeyboardButton("⚙️ FILTRI RUBRICA", callback_data="contact_filters")],
         [InlineKeyboardButton("📄 ESPORTA LISTA TXT", callback_data="contacts_export")],
         [InlineKeyboardButton("➕ AGGIUNGI CONTATTI", callback_data="contacts_add")],
-        [
-            InlineKeyboardButton("➖", callback_data="contacts_interval_minus"),
-            InlineKeyboardButton(f"⏱ {state['contact_interval_minutes']} MIN", callback_data="noop"),
-            InlineKeyboardButton("➕", callback_data="contacts_interval_plus"),
-        ],
-        [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
+        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
     ])
 
 
@@ -2462,72 +2477,68 @@ def group_label(group):
 
 
 def main_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("👤 Account e profili", callback_data="sessions")],
+        [InlineKeyboardButton("👥 Gruppi e membri", callback_data="menu_groups")],
+        [InlineKeyboardButton("📒 Rubrica", callback_data="contacts")],
+        [InlineKeyboardButton("📤 Inviti", callback_data="menu_invites")],
+        [InlineKeyboardButton("⚙️ Diagnostica", callback_data="menu_diagnostics")],
+    ])
 
-    keyboard = [
-        [InlineKeyboardButton("👤 SELEZIONA SESSIONE", callback_data="sessions")],
-        [InlineKeyboardButton("➕ AGGIUNGI SESSIONE", callback_data="add_session")],
-        [InlineKeyboardButton("🌐 PROXY / DIAGNOSTICA", callback_data="proxy_status")],
-        [
-            InlineKeyboardButton("📥 GRUPPO A", callback_data="set_a"),
-            InlineKeyboardButton("📤 GRUPPO B", callback_data="set_b"),
-        ],
-        [
-            InlineKeyboardButton("➖", callback_data="target_minus"),
-            InlineKeyboardButton(f"🎯 {state['daily_target']}/GIORNO", callback_data="noop"),
-            InlineKeyboardButton("➕", callback_data="target_plus"),
-        ],
-        [
-            InlineKeyboardButton(
-                f"🕐 PARTENZA {state['start_time']}",
-                callback_data="set_start_time",
-            )
-        ],
-        [
-            InlineKeyboardButton("➖", callback_data="interval_minus"),
-            InlineKeyboardButton(f"⏱ {state['interval_minutes']} MIN", callback_data="noop"),
-            InlineKeyboardButton("➕", callback_data="interval_plus"),
-        ],
-        [
-            InlineKeyboardButton(
-                (
-                    "🛑 LIMITAZIONE TELEGRAM" if state["telegram_locked"] and state["telegram_restriction_detected"]
-                    else "🔒 INVITI SOSPESI" if state["telegram_locked"]
-                    else "🟢 AUTOMATICO ATTIVO" if state["running"]
-                    else f"🟡 PROGRAMMATO {state['start_time']}" if state["auto_enabled"]
-                    else "🤖 ATTIVA AUTOMATICO"
-                ),
-                callback_data=(
-                    "noop" if state["telegram_locked"]
-                    else "auto_status_menu" if (state["running"] or state["auto_enabled"])
-                    else "start_run"
-                ),
-            )
-        ],
-        [
-            InlineKeyboardButton("🛑 STOP", callback_data="stop"),
-        ],
-        [
-            InlineKeyboardButton("👥 MEMBRI GRUPPO A", callback_data="members"),
-            InlineKeyboardButton("➕ INVITA PER ID", callback_data="manual_invite"),
-        ],
-        [
-            InlineKeyboardButton("📒 RUBRICA", callback_data="contacts"),
-        ],
-        [
-            InlineKeyboardButton("📊 STATISTICHE", callback_data="statistics"),
-            InlineKeyboardButton("📋 LOG", callback_data="logs"),
-        ],
+
+def groups_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("📥 Configura gruppo a", callback_data="set_a"),
+         InlineKeyboardButton("📤 Configura gruppo b", callback_data="set_b")],
+        [InlineKeyboardButton("👥 Membri gruppo a", callback_data="members")],
+        [InlineKeyboardButton("📥 Sessioni nel gruppo a", callback_data="join_a_setup")],
+        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
+    ])
+
+
+def invites_keyboard():
+    automatic_label = (
+        "🛑 Limitazione Telegram" if state["telegram_locked"] and state["telegram_restriction_detected"]
+        else "🔒 Inviti sospesi" if state["telegram_locked"]
+        else "🟢 Gestisci automatico" if state["running"]
+        else f"🟡 Programmato {state['start_time']}" if state["auto_enabled"]
+        else "🤖 Attiva automatico"
+    )
+    automatic_callback = ("noop" if state["telegram_locked"] else
+                          "auto_status_menu" if state["running"] or state["auto_enabled"] else "start_run")
+    return panel_markup([
+        [InlineKeyboardButton("➕ Invito manuale per id", callback_data="manual_invite")],
+        [InlineKeyboardButton(automatic_label, callback_data=automatic_callback)],
+        [InlineKeyboardButton(f"🕐 Orario {state['start_time']}", callback_data="set_start_time")],
+        [InlineKeyboardButton("➖", callback_data="target_minus"),
+         InlineKeyboardButton(f"🎯 {state['daily_target']}/giorno", callback_data="noop"),
+         InlineKeyboardButton("➕", callback_data="target_plus")],
+        [InlineKeyboardButton("➖", callback_data="interval_minus"),
+         InlineKeyboardButton(f"⏱ Automatico: {state['interval_minutes']} min", callback_data="noop"),
+         InlineKeyboardButton("➕", callback_data="interval_plus")],
+        [InlineKeyboardButton("➖", callback_data="contacts_interval_minus"),
+         InlineKeyboardButton(f"⏱ Rubrica: {state['contact_interval_minutes']} min", callback_data="noop"),
+         InlineKeyboardButton("➕", callback_data="contacts_interval_plus")],
+        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
+    ])
+
+
+def diagnostics_menu_keyboard():
+    rows = [
+        [InlineKeyboardButton("📋 Log", callback_data="logs"),
+         InlineKeyboardButton("📊 Statistiche", callback_data="statistics")],
+        [InlineKeyboardButton("🌐 Proxy / diagnostica", callback_data="proxy_status")],
+        [InlineKeyboardButton("🔎 Verifica sessione attiva", callback_data=f"check_session:{current_session_id()}")],
     ]
-
     if state["telegram_locked"]:
-        keyboard.append([
-            InlineKeyboardButton(
-                "🔓 RIABILITA INVITI",
-                callback_data="unlock_confirm",
-            )
-        ])
+        rows.append([InlineKeyboardButton("🔓 Riabilita inviti", callback_data="unlock_confirm")])
+    rows.append([InlineKeyboardButton("⬅️ Menu principale", callback_data="home")])
+    return panel_markup(rows)
 
-    return InlineKeyboardMarkup(keyboard)
+
+async def section_text(section):
+    titles = {"menu_groups": "👥 GRUPPI E MEMBRI", "menu_invites": "📤 INVITI", "menu_diagnostics": "⚙️ DIAGNOSTICA"}
+    return await home_text() + "\n\n" + titles[section]
 
 
 async def home_text():
@@ -2546,7 +2557,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.8.7\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.8.8\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -3348,8 +3359,8 @@ async def callback_notice(query, text, show_alert=False):
     rows = []
     if state["running"] or (worker_task is not None and not worker_task.done()):
         rows.append([InlineKeyboardButton("🛑 FERMA AUTO", callback_data="stop")])
-    rows.append([InlineKeyboardButton("⬅️ HOME", callback_data="home")])
-    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    rows.append([InlineKeyboardButton("⬅️ Menu principale", callback_data="home")])
+    await query.message.reply_text(text, reply_markup=panel_markup(rows))
     await add_log(f"ℹ️ Pannello — {text}", "WARNING")
 
 
@@ -3371,6 +3382,15 @@ async def buttons(
     await query.answer()
 
     data = query.data
+    if data in {"menu_groups", "menu_invites", "menu_diagnostics"}:
+        state["waiting_for"] = None
+        context.user_data["menu_section"] = data
+        keyboard = {"menu_groups": groups_keyboard, "menu_invites": invites_keyboard,
+                    "menu_diagnostics": diagnostics_menu_keyboard}[data]
+        await query.edit_message_text(await section_text(data), reply_markup=keyboard())
+        return
+    if data in {"home", "sessions", "contacts", "members"}:
+        context.user_data["menu_section"] = data
     if data == "add_session":
         if update.effective_chat.type != "private":
             await callback_notice(query, "Apri il pannello nella chat privata con il bot.")
@@ -3665,8 +3685,8 @@ async def buttons(
             )
 
         await query.edit_message_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
         )
 
     elif data == "target_plus":
@@ -3681,8 +3701,8 @@ async def buttons(
             )
 
         await query.edit_message_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
         )
 
     # =====================================================
@@ -3708,8 +3728,8 @@ async def buttons(
             )
 
         await query.edit_message_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
         )
 
     elif data == "interval_plus":
@@ -3731,8 +3751,8 @@ async def buttons(
             )
 
         await query.edit_message_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
         )
 
     # =====================================================
@@ -4245,13 +4265,13 @@ async def buttons(
         if state["contact_interval_minutes"] > 1:
             state["contact_interval_minutes"] -= 1
             await set_setting("contact_interval_minutes", state["contact_interval_minutes"])
-        await query.edit_message_text(await contacts_page_text(state["contact_page"]), reply_markup=contacts_keyboard())
+        await query.edit_message_text(await section_text("menu_invites"), reply_markup=invites_keyboard())
 
     elif data == "contacts_interval_plus":
         if state["contact_interval_minutes"] < 120:
             state["contact_interval_minutes"] += 1
             await set_setting("contact_interval_minutes", state["contact_interval_minutes"])
-        await query.edit_message_text(await contacts_page_text(state["contact_page"]), reply_markup=contacts_keyboard())
+        await query.edit_message_text(await section_text("menu_invites"), reply_markup=invites_keyboard())
 
     elif data == "contacts_confirm":
         if state["telegram_locked"]:
@@ -4270,7 +4290,7 @@ async def buttons(
             f"▶️ CODA RUBRICA AVVIATA\n\nContatti: {len(refs)}\n"
             f"⏱ Intervallo: {state['contact_interval_minutes']} minuti\n\n"
             "Puoi continuare a usare il bot: la coda procede in background.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ HOME", callback_data="home")]])
+            reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Menu principale", callback_data="home")]])
         )
 
     # =====================================================
@@ -4662,8 +4682,8 @@ async def text_input(
         await add_log(f"🕐 Orario partenza impostato: {value}")
 
         await update.message.reply_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
         )
         return
 
@@ -5250,7 +5270,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.8.7 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.8.8 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -5628,7 +5648,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.8.7 avviato"
+        "V4.8.8 avviato"
     )
 
     application.run_polling()
