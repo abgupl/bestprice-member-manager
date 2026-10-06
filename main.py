@@ -999,13 +999,14 @@ def sessions_keyboard():
 
 
 PROFILE_COLORS = ((211, 45, 55), (25, 112, 182), (32, 143, 106), (111, 67, 174), (202, 112, 26), (35, 127, 145))
-PROFILE_NAMES = ("Community", "Supporto", "Assistente")
-PROFILE_BIOS = ("Account gestito dal team BestPrice24 per la community.",
-                "Account di supporto della community BestPrice24.",
-                "Account del team BestPrice24: assistenza alla community.")
+PROFILE_NAMES = ("Nuvio", "Zampix", "Lunetto", "Puffolo", "Morbix", "Tondino", "Frullix", "Baffolo", "Piumix", "Nebulino", "Zuffolo", "Brillix")
+PROFILE_BIOS = ("Mascotte della community. Account gestito dal team.",
+                "Account di gestione della community con avatar mascotte.",
+                "Mascotte virtuale del team. Supporto alla community.")
+PROFILE_MASCOTS = ("orsetto", "gattino", "gufetto")
 
-def profile_avatar(account_id, color):
-    """Avatar grafico originale B24 + slot, PNG senza dipendenze esterne."""
+def profile_avatar(account_id, color, mascot="orsetto"):
+    """Mascotte illustrata + slot, PNG senza dipendenze esterne."""
     size = 512
     pixels = bytearray(bytes(color) * (size * size))
     def rect(x, y, w, h, rgb):
@@ -1029,9 +1030,49 @@ def profile_avatar(account_id, color):
                 for col, bit in enumerate(bits):
                     if bit == '1': rect(x + col * scale, y + row * scale, scale, scale, (255,255,255))
             x += 6 * scale
-    rect(64, 64, 384, 5, (255,255,255))
-    text('B24', 130, 20)
-    text(str(account_id).zfill(2), 330, 12)
+    def ellipse(cx, cy, rx, ry, rgb):
+        for y in range(max(0, cy - ry), min(size, cy + ry + 1)):
+            half = int(rx * math.sqrt(max(0, 1 - ((y - cy) / ry) ** 2)))
+            rect(cx - half, y, half * 2 + 1, 1, rgb)
+    dark = (38, 43, 63)
+    cream = (255, 240, 218)
+    peach = (242, 179, 166)
+    ellipse(256, 265, 193, 193, tuple(min(255, c + 26) for c in color))
+    if mascot == 'gattino':
+        # Orecchie a punta, disegnate a righe.
+        for y in range(90, 210):
+            width = (y - 90) // 2
+            rect(155 - width, y, width * 2 + 1, 1, cream)
+            rect(357 - width, y, width * 2 + 1, 1, cream)
+    elif mascot == 'orsetto':
+        ellipse(151, 166, 64, 66, cream)
+        ellipse(361, 166, 64, 66, cream)
+        ellipse(151, 166, 35, 37, peach)
+        ellipse(361, 166, 35, 37, peach)
+    else:
+        ellipse(169, 195, 79, 82, cream)
+        ellipse(343, 195, 79, 82, cream)
+    ellipse(256, 270, 148, 132, cream)
+    if mascot == 'gufetto':
+        ellipse(194, 247, 53, 57, (255,255,255))
+        ellipse(318, 247, 53, 57, (255,255,255))
+    ellipse(198, 247, 16, 24, dark)
+    ellipse(314, 247, 16, 24, dark)
+    ellipse(194, 239, 5, 7, (255,255,255))
+    ellipse(310, 239, 5, 7, (255,255,255))
+    ellipse(161, 292, 22, 13, peach)
+    ellipse(351, 292, 22, 13, peach)
+    ellipse(256, 286, 17, 12, (229,148,55) if mascot == 'gufetto' else dark)
+    rect(253, 297, 6, 18, dark)
+    ellipse(241, 313, 17, 5, dark)
+    ellipse(271, 313, 17, 5, dark)
+    if mascot == 'gattino':
+        rect(112, 276, 46, 4, dark)
+        rect(111, 299, 46, 4, dark)
+        rect(354, 276, 46, 4, dark)
+        rect(355, 299, 46, 4, dark)
+    ellipse(256, 416, 65, 47, dark)
+    text(str(account_id).zfill(2), 389, 8)
     def chunk(kind, payload):
         return struct.pack('>I', len(payload)) + kind + payload + struct.pack('>I', zlib.crc32(kind + payload) & 0xffffffff)
     raw = b''.join(b'\x00' + pixels[row*size*3:(row+1)*size*3] for row in range(size))
@@ -1070,17 +1111,17 @@ async def profile_action(update, context):
             if not me or me.id != session_info[account_id]['user_id']:
                 raise ValueError('Identità della sessione cambiata: esegui VERIFICA')
             role = secrets.choice(PROFILE_NAMES)
-            username = f'bestprice24_{account_id}_{secrets.token_hex(3)}'
+            username = f'{role.lower()}_community_{secrets.token_hex(3)}'
             available = bool(await asyncio.wait_for(client(CheckUsernameRequest(username)), 15))
             pending = {'account_id': account_id, 'owner_id': me.id,
                        'admin_id': update.effective_user.id, 'created_at': now_it().timestamp(),
-                       'nonce': secrets.token_hex(6), 'first_name': 'BestPrice24',
-                       'last_name': role, 'bio': secrets.choice(PROFILE_BIOS),
+                       'nonce': secrets.token_hex(6), 'first_name': role,
+                       'last_name': '', 'bio': secrets.choice(PROFILE_BIOS),
                        'username': username if available else None,
-                       'color': secrets.choice(PROFILE_COLORS)}
-            avatar = profile_avatar(account_id, pending['color'])
+                       'color': secrets.choice(PROFILE_COLORS), 'mascot': secrets.choice(PROFILE_MASCOTS)}
+            avatar = profile_avatar(account_id, pending['color'], pending['mascot'])
             caption = (f"🎲 ANTEPRIMA ACCOUNT {account_id} — ID {me.id}\n\n"
-                       f"Nome: {pending['first_name']} • {role}\n"
+                       f"Nome: {pending['first_name']}\nAvatar: {pending['mascot']}\n"
                        f"Bio: {pending['bio']}\n"
                        + (f"Username: @{username} — disponibile al controllo" if available else 'Username proposto non disponibile: quello attuale sarà mantenuto')
                        + '\n\nProfilo del progetto. Modifiche solo dopo APPLICA; nessun invito.')
@@ -1117,7 +1158,7 @@ async def profile_action(update, context):
         await asyncio.wait_for(client(UpdateProfileRequest(first_name=pending['first_name'], last_name=pending['last_name'], about=pending['bio'])), 20)
         lines.append('✅ Nome e bio aggiornati')
         await add_log('👤 PROFILO — nome e bio aggiornati', session_id=account_id)
-        session_info[account_id]['name'] = f"@{me.username}" if me.username else pending['first_name'] + ' ' + pending['last_name']
+        session_info[account_id]['name'] = f"@{me.username}" if me.username else (pending['first_name'] + ' ' + pending['last_name']).strip()
         if pending['username']:
             await asyncio.wait_for(client(UpdateUsernameRequest(pending['username'])), 20)
             session_info[account_id]['name'] = '@' + pending['username']
@@ -1125,8 +1166,8 @@ async def profile_action(update, context):
             await add_log('👤 PROFILO — username aggiornato', session_id=account_id)
         else:
             lines.append('ℹ️ Username attuale mantenuto')
-        photo = io.BytesIO(profile_avatar(account_id, pending['color']))
-        photo.name = f'bestprice24_account_{account_id}.png'
+        photo = io.BytesIO(profile_avatar(account_id, pending['color'], pending['mascot']))
+        photo.name = f'mascotte_account_{account_id}.png'
         uploaded = await asyncio.wait_for(client.upload_file(photo), 30)
         await asyncio.wait_for(client(UploadProfilePhotoRequest(file=uploaded)), 20)
         lines.append('✅ Avatar aggiornato')
@@ -1262,7 +1303,7 @@ async def diagnostic_group(client, group, label):
             lines.append(f"Membri riportati: {entity.participants_count}")
     except Exception as exc:
         if type(exc).__name__ == "UserNotParticipantError":
-            lines.append("❌ Account non membro: deve prima entrare nel gruppo.")
+            lines.append("ℹ️ Account non membro: la lettura dipende dall'accesso consentito da Telegram." if label == "GRUPPO A" else "❌ Account non membro: deve prima entrare nel gruppo.")
         else:
             lines.append("⚠️ Accesso/permessi non verificabili — " + safe_connection_error(exc))
     return lines
@@ -1929,7 +1970,7 @@ async def member_filters_text():
             "I pulsanti configurano la prossima estrazione. La lista salvata cambia solo dopo ESTRAI/AGGIORNA.\n\n"
             + ("Fonte: lista membri visibile alla sessione." if config["mode"] == "members" else
                f"Fonte: autori dei messaggi negli ultimi {config['message_days']} giorni, massimo {config['message_limit']} messaggi esaminati.")
-            + "\n\nLa sessione deve essere amministratrice del gruppo A. Bot, account eliminati e duplicati sono esclusi. "
+            + "\n\nNessun obbligo locale di iscrizione o ruolo amministratore: vengono letti i dati accessibili alla sessione secondo i permessi Telegram. Bot, account eliminati e duplicati sono esclusi. "
             "Le menzioni e i messaggi di servizio non vengono usati per selezionare utenti. "
             "Ultimo accesso nascosto/approssimativo: escluso se il filtro accesso è attivo. "
             "La lista non registra consenso a inviti o messaggi. Paese e nazionalità non sono dedotti dal profilo.")
@@ -1955,9 +1996,6 @@ async def extract_members_a():
     if operation_busy() or state["auto_enabled"]:
         raise ValueError("Disattiva AUTO e attendi la fine delle operazioni prima di estrarre.")
     source = await user_client.get_entity(state["group_a"]["input"])
-    permissions = await user_client.get_permissions(source, "me")
-    if not permissions or not (permissions.is_admin or permissions.is_creator):
-        raise ValueError("Per questa lettura autorizzata, la sessione deve essere amministratrice del gruppo A.")
     config = await get_member_filters()
     me = await user_client.get_me()
     stamp = now_it()
@@ -2422,7 +2460,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.8.3\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.8.5\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -4667,7 +4705,7 @@ async def post_init(
         await set_setting("active_session", state["active_session"])
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
-    await add_log("⚙️ Avvio V4.8.3 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.8.5 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -5040,7 +5078,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.8.3 avviato"
+        "V4.8.5 avviato"
     )
 
     application.run_polling()
