@@ -196,6 +196,15 @@ def session_label(account_id=None):
     return f"ACCOUNT {account_id} — {session_info[account_id]['name']}"
 
 
+def session_button_name(account_id):
+    """Nome dell'utente sui pulsanti; lo slot resta solo nei callback e nei log."""
+    info = session_info[account_id]
+    name = str(info.get("name") or "").strip()
+    if not name or name == f"ACCOUNT {account_id}" or name == "Account aggiunto":
+        name = f"ID {info['user_id']}" if info.get("user_id") else f"Non collegata ({account_id})"
+    return name[:45]
+
+
 class SelectedClient:
     """Ogni task usa la sessione fissata all'avvio dell'operazione."""
     def _client(self):
@@ -994,8 +1003,6 @@ async def select_session(account_id):
         raise ValueError("Sessione non valida")
     if operation_busy():
         raise ValueError("Attendi la fine delle operazioni prima di cambiare sessione")
-    if not session_info[account_id]["ready"]:
-        raise ValueError("Sessione non disponibile: verifica connessione e variabili Railway")
     if account_id == state["active_session"]:
         return
     old_label = session_label(state["active_session"])
@@ -1016,53 +1023,99 @@ async def select_session(account_id):
 
 
 async def sessions_text():
-    lines = ["👥 GESTIONE SESSIONI", f"Attiva: {session_label(state['active_session'])}", ""]
-    for account_id in ACCOUNT_IDS:
-        info = session_info[account_id]
-        record = await registry_for(account_id)
-        stamp = record.get("inserted_at")
-        age = "sconosciuta"
-        if stamp:
-            date = datetime.fromisoformat(stamp)
-            if date.tzinfo is None:
-                date = date.replace(tzinfo=ITALY_TZ)
-            age = f"{max(0, int((now_it() - date).total_seconds() // 3600))} ore"
-        try:
-            diagnosis = json.loads(record.get("diagnosis", "{}"))
-        except (ValueError, TypeError):
-            diagnosis = {}
-        lines.extend([session_label(account_id)[:75],
-            f"ID: {info['user_id'] or 'non disponibile'}",
-            "Inserimento: " + (stamp or "data sconosciuta"),
-            "Tempo dall'inserimento: " + age,
-            "Stato: " + await session_status_label(account_id, record),
-            "Connessione: " + info["error"][:100],
-            f"Proxy: {info['proxy_slot'] or 'diretto / non configurato'}",
-            "Ultima verifica: " + (record.get("last_check") or "non disponibile"),
-            "Gruppo B (ultima diagnosi): " + diagnosis.get("membership", "non verificato"),
-            "Ultimo errore: " + (record.get("last_error") or "nessuno registrato")[:200], ""])
-    lines.append("L'età è quella dall'inserimento nel programma, non dalla creazione dell'account Telegram. "
-                 "L'attesa di 48 ore non garantisce l'assenza di limiti. Il cambio sessione disattiva AUTO.")
-    return "\n".join(lines)
+    ready = sum(bool(session_info[i]["ready"]) for i in ACCOUNT_IDS)
+    return ("👥 GESTIONE SESSIONI\n\n"
+            f"Sessioni: {len(ACCOUNT_IDS)} · connesse: {ready}\n"
+            f"Selezionata: {session_label(state['active_session'])}\n\n"
+            "Apri l'elenco per scegliere un account e vedere la sua scheda. "
+            "Le nuove sessioni attendono 48 ore dall'aggiunta; quelle già presenti non ricominciano l'attesa.")
 
 
 def sessions_keyboard():
-    rows = [
-        [InlineKeyboardButton("🔎 Verifica tutte le sessioni", callback_data="sf:all")],
-        [InlineKeyboardButton("🔎 Diagnostica gruppo B", callback_data="sf:diagnose")],
-        [InlineKeyboardButton("🚪 Entra nel gruppo B", callback_data="jb:setup"),
-         InlineKeyboardButton("🧪 Test messaggio", callback_data="msg:setup")],
-        [InlineKeyboardButton("⏳ Data / attesa iniziale", callback_data="sf:age"),
-         InlineKeyboardButton("✅ Abilita sessione", callback_data="sf:enable")],
-    ]
-    for account_id in ACCOUNT_IDS:
-        rows.extend([
-            [InlineKeyboardButton(f"{'✅' if account_id == state['active_session'] else '👤'} Account {account_id}", callback_data=f"select_session:{account_id}"),
-             InlineKeyboardButton("🔎 Verifica completa", callback_data=f"check_session:{account_id}")],
-            [InlineKeyboardButton(f"🎲 Genera profilo {account_id}", callback_data=f"profile_new:{account_id}"),
-             InlineKeyboardButton(f"🗑 Elimina {account_id}", callback_data=f"delete_session:{account_id}")],
-        ])
-    rows.append([InlineKeyboardButton("➕ Aggiungi", callback_data="add_session"), InlineKeyboardButton("⬅️ Menu", callback_data="home")])
+    return panel_markup([
+        [InlineKeyboardButton("📋 Seleziona sessione", callback_data="sf:list")],
+        [InlineKeyboardButton("🔎 Verifica tutte", callback_data="sf:all")],
+        [InlineKeyboardButton("🧪 Test messaggio", callback_data="msg:setup")],
+        [InlineKeyboardButton("➕ Aggiungi sessione", callback_data="add_session")],
+        [InlineKeyboardButton("⬅️ Menu", callback_data="home")],
+    ])
+
+
+async def session_list_keyboard():
+    rows = []
+    for slot in ACCOUNT_IDS:
+        record = await registry_for(slot)
+        label = await session_status_label(slot, record)
+        icon = "🛑" if "Fermata" in label else "⏳" if "In attesa" in label else "🔌" if not session_info[slot]["ready"] else "✅" if slot == state["active_session"] else "👤"
+        name = session_button_name(slot)
+        short = "selezionata" if slot == state["active_session"] and icon == "✅" else label.split(" — ")[0].lower()
+        rows.append([TelegramInlineKeyboardButton(f"{icon} {name} · {short}", callback_data=f"select_session:{slot}")])
+    rows.append([InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")])
+    return panel_markup(rows)
+
+
+async def session_card_text(account_id):
+    info = session_info[account_id]
+    record = await registry_for(account_id)
+    stamp = record.get("inserted_at")
+    if record.get("legacy_session"):
+        age = "Sessione già presente da giorni — attesa iniziale non richiesta"
+        inserted = "data storica non registrata — preesistente all’aggiornamento"
+    elif stamp:
+        date = datetime.fromisoformat(stamp)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=ITALY_TZ)
+        age = f"{max(0, int((now_it() - date).total_seconds() // 3600))} ore"
+        inserted = stamp
+    else:
+        age, inserted = "non disponibile", "non disponibile"
+    try:
+        diagnosis = json.loads(record.get("diagnosis", "{}"))
+    except (ValueError, TypeError):
+        diagnosis = {}
+    group_state = diagnosis.get("membership", "non verificato") if diagnosis.get("group_id") == (state["group_b"] or {}).get("id") else "non verificato per il gruppo attuale"
+    return "\n".join([
+        "👤 SCHEDA SESSIONE", session_label(account_id),
+        f"ID: {info['user_id'] or 'non disponibile'}",
+        "Stato: " + await session_status_label(account_id, record),
+        "Inserimento: " + inserted, "Età: " + age,
+        "Connessione: " + info["error"][:180],
+        f"Proxy: {info['proxy_slot'] or 'diretto / non configurato'}",
+        "Ultima verifica: " + (record.get("last_check") or "non disponibile"),
+        "Gruppo B (ultima diagnosi): " + group_state,
+        "Ultimo errore: " + (record.get("last_error") or "nessuno registrato")[:300],
+        "", "Il cambio sessione disattiva AUTO. I blocchi Telegram restano invariati.",
+    ])
+
+
+async def session_card_keyboard(account_id):
+    record = await registry_for(account_id)
+    try:
+        diagnosis = json.loads(record.get("diagnosis", "{}"))
+    except (ValueError, TypeError):
+        diagnosis = {}
+    rows = [[InlineKeyboardButton("🔎 Diagnostica", callback_data="sf:diagnose")]]
+    if diagnosis.get("group_id") == (state["group_b"] or {}).get("id") and diagnosis.get("membership") == "absent":
+        rows.append([InlineKeyboardButton("🚪 Entra nel gruppo B", callback_data="jb:setup")])
+    rows.append([InlineKeyboardButton("⚙️ Gestisci account", callback_data="sf:manage")])
+    rows.append([InlineKeyboardButton("⬅️ Elenco sessioni", callback_data="sf:list")])
+    return panel_markup(rows)
+
+
+async def account_management_keyboard(account_id):
+    record = await registry_for(account_id)
+    remaining = wait_remaining(record)
+    info = session_info[account_id]
+    rows = [[InlineKeyboardButton("🔌 Verifica connessione e SpamBot", callback_data=f"check_session:{account_id}")],
+            [InlineKeyboardButton("🎲 Genera profilo", callback_data=f"profile_new:{account_id}")]]
+    if remaining is None and info["user_id"]:
+        rows.append([InlineKeyboardButton("⏳ Inizia attesa", callback_data="sf:age")])
+    elif remaining == 0 and (not record.get("approved") or record.get("halted_reason")) and not info["telegram_locked"] and not info["telegram_restriction_detected"]:
+        rows.append([InlineKeyboardButton("✅ Abilita sessione", callback_data="sf:enable")])
+    if info["telegram_locked"]:
+        rows.append([InlineKeyboardButton("🔒 Gestisci blocco", callback_data="unlock_confirm")])
+    rows.extend([[InlineKeyboardButton("🗑 Elimina sessione", callback_data=f"delete_session:{account_id}")],
+                 [InlineKeyboardButton("⬅️ Scheda sessione", callback_data="sf:card")]])
     return panel_markup(rows)
 
 
@@ -1537,9 +1590,8 @@ async def session_diagnostic_text(account_id):
 
 def diagnostic_keyboard():
     return panel_markup([
-        [InlineKeyboardButton("👤 SESSIONI", callback_data="sessions")],
-        [InlineKeyboardButton("⬅️ Diagnostica", callback_data="menu_diagnostics")],
-        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
+        [InlineKeyboardButton("⬅️ Scheda sessione", callback_data="sf:card")],
+        [InlineKeyboardButton("👥 Gestione sessioni", callback_data="sessions")],
     ])
 
 
@@ -2628,7 +2680,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.0\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.2\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -2664,7 +2716,7 @@ async def init_session_features():
                 owner_id INTEGER PRIMARY KEY, inserted_at TEXT,
                 approved INTEGER NOT NULL DEFAULT 0, halted_reason TEXT NOT NULL DEFAULT '',
                 last_check TEXT, last_error TEXT NOT NULL DEFAULT '',
-                diagnosis TEXT NOT NULL DEFAULT '{}'
+                diagnosis TEXT NOT NULL DEFAULT '{}', legacy_session INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS message_deliveries (
                 batch_id TEXT NOT NULL, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL,
@@ -2682,6 +2734,21 @@ async def init_session_features():
                 PRIMARY KEY(user_id, destination_id)
             );
         """)
+        cursor = await db.execute("PRAGMA table_info(session_registry)")
+        if "legacy_session" not in {row[1] for row in await cursor.fetchall()}:
+            await db.execute("ALTER TABLE session_registry ADD COLUMN legacy_session INTEGER NOT NULL DEFAULT 0")
+        cursor = await db.execute("SELECT value FROM settings WHERE key='legacy_sessions_wait_exemption'")
+        if not await cursor.fetchone():
+            await db.execute("UPDATE session_registry SET legacy_session=1,approved=CASE WHEN halted_reason='' THEN 1 ELSE approved END WHERE inserted_at IS NULL")
+            # La versione precedente permetteva di iniziare da ora l'attesa
+            # di una sessione storica: non farla ripartire nemmeno in quel caso.
+            cursor = await db.execute("SELECT DISTINCT session_id FROM logs WHERE message LIKE '%Attesa iniziale avviata manualmente; data persistente%'")
+            for row in await cursor.fetchall():
+                owner_cursor = await db.execute("SELECT value FROM settings WHERE key=?", (f"session_{row[0]}_owner",))
+                owner = await owner_cursor.fetchone()
+                if owner:
+                    await db.execute("UPDATE session_registry SET legacy_session=1,approved=CASE WHEN halted_reason='' THEN 1 ELSE approved END WHERE owner_id=?", (owner[0],))
+            await db.execute("INSERT INTO settings VALUES ('legacy_sessions_wait_exemption','1')")
         cursor = await db.execute("SELECT value FROM settings WHERE key='session_features_migrated'")
         if not await cursor.fetchone():
             slots = {i for i in ACCOUNT_IDS if i in session_clients or os.environ.get(f"TELEGRAM_SESSION{account_suffix(i)}", "").strip()}
@@ -2692,7 +2759,7 @@ async def init_session_features():
                 cursor = await db.execute("SELECT value FROM settings WHERE key=?", (f"session_{slot}_owner",))
                 row = await cursor.fetchone()
                 if row and str(row[0]).isdigit():
-                    await db.execute("INSERT OR IGNORE INTO session_registry(owner_id) VALUES (?)", (int(row[0]),))
+                    await db.execute("INSERT OR IGNORE INTO session_registry(owner_id,legacy_session,approved) VALUES (?,1,1)", (int(row[0]),))
                 else:
                     await db.execute("INSERT OR IGNORE INTO settings VALUES (?, '1')", (f"legacy_unknown_slot_{slot}",))
             await db.execute("INSERT INTO settings VALUES ('session_features_migrated','1')")
@@ -2703,8 +2770,8 @@ async def register_session_age(account_id, owner_id, previous_owner=None, newly_
     legacy = await get_setting(f"legacy_unknown_slot_{account_id}", "0") == "1"
     unknown = not newly_added and (previous_owner == str(owner_id) or (legacy and previous_owner is None))
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO session_registry(owner_id,inserted_at) VALUES (?,?)",
-                         (owner_id, None if unknown else now_it().isoformat()))
+        await db.execute("INSERT OR IGNORE INTO session_registry(owner_id,inserted_at,legacy_session,approved) VALUES (?,?,?,?)",
+                         (owner_id, None if unknown else now_it().isoformat(), int(unknown), int(unknown)))
         await db.execute("DELETE FROM settings WHERE key=?", (f"legacy_unknown_slot_{account_id}",))
         await db.commit()
 
@@ -2721,6 +2788,8 @@ async def registry_for(account_id):
 
 
 def wait_remaining(record):
+    if record.get("legacy_session"):
+        return 0
     if not record.get("inserted_at"):
         return None
     stamp = datetime.fromisoformat(record["inserted_at"])
@@ -2760,6 +2829,8 @@ async def session_status_label(account_id, record=None):
         return "Da verificare — data sconosciuta"
     if remaining:
         return f"In attesa iniziale — {math.ceil(remaining / 3600)} ore residue"
+    if record.get("legacy_session") and record.get("approved"):
+        return "Sessione esistente — nessuna nuova attesa"
     return "Abilitata manualmente" if record.get("approved") else "Attesa completata — da abilitare manualmente"
 
 
@@ -2961,11 +3032,20 @@ async def session_features_action(update, context, data):
     if update.effective_chat.type != "private":
         await callback_notice(query, "Usa il pannello nella chat privata con il bot.")
         return True
+    action = data[3:]
+    account_id = state["active_session"]
+    if action == "list":
+        await query.edit_message_text("📋 SELEZIONA SESSIONE\nPremi un account per aprire la sua scheda. Il cambio disattiva AUTO.", reply_markup=await session_list_keyboard())
+        return True
+    if action == "card":
+        await reply_long(query.message, await session_card_text(account_id), await session_card_keyboard(account_id), edit=True)
+        return True
+    if action == "manage":
+        await query.edit_message_text("⚙️ GESTISCI ACCOUNT\n" + session_label(account_id), reply_markup=await account_management_keyboard(account_id))
+        return True
     if operation_busy() or state["auto_enabled"]:
         await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni.")
         return True
-    action = data[3:]
-    account_id = state["active_session"]
     state["waiting_for"] = None
     if action == "all":
         lines = ["🔎 VERIFICA TUTTE LE SESSIONI — nessun ingresso o messaggio"]
@@ -2984,7 +3064,7 @@ async def session_features_action(update, context, data):
     elif action == "diagnose":
         await query.edit_message_text("🔎 Controllo gruppo B in corso…")
         result = await diagnose_destination(account_id)
-        await reply_long(query.message, format_destination_diagnosis(account_id, result), sessions_keyboard(), edit=True)
+        await reply_long(query.message, format_destination_diagnosis(account_id, result), await session_card_keyboard(account_id), edit=True)
     elif action == "age":
         record = await registry_for(account_id)
         if not record:
@@ -3018,7 +3098,7 @@ async def session_features_action(update, context, data):
             return True
         result = await diagnose_destination(account_id)
         if result["identity"] != "confirmed" or result["membership"] != "present" or result["invite_allowed"] is not True:
-            await reply_long(query.message, format_destination_diagnosis(account_id, result), sessions_keyboard(), edit=True)
+            await reply_long(query.message, format_destination_diagnosis(account_id, result), await session_card_keyboard(account_id), edit=True)
             return True
         nonce = secrets.token_hex(8)
         context.user_data["enable_session_pending"] = {"slot": account_id, "owner": session_info[account_id]["user_id"],
@@ -3039,7 +3119,7 @@ async def session_features_action(update, context, data):
             return True
         result = await diagnose_destination(account_id)
         if result["identity"] != "confirmed" or result["membership"] != "present" or result["invite_allowed"] is not True:
-            await reply_long(query.message, format_destination_diagnosis(account_id, result), sessions_keyboard(), edit=True)
+            await reply_long(query.message, format_destination_diagnosis(account_id, result), await session_card_keyboard(account_id), edit=True)
             return True
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE session_registry SET approved=1,halted_reason='' WHERE owner_id=?", (pending["owner"],))
@@ -3176,7 +3256,7 @@ def message_test_keyboard(draft):
             if slot == draft["sender_slot"] or not owner:
                 continue
             selected = any(item["id"] == owner for item in draft["recipients"])
-            rows.append([InlineKeyboardButton(f"{'✅' if selected else '☐'} {session_label(slot)[:45]}", callback_data=f"msg:pick:{slot}")])
+            rows.append([TelegramInlineKeyboardButton(f"{'✅' if selected else '☐'} {session_button_name(slot)}", callback_data=f"msg:pick:{slot}")])
         rows.append([InlineKeyboardButton("✅ Seleziona tutte", callback_data="msg:all"),
                      InlineKeyboardButton("❌ Deseleziona tutte", callback_data="msg:none")])
     else:
@@ -3373,7 +3453,7 @@ async def message_feature_action(update, context, data):
         return True
     action = data[4:]
     if action == "setup":
-        rows = [[InlineKeyboardButton(session_label(i)[:50], callback_data=f"msg:sender:{i}")] for i in ACCOUNT_IDS if session_info[i]["ready"]]
+        rows = [[TelegramInlineKeyboardButton(session_button_name(i), callback_data=f"msg:sender:{i}")] for i in ACCOUNT_IDS if session_info[i]["ready"]]
         rows.append([InlineKeyboardButton("📋 Esiti dei test", callback_data="msg:results")])
         rows.append([InlineKeyboardButton("⬅️ Sessioni", callback_data="sessions")])
         context.user_data.pop("message_draft", None)
@@ -4772,7 +4852,7 @@ async def buttons(
         except ValueError as exc:
             await callback_notice(query, str(exc), show_alert=True)
             return
-        await reply_long(query.message, await sessions_text(), sessions_keyboard(), edit=True)
+        await reply_long(query.message, await session_card_text(account_id), await session_card_keyboard(account_id), edit=True)
         return
     if data.startswith("check_session:"):
         account_id = int(data.split(":", 1)[1])
@@ -5703,7 +5783,7 @@ async def buttons(
             f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n".join(reversed(lines)) or "Nessun evento."),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("TUTTE", callback_data="logs:all")],
-                *[[InlineKeyboardButton(f"ACCOUNT {i}", callback_data=f"logs:{i}")
+                *[[TelegramInlineKeyboardButton(session_button_name(i), callback_data=f"logs:{i}")
                    for i in ACCOUNT_IDS[start:start + 3]] for start in range(0, len(ACCOUNT_IDS), 3)],
                 [InlineKeyboardButton("🔄 Aggiorna", callback_data=f"{'logdetails' if detailed else 'logs'}:{selected_filter}"),
                  InlineKeyboardButton("📄 Dettagli" if not detailed else "📋 Riepilogo", callback_data=f"{'logdetails' if not detailed else 'logs'}:{selected_filter}")],
@@ -6616,7 +6696,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.0 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.2 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -6999,7 +7079,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.0 avviato"
+        "V4.9.2 avviato"
     )
 
     application.run_polling()
