@@ -1742,78 +1742,8 @@ def parse_join_reference(value):
     public = re.fullmatch(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,})(?:/)?", value)
     username = public.group(1) if public else value.lstrip("@")
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", username):
-        raise ValueError("Inserisci @username o un link t.me valido del gruppo A, non il solo ID.")
+        raise ValueError("Inserisci @username o un link t.me valido del gruppo, non il solo ID.")
     return {"private": False, "value": "@" + username, "display": value}
-
-
-async def inspect_join_target(client, reference, group):
-    if reference["private"]:
-        invite = await asyncio.wait_for(client(CheckChatInviteRequest(reference["value"])), timeout=15)
-        entity = getattr(invite, "chat", None)
-        title = getattr(entity or invite, "title", "")
-        if entity is not None:
-            if entity.id != group["id"]:
-                raise ValueError("Il link appartiene a un gruppo diverso dal gruppo A.")
-        elif title != group["name"]:
-            raise ValueError("Il nome del gruppo nel link non corrisponde al gruppo A configurato.")
-        if getattr(invite, "broadcast", False) or getattr(entity, "broadcast", False):
-            raise ValueError("Il link appartiene a un canale, non a un gruppo.")
-        return entity, title, entity is not None
-    entity = await asyncio.wait_for(client.get_entity(reference["value"]), timeout=15)
-    if not isinstance(entity, Channel) or not entity.megagroup or entity.id != group["id"]:
-        raise ValueError("Lo username non appartiene al gruppo A configurato.")
-    return entity, entity.title, True
-
-
-async def join_source_account(account_id, reference, group):
-    info = session_info[account_id]
-    if not info["ready"]:
-        await connect_session(account_id)
-    if not info["ready"]:
-        return "❌ Sessione non disponibile — " + info["error"], False
-    owner = info["user_id"]
-    deadline_key = f"join_source_wait_{owner}"
-    remaining = float(await get_setting(deadline_key, "0")) - now_it().timestamp()
-    if remaining > 0:
-        return f"⏳ Pausa Telegram ancora attiva: {math.ceil(remaining)} secondi", True
-    client = session_clients[account_id]
-    try:
-        entity, _, _ = await inspect_join_target(client, reference, group)
-        if entity is not None:
-            try:
-                permissions = await asyncio.wait_for(client.get_permissions(entity, "me"), timeout=15)
-                if permissions is not None and not permissions.has_left and not getattr(getattr(getattr(permissions, "participant", None), "banned_rights", None), "view_messages", False):
-                    return "↪️ Già membro del gruppo A", False
-            except Exception as exc:
-                if type(exc).__name__ != "UserNotParticipantError":
-                    raise
-        request = ImportChatInviteRequest(reference["value"]) if reference["private"] else JoinChannelRequest(entity)
-        result = await asyncio.wait_for(client(request), timeout=20)
-        # Per link privati senza ID nella preview, usa il gruppo restituito dalla risposta.
-        if reference["private"]:
-            entity = next((chat for chat in getattr(result, "chats", []) if getattr(chat, "id", None) == group["id"]), None)
-            if entity is None:
-                raise ValueError("Risposta ricevuta, ma gruppo A non identificato: esito da verificare, nessun nuovo tentativo automatico.")
-        permissions = await asyncio.wait_for(client.get_permissions(entity, "me"), timeout=15)
-        if permissions is None or permissions.has_left or getattr(getattr(getattr(permissions, "participant", None), "banned_rights", None), "view_messages", False):
-            return "⚠️ Richiesta ricevuta, presenza non confermata", False
-        return "✅ Entrato nel gruppo A — presenza verificata", False
-    except FloodWaitError as exc:
-        await set_setting(deadline_key, str(now_it().timestamp() + exc.seconds))
-        return f"⏳ Telegram richiede una pausa di {exc.seconds} secondi; operazione interrotta", True
-    except PeerFloodError:
-        for flag in ("telegram_locked", "telegram_restriction_detected"):
-            info[flag] = True
-            await set_setting(f"session_{account_id}_{flag}", "1")
-        if account_id == state["active_session"]:
-            sync_session_state()
-        return "🛑 PeerFloodError: limitazione Telegram; operazione interrotta e blocco locale attivato", True
-    except Exception as exc:
-        if type(exc).__name__ == "InviteRequestSentError":
-            return "📨 Richiesta di accesso inviata — in attesa dell'approvazione degli amministratori", False
-        if type(exc).__name__ == "UserAlreadyParticipantError":
-            return "↪️ Telegram segnala account già membro", False
-        return "❌ " + safe_connection_error(exc), False
 
 
 async def resolve_group(value):
@@ -2687,7 +2617,6 @@ def groups_keyboard():
         [InlineKeyboardButton("📥 Configura gruppo a", callback_data="set_a"),
          InlineKeyboardButton("📤 Configura gruppo b", callback_data="set_b")],
         [InlineKeyboardButton("👥 Membri gruppo a", callback_data="members")],
-        [InlineKeyboardButton("📥 Sessioni nel gruppo a", callback_data="join_a_setup")],
         [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
     ])
 
@@ -2722,19 +2651,9 @@ INVITE_VALUE_RULES = {
 
 
 async def invites_text(settings=False):
-    if state["telegram_locked"] and state["telegram_restriction_detected"]:
-        status = "🛑 Limitazione Telegram — inviti bloccati"
-    elif state["telegram_locked"]:
-        status = "🔒 Inviti sospesi"
-    elif state["running"]:
-        status = "🟢 Automatico in esecuzione"
-    elif state["auto_enabled"]:
-        status = "🟡 Automatico programmato"
-    else:
-        status = "🔴 Automatico disattivato"
+    status = await selected_account_status(state["active_session"])
     return (
         ("⚙️ IMPOSTAZIONI INVITI\n\n" if settings else "📤 INVITI\n\n")
-        + f"👤 {session_label()}\n"
         + f"📥 Destinazione: {group_label(state['group_b'])}\n\n"
         + f"{status}\n"
         + f"🕐 Partenza: {state['start_time']}\n"
@@ -2764,34 +2683,53 @@ async def section_text(section):
     return await home_text() + "\n\n" + titles[section]
 
 
-async def home_text():
-
-    # La HOME mostra solo le informazioni essenziali.
-    # Le statistiche dettagliate restano disponibili dal pulsante STATISTICHE.
-    if state["telegram_locked"] and state["telegram_restriction_detected"]:
-        status = "🛑 LIMITAZIONE TELEGRAM RILEVATA — INVITI BLOCCATI"
-    elif state["telegram_locked"]:
-        status = "🔒 INVITI SOSPESI DAL BLOCCO LOCALE"
-    elif state["running"]:
-        status = "🟢 AUTOMATICO IN ESECUZIONE"
-    elif state["auto_enabled"]:
-        status = f"🟡 AUTOMATICO PROGRAMMATO — {state['start_time']}"
+async def selected_account_status(account_id, record=None):
+    info = session_info[account_id]
+    record = record if record is not None else await registry_for(account_id)
+    lines = ["👤 Sessione selezionata: " + session_button_name(account_id)]
+    blocked = info["telegram_locked"] or info["telegram_restriction_detected"] or record.get("halted_reason")
+    if not info["ready"]:
+        lines.extend(["🔴 Questo account non è connesso", "Dettaglio: " + info["error"][:180]])
+    elif blocked:
+        code = recorded_error_type(info, record)
+        lines.append("🔴 Inviti sospesi per questo account")
+        lines.append("Errore: " + code if code != "Motivo non registrato" else "Motivo del blocco non registrato")
+    elif await session_status_color(account_id, record) == "🟡":
+        lines.append("🟡 " + await session_status_label(account_id, record))
     else:
-        status = "🔴 AUTOMATICO DISATTIVATO"
+        lines.append("🟢 Inviti abilitati localmente per questo account")
+    if not info["ready"] or blocked:
+        lines.append("🔎 Apri Gestione sessioni → Diagnostica per i dettagli")
+    return "\n".join(lines)
 
+
+async def home_text():
+    account_id = state["active_session"]
+    counts = {"🟢": 0, "🟡": 0, "🔴": 0}
+    active_record = None
+    for slot in ACCOUNT_IDS:
+        record = await registry_for(slot)
+        counts[await session_status_color(slot, record)] += 1
+        if slot == account_id:
+            active_record = record
+    if state["running"]:
+        automatic = "▶️ Automatico in esecuzione"
+    elif state["auto_enabled"]:
+        automatic = f"🕐 Automatico programmato: {state['start_time']}"
+    else:
+        automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.3\n\n"
-        f"👤 SESSIONE ATTIVA: {session_label()}\n"
-        f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
-        f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
-        f"📤 GRUPPO B: {group_label(state['group_b'])}\n\n"
-        f"{status}"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.5\n\n"
+        + await selected_account_status(account_id, active_record)
+        + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
+        + f"🟢 Abilitate: {counts['🟢']}\n"
+        + f"🟡 In attesa/verifica: {counts['🟡']}\n"
+        + f"🔴 Non operative: {counts['🔴']}\n\n"
+        + f"📥 Gruppo A: {group_label(state['group_a'])}\n"
+        + f"📤 Gruppo B: {group_label(state['group_b'])}\n\n"
+        + automatic
     )
 
-
-# =========================================================
-# INVITO SINGOLO
-# =========================================================
 
 DESTINATION_ERRORS = {
     "ChatWriteForbiddenError", "ChatAdminRequiredError", "ChannelPrivateError",
@@ -3352,6 +3290,9 @@ async def link_permissions_list():
 
 
 def message_test_keyboard(draft):
+    if draft["kind"] == "test" and not draft.get("nonce"):
+        draft["nonce"] = secrets.token_hex(8)
+        draft["preview_at"] = time.monotonic()
     rows = []
     if draft["kind"] == "test":
         for slot in ACCOUNT_IDS:
@@ -3370,7 +3311,8 @@ def message_test_keyboard(draft):
     rows.extend([
         [InlineKeyboardButton("✍️ Inserisci username / ID", callback_data="msg:manual")],
         [InlineKeyboardButton("✏️ Modifica testo", callback_data="msg:text")],
-        [InlineKeyboardButton("👁 Anteprima", callback_data="msg:preview")],
+        [InlineKeyboardButton("📤 Invia test", callback_data="msg:send:" + draft["nonce"]) if draft["kind"] == "test"
+         else InlineKeyboardButton("👁 Anteprima", callback_data="msg:preview")],
         [InlineKeyboardButton("❌ Annulla", callback_data="sessions" if draft["kind"] == "test" else "link:menu")],
     ])
     return panel_markup(rows)
@@ -3381,7 +3323,7 @@ def message_draft_text(draft):
     names = ", ".join(item["label"] for item in draft["recipients"]) or "nessuno"
     return ("🧪 TEST MESSAGGIO" if draft["kind"] == "test" else "📩 INVITO CON LINK") + \
         f"\nMittente: {sender}\nDestinatari: {names}\n\nTesto:\n{draft['text']}\n\n" + \
-        ("Seleziona soltanto account tuoi. Un messaggio per destinatario, nessuna risposta automatica." if draft["kind"] == "test"
+        ("" if draft["kind"] == "test"
          else "Destinatari con consenso registrato. Un invito per persona e gruppo, senza reinvio automatico.")
 
 
@@ -3617,6 +3559,9 @@ async def message_feature_action(update, context, data):
             reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Destinatari", callback_data="msg:back")]]))
         return True
     elif action == "preview":
+        if draft["kind"] == "test":
+            await callback_notice(query, "Usa Invia test dalla schermata dei destinatari.")
+            return True
         if not draft["recipients"]:
             await callback_notice(query, "Seleziona almeno un destinatario.")
             return True
@@ -3625,14 +3570,20 @@ async def message_feature_action(update, context, data):
             return True
         draft["nonce"] = secrets.token_hex(8)
         draft["preview_at"] = time.monotonic()
-        extra = "\nConfermo che i destinatari manuali sono account miei." if draft["kind"] == "test" else "\nInvio soltanto ai destinatari con consenso registrato."
+        extra = "\nInvio soltanto ai destinatari con consenso registrato."
         await reply_long(query.message, "👁 ANTEPRIMA\n" + message_draft_text(draft) + extra,
             panel_markup([[InlineKeyboardButton("📤 Invia test" if draft["kind"] == "test" else "📩 Invia invito", callback_data="msg:send:" + draft["nonce"])],
                           [InlineKeyboardButton("⬅️ Modifica", callback_data="msg:back")]]), edit=True)
         return True
     elif action.startswith("send:"):
+        if not draft["recipients"]:
+            await callback_notice(query, "Seleziona almeno un destinatario.")
+            return True
+        if len(draft["recipients"]) > 20:
+            await callback_notice(query, "Massimo 20 destinatari per operazione manuale.")
+            return True
         if draft.get("nonce") != action.split(":")[1] or time.monotonic() - draft.get("preview_at", 0) > 300:
-            await callback_notice(query, "Anteprima scaduta: preparala di nuovo.")
+            await callback_notice(query, "Invio scaduto: riapri i destinatari." if draft["kind"] == "test" else "Anteprima scaduta: preparala di nuovo.")
             return True
         if draft["kind"] == "link" and draft.get("group") != state["group_b"]:
             await callback_notice(query, "Gruppo B cambiato: prepara di nuovo l'invito.")
@@ -4849,7 +4800,6 @@ async def buttons(
         return
     if data == "home":
         context.user_data.pop("profile_pending", None)
-        context.user_data.pop("join_a_pending", None)
 
     if data == "clean_members":
         if operation_busy() or state["auto_enabled"]:
@@ -4891,43 +4841,6 @@ async def buttons(
                 return
             await set_setting("member_filters", json.dumps(config))
         await query.edit_message_text(await member_filters_text(), reply_markup=await member_filters_keyboard())
-        return
-    if data == "join_a_setup":
-        if operation_busy() or state["auto_enabled"]:
-            await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni prima di procedere.", show_alert=True)
-            return
-        if not state["group_a"]:
-            await callback_notice(query, "Configura prima il gruppo A.", show_alert=True)
-            return
-        state["waiting_for"] = "join_a_link"
-        context.user_data.pop("join_a_pending", None)
-        await query.edit_message_text("📥 INGRESSO DELLE SESSIONI NEL GRUPPO A\n\n"
-            + state["group_a"]["name"] + "\nIncolla il link d'invito del gruppo A oppure il suo @username. "
-            "Ti mostrerò una conferma prima di procedere.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ANNULLA", callback_data="home")]]))
-        return
-    if data == "join_a_confirm":
-        pending = context.user_data.get("join_a_pending")
-        if operation_busy() or state["auto_enabled"]:
-            await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni.", show_alert=True)
-            return
-        if not pending or not state["group_a"] or pending["group"] != state["group_a"] or now_it().timestamp() - pending["created_at"] > 600:
-            context.user_data.pop("join_a_pending", None)
-            await callback_notice(query, "Conferma scaduta: riapri il pulsante di ingresso.", show_alert=True)
-            return
-        context.user_data.pop("join_a_pending", None)
-        state["waiting_for"] = None
-        lines = ["📥 INGRESSO SESSIONI — " + pending["group"]["name"]]
-        for index, account_id in enumerate(ACCOUNT_IDS):
-            await query.edit_message_text("\n".join(lines) + f"\n⏳ Controllo ACCOUNT {account_id}…")
-            outcome, stop = await join_source_account(account_id, pending["reference"], pending["group"])
-            lines.append(f"ACCOUNT {account_id}: {outcome}")
-            await add_log("📥 INGRESSO GRUPPO A — " + outcome, session_id=account_id)
-            if stop:
-                lines.append("Operazione fermata. Gli account successivi non sono stati tentati.")
-                break
-            if index < len(ACCOUNT_IDS) - 1:
-                await asyncio.sleep(2)
-        await query.edit_message_text("\n".join(lines), reply_markup=sessions_keyboard())
         return
     if data == "proxy_status":
         await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
@@ -5855,7 +5768,6 @@ async def buttons(
     # =====================================================
 
     elif data == "logs" or data.startswith(("logs:", "logdetails:")):
-        detailed = data.startswith("logdetails:")
         selected_filter = data.split(":", 1)[1] if ":" in data else "all"
         if selected_filter not in {"all", *(str(i) for i in ACCOUNT_IDS)}:
             return
@@ -5877,8 +5789,7 @@ async def buttons(
                 stamp = dt.strftime("%d/%m/%Y %H:%M:%S %Z")
             except (ValueError, TypeError):
                 stamp = "--:--:--"
-            shown = message if detailed else (message[:260] + "… [dettagli]" if len(message) > 260 else message)
-            line = f"{stamp}  {shown}"
+            line = f"{stamp}  {message}"
             if budget + len(line) + 1 > 3700:
                 break
             lines.append(line)
@@ -5890,8 +5801,7 @@ async def buttons(
                 [InlineKeyboardButton("TUTTE", callback_data="logs:all")],
                 *[[TelegramInlineKeyboardButton(f"{await session_status_color(i)} {session_button_name(i)}", callback_data=f"logs:{i}")
                    for i in ACCOUNT_IDS[start:start + 3]] for start in range(0, len(ACCOUNT_IDS), 3)],
-                [InlineKeyboardButton("🔄 Aggiorna", callback_data=f"{'logdetails' if detailed else 'logs'}:{selected_filter}"),
-                 InlineKeyboardButton("📄 Dettagli" if not detailed else "📋 Riepilogo", callback_data=f"{'logdetails' if not detailed else 'logs'}:{selected_filter}")],
+                [InlineKeyboardButton("🔄 Aggiorna", callback_data=f"logs:{selected_filter}")],
                 [InlineKeyboardButton("🗑 PULISCI TUTTI I LOG", callback_data="clear_logs_confirm")],
                 [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
             ]),
@@ -6068,28 +5978,6 @@ async def text_input(
             await update.message.reply_text(
                 "❌ Collegamento non avviato (" + type(exc).__name__ + "). "
                 "Controlla il numero e riprova; se Telegram richiede una pausa, attendi prima di riprovare.")
-        return
-
-    if target == "join_a_link":
-        if operation_busy() or state["auto_enabled"] or not state["group_a"]:
-            await update.message.reply_text("Disattiva AUTO e configura il gruppo A prima di procedere.")
-            return
-        try:
-            reference = parse_join_reference(update.message.text)
-            ready = next((account_id for account_id in ACCOUNT_IDS if session_info[account_id]["ready"]), None)
-            if ready is None:
-                raise ValueError("Nessuna sessione connessa: usa VERIFICA e riprova.")
-            _, title, id_known = await inspect_join_target(session_clients[ready], reference, state["group_a"])
-            context.user_data["join_a_pending"] = {"reference": reference, "group": dict(state["group_a"]), "created_at": now_it().timestamp()}
-            state["waiting_for"] = None
-            await update.message.reply_text("📥 CONFERMA INGRESSO DELLE SESSIONI\n\n"
-                + title + "\nLink/username: " + reference["display"] + "\n\n"
-                + ("Identità del gruppo verificata." if id_known else "Il link privato espone solo il nome, non l'ID. Conferma che questo sia il link del gruppo A.")
-                + "\nGli account già membri saranno saltati. Le richieste soggette ad approvazione resteranno in attesa. I blocchi sugli inviti rimangono invariati.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ CONFERMA INGRESSO", callback_data="join_a_confirm")], [InlineKeyboardButton("❌ ANNULLA", callback_data="home")]]))
-        except Exception as exc:
-            context.user_data.pop("join_a_pending", None)
-            await update.message.reply_text("❌ " + safe_connection_error(exc) + "\nIncolla un link valido del gruppo A.")
         return
 
     # =====================================================
@@ -6801,7 +6689,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.3 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.5 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7184,7 +7072,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.3 avviato"
+        "V4.9.5 avviato"
     )
 
     application.run_polling()
