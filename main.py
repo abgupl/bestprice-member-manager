@@ -197,12 +197,36 @@ def session_label(account_id=None):
 
 
 def session_button_name(account_id):
-    """Nome dell'utente sui pulsanti; lo slot resta solo nei callback e nei log."""
+    """Solo il nome pubblico del profilo, mai lo username o il numero dello slot."""
     info = session_info[account_id]
-    name = str(info.get("name") or "").strip()
-    if not name or name == f"ACCOUNT {account_id}" or name == "Account aggiunto":
-        name = f"ID {info['user_id']}" if info.get("user_id") else f"Non collegata ({account_id})"
+    name = str(info.get("display_name") or info.get("name") or "").strip()
+    if not name or name.startswith("@") or name == f"ACCOUNT {account_id}" or name == "Account aggiunto":
+        return "Nome non impostato"
     return name[:45]
+
+
+def telegram_profile_name(user):
+    return " ".join(value for value in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if value).strip() or "Nome non impostato"
+
+
+def recorded_error_type(info, record):
+    # Prima il motivo della sospensione, poi il dettaglio dell'ultimo errore.
+    # Non si deduce un errore Telegram dalla sola presenza di un blocco locale.
+    for detail in (record.get("halted_reason"), record.get("last_error")):
+        match = re.search(r"\b([A-Z][A-Za-z0-9]*(?:Error|Timeout)|RetryAfter)\b", detail or "")
+        if match:
+            return match.group(1)
+    return "Motivo non registrato"
+
+
+async def session_status_color(account_id, record=None):
+    record = record if record is not None else await registry_for(account_id)
+    info = session_info[account_id]
+    if not info["ready"] or info["telegram_locked"] or info["telegram_restriction_detected"] or record.get("halted_reason"):
+        return "🔴"
+    if wait_remaining(record) != 0 or not record.get("approved"):
+        return "🟡"
+    return "🟢"
 
 
 class SelectedClient:
@@ -982,7 +1006,7 @@ async def connect_session(account_id):
                 raise ValueError("Questo account è già presente in un altro slot: usa account distinti")
         await bind_session_owner(account_id, me.id)
         info.update(ready=True, user_id=me.id,
-                    name=(f"@{me.username}" if me.username else me.first_name or str(me.id)), username=me.username,
+                    name=telegram_profile_name(me), display_name=telegram_profile_name(me), username=me.username,
                     error="Connessa e autorizzata")
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE session_registry SET last_check=? WHERE owner_id=?", (now_it().isoformat(), me.id))
@@ -1045,11 +1069,8 @@ async def session_list_keyboard():
     rows = []
     for slot in ACCOUNT_IDS:
         record = await registry_for(slot)
-        label = await session_status_label(slot, record)
-        icon = "🛑" if "Fermata" in label else "⏳" if "In attesa" in label else "🔌" if not session_info[slot]["ready"] else "✅" if slot == state["active_session"] else "👤"
-        name = session_button_name(slot)
-        short = "selezionata" if slot == state["active_session"] and icon == "✅" else label.split(" — ")[0].lower()
-        rows.append([TelegramInlineKeyboardButton(f"{icon} {name} · {short}", callback_data=f"select_session:{slot}")])
+        icon = await session_status_color(slot, record)
+        rows.append([TelegramInlineKeyboardButton(f"{icon} {session_button_name(slot)}", callback_data=f"select_session:{slot}")])
     rows.append([InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")])
     return panel_markup(rows)
 
@@ -1075,7 +1096,9 @@ async def session_card_text(account_id):
         diagnosis = {}
     group_state = diagnosis.get("membership", "non verificato") if diagnosis.get("group_id") == (state["group_b"] or {}).get("id") else "non verificato per il gruppo attuale"
     return "\n".join([
-        "👤 SCHEDA SESSIONE", session_label(account_id),
+        "👤 SCHEDA SESSIONE", session_button_name(account_id),
+        "Username: " + ("@" + info["username"] if info.get("username") else "non impostato"),
+        "Colore: " + await session_status_color(account_id, record),
         f"ID: {info['user_id'] or 'non disponibile'}",
         "Stato: " + await session_status_label(account_id, record),
         "Inserimento: " + inserted, "Età: " + age,
@@ -1199,6 +1222,82 @@ def profile_avatar(account_id, color, mascot="orsetto"):
     raw = b''.join(b'\x00' + pixels[row*size*3:(row+1)*size*3] for row in range(size))
     return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB',size,size,8,2,0,0,0)) + chunk(b'IDAT',zlib.compress(raw)) + chunk(b'IEND',b'')
 
+PROFILE_NAME_ROOTS = ("Nuv", "Zamp", "Lun", "Pium", "Neb", "Baff", "Zuff", "Brill", "Morb", "Tond", "Frull", "Puff", "Birb", "Mirt", "Fuf", "Dond", "Nimb", "Bubl", "Ruff", "Zig")
+PROFILE_NAME_ENDINGS = ("io", "ix", "etto", "ino", "olo", "ello", "ico", "ino", "otto", "u")
+
+
+async def used_profile_identifiers():
+    names = {session_button_name(i).casefold() for i in ACCOUNT_IDS if session_button_name(i) != "Nome non impostato"}
+    usernames = {(info.get("username") or "").casefold() for info in session_info.values() if info.get("username")}
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT name,username FROM generated_profile_history")
+        for name, username in await cursor.fetchall():
+            names.add(name.casefold())
+            usernames.add(username.casefold())
+    return names, usernames
+
+
+async def generate_profile_identity(client, owner_id):
+    names, usernames = await used_profile_identifiers()
+    remaining = [name for name in PROFILE_NAMES if name.casefold() not in names]
+    for attempt in range(12):
+        if remaining:
+            name = secrets.choice(remaining)
+            remaining.remove(name)
+        else:
+            name = None
+            for _ in range(300):
+                candidate = secrets.choice(PROFILE_NAME_ROOTS) + secrets.choice(PROFILE_NAME_ENDINGS)
+                if candidate.casefold() not in names:
+                    name = candidate
+                    break
+            if name is None:
+                raise ValueError("Nessun nuovo nome disponibile: amplia il generatore")
+        names.add(name.casefold())
+        base = name.lower()[:8]
+        # Username classici: lettere ASCII, numeri; minimo 5 caratteri.
+        # Per questa funzione il target scelto e' 6–10 caratteri.
+        for variant in range(3):
+            suffix = "" if variant == 0 and len(base) >= 6 else secrets.choice("abcdefghkmnprstuvz23456789")
+            if variant == 2:
+                suffix += secrets.choice("23456789")
+            username = base + suffix
+            if not 6 <= len(username) <= 10 or username.casefold() in usernames:
+                continue
+            usernames.add(username.casefold())
+            try:
+                available = bool(await asyncio.wait_for(client(CheckUsernameRequest(username)), 12))
+            except Exception as exc:
+                if type(exc).__name__ in {"UsernameOccupiedError", "UsernameInvalidError"}:
+                    continue
+                raise
+            if not available:
+                continue
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("INSERT INTO generated_profile_history(name,username,owner_id,created_at) VALUES (?,?,?,?)",
+                                     (name.casefold(), username.casefold(), owner_id, now_it().isoformat()))
+                    await db.commit()
+            except aiosqlite.IntegrityError:
+                continue
+            return name, username
+    raise ValueError("Nessuno username breve disponibile nei controlli effettuati. Nessun profilo modificato; riprova piu' tardi")
+
+
+async def recheck_profile_identity(client, pending):
+    for slot in ACCOUNT_IDS:
+        info = session_info[slot]
+        if info.get("user_id") == pending["owner_id"]:
+            continue
+        if session_button_name(slot).casefold() == pending["first_name"].casefold():
+            raise ValueError("Il nome e' ora utilizzato da un'altra sessione: rigenera il profilo")
+        if (info.get("username") or "").casefold() == pending["username"].casefold():
+            raise ValueError("Lo username e' ora utilizzato da un'altra sessione: rigenera il profilo")
+    available = bool(await asyncio.wait_for(client(CheckUsernameRequest(pending["username"])), 12))
+    if not available:
+        raise ValueError("Lo username non e' piu' disponibile: nessuna modifica eseguita. Rigenera il profilo")
+
+
 async def profile_action(update, context):
     query = update.callback_query
     data = query.data
@@ -1231,9 +1330,8 @@ async def profile_action(update, context):
             me = await asyncio.wait_for(client.get_me(), 15)
             if not me or me.id != session_info[account_id]['user_id']:
                 raise ValueError('Identità della sessione cambiata: esegui VERIFICA')
-            role = secrets.choice(PROFILE_NAMES)
-            username = f'{role.lower()}_community_{secrets.token_hex(3)}'
-            available = bool(await asyncio.wait_for(client(CheckUsernameRequest(username)), 15))
+            role, username = await generate_profile_identity(client, me.id)
+            available = True
             pending = {'account_id': account_id, 'owner_id': me.id,
                        'admin_id': update.effective_user.id, 'created_at': now_it().timestamp(),
                        'nonce': secrets.token_hex(6), 'first_name': role,
@@ -1276,13 +1374,15 @@ async def profile_action(update, context):
         pause_until = float(await get_setting(f'profile_pause_{account_id}', '0'))
         if pause_until > now_it().timestamp():
             raise ValueError('Pausa Telegram ancora attiva per questo profilo')
+        await recheck_profile_identity(client, pending)
         await asyncio.wait_for(client(UpdateProfileRequest(first_name=pending['first_name'], last_name=pending['last_name'], about=pending['bio'])), 20)
         lines.append('✅ Nome e bio aggiornati')
         await add_log('👤 PROFILO — nome e bio aggiornati', session_id=account_id)
-        session_info[account_id]['name'] = f"@{me.username}" if me.username else (pending['first_name'] + ' ' + pending['last_name']).strip()
+        session_info[account_id]['name'] = (pending['first_name'] + ' ' + pending['last_name']).strip()
+        session_info[account_id]['display_name'] = session_info[account_id]['name']
         if pending['username']:
             await asyncio.wait_for(client(UpdateUsernameRequest(pending['username'])), 20)
-            session_info[account_id]['name'] = '@' + pending['username']
+            session_info[account_id]['username'] = pending['username']
             lines.append('✅ Username aggiornato: @' + pending['username'])
             await add_log('👤 PROFILO — username aggiornato', session_id=account_id)
         else:
@@ -2680,7 +2780,7 @@ async def home_text():
         status = "🔴 AUTOMATICO DISATTIVATO"
 
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.2\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.3\n\n"
         f"👤 SESSIONE ATTIVA: {session_label()}\n"
         f"🔌 {'Connessa' if session_info[current_session_id()]['ready'] else 'Non disponibile'}\n\n"
         f"📥 GRUPPO A: {group_label(state['group_a'])}\n"
@@ -2712,6 +2812,10 @@ INITIAL_WAIT_SECONDS = 48 * 60 * 60
 async def init_session_features():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
+            CREATE TABLE IF NOT EXISTS generated_profile_history (
+                name TEXT PRIMARY KEY COLLATE NOCASE, username TEXT UNIQUE COLLATE NOCASE NOT NULL,
+                owner_id INTEGER NOT NULL, created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS session_registry (
                 owner_id INTEGER PRIMARY KEY, inserted_at TEXT,
                 approved INTEGER NOT NULL DEFAULT 0, halted_reason TEXT NOT NULL DEFAULT '',
@@ -2806,7 +2910,7 @@ async def invitation_gate(account_id):
     if info["telegram_locked"] or info["telegram_restriction_detected"]:
         return "Blocco locale Telegram attivo: controlla la diagnosi e @SpamBot."
     if record.get("halted_reason"):
-        return "Sessione fermata per errore: " + record["halted_reason"][:180]
+        return "Inviti sospesi: " + recorded_error_type(info, record) + " — " + record["halted_reason"][:180]
     remaining = wait_remaining(record)
     if remaining is None:
         return "Data d'inserimento sconosciuta: imposta l'inizio dell'attesa dal pannello."
@@ -2821,9 +2925,9 @@ async def session_status_label(account_id, record=None):
     info = session_info[account_id]
     record = record if record is not None else await registry_for(account_id)
     if not info["ready"]:
-        return "Disconnessa"
-    if info["telegram_locked"] or record.get("halted_reason"):
-        return "Fermata per errore"
+        return "Disconnessa — " + info.get("error", "connessione non verificata")[:160]
+    if info["telegram_locked"] or info["telegram_restriction_detected"] or record.get("halted_reason"):
+        return recorded_error_type(info, record) + " — inviti sospesi localmente"
     remaining = wait_remaining(record)
     if remaining is None:
         return "Da verificare — data sconosciuta"
@@ -3035,7 +3139,7 @@ async def session_features_action(update, context, data):
     action = data[3:]
     account_id = state["active_session"]
     if action == "list":
-        await query.edit_message_text("📋 SELEZIONA SESSIONE\nPremi un account per aprire la sua scheda. Il cambio disattiva AUTO.", reply_markup=await session_list_keyboard())
+        await query.edit_message_text("📋 SELEZIONA SESSIONE\nSessione selezionata: " + session_button_name(account_id) + "\n\n🟢 Abilitata localmente · 🟡 Attesa o verifica necessaria · 🔴 Disconnessa o inviti sospesi\nPremi un nome per aprire la scheda. Il cambio disattiva AUTO.", reply_markup=await session_list_keyboard())
         return True
     if action == "card":
         await reply_long(query.message, await session_card_text(account_id), await session_card_keyboard(account_id), edit=True)
@@ -3256,7 +3360,7 @@ def message_test_keyboard(draft):
             if slot == draft["sender_slot"] or not owner:
                 continue
             selected = any(item["id"] == owner for item in draft["recipients"])
-            rows.append([TelegramInlineKeyboardButton(f"{'✅' if selected else '☐'} {session_button_name(slot)}", callback_data=f"msg:pick:{slot}")])
+            rows.append([TelegramInlineKeyboardButton(f"{draft.get('session_colors', {}).get(slot, '🟡')} {session_button_name(slot)}", callback_data=f"msg:pick:{slot}")])
         rows.append([InlineKeyboardButton("✅ Seleziona tutte", callback_data="msg:all"),
                      InlineKeyboardButton("❌ Deseleziona tutte", callback_data="msg:none")])
     else:
@@ -3453,7 +3557,7 @@ async def message_feature_action(update, context, data):
         return True
     action = data[4:]
     if action == "setup":
-        rows = [[TelegramInlineKeyboardButton(session_button_name(i), callback_data=f"msg:sender:{i}")] for i in ACCOUNT_IDS if session_info[i]["ready"]]
+        rows = [[TelegramInlineKeyboardButton(f"{await session_status_color(i)} {session_button_name(i)}", callback_data=f"msg:sender:{i}")] for i in ACCOUNT_IDS if session_info[i]["ready"]]
         rows.append([InlineKeyboardButton("📋 Esiti dei test", callback_data="msg:results")])
         rows.append([InlineKeyboardButton("⬅️ Sessioni", callback_data="sessions")])
         context.user_data.pop("message_draft", None)
@@ -3471,7 +3575,8 @@ async def message_feature_action(update, context, data):
             await callback_notice(query, "Sessione non disponibile")
             return True
         context.user_data["message_draft"] = {"kind": "test", "sender_slot": slot,
-            "sender_id": session_info[slot]["user_id"], "recipients": [], "text": "ciao"}
+            "sender_id": session_info[slot]["user_id"], "recipients": [], "text": "ciao",
+            "session_colors": {i: await session_status_color(i) for i in ACCOUNT_IDS}}
     draft = context.user_data.get("message_draft")
     if not draft:
         await callback_notice(query, "Preparazione scaduta: riapri Test messaggio o Invito con link.")
@@ -5783,7 +5888,7 @@ async def buttons(
             f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n".join(reversed(lines)) or "Nessun evento."),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("TUTTE", callback_data="logs:all")],
-                *[[TelegramInlineKeyboardButton(session_button_name(i), callback_data=f"logs:{i}")
+                *[[TelegramInlineKeyboardButton(f"{await session_status_color(i)} {session_button_name(i)}", callback_data=f"logs:{i}")
                    for i in ACCOUNT_IDS[start:start + 3]] for start in range(0, len(ACCOUNT_IDS), 3)],
                 [InlineKeyboardButton("🔄 Aggiorna", callback_data=f"{'logdetails' if detailed else 'logs'}:{selected_filter}"),
                  InlineKeyboardButton("📄 Dettagli" if not detailed else "📋 Riepilogo", callback_data=f"{'logdetails' if not detailed else 'logs'}:{selected_filter}")],
@@ -6417,7 +6522,7 @@ async def login_web_operation(token, form=None):
             await bind_session_owner(account_id, me.id)
             session_info[account_id].update(
                 ready=True, user_id=me.id,
-                name=f"@{me.username}" if me.username else me.first_name or str(me.id), username=me.username,
+                name=telegram_profile_name(me), display_name=telegram_profile_name(me), username=me.username,
                 error="Connessa e autorizzata",
                 proxy_slot=int(os.environ["ADDED_SESSION_PROXY"]) if os.environ.get("ADDED_SESSION_PROXY", "").strip() else None,
             )
@@ -6696,7 +6801,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.2 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.3 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7079,7 +7184,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.2 avviato"
+        "V4.9.3 avviato"
     )
 
     application.run_polling()
