@@ -1285,12 +1285,12 @@ async def account_management_keyboard(account_id):
     return panel_markup(rows)
 
 
-PROFILE_COLORS = ((211, 45, 55), (25, 112, 182), (32, 143, 106), (111, 67, 174), (202, 112, 26), (35, 127, 145))
-PROFILE_NAMES = ("Nuvio", "Zampix", "Lunetto", "Puffolo", "Morbix", "Tondino", "Frullix", "Baffolo", "Piumix", "Nebulino", "Zuffolo", "Brillix")
-PROFILE_SECOND_WORDS = ("Birbante", "Sorridente", "Sognatore", "Vivace", "Curioso", "Allegro", "Gentile", "Buffo", "Soffice", "Solare", "Scattante", "Gioioso")
-PROFILE_BIOS = ("Un piccolo personaggio cartoon, una grande fantasia. 🎨",
-                "Zampe, sorrisi e un pizzico di fantasia. 🐾",
-                "Una mascotte cartoon dal sorriso contagioso. ✨")
+PROFILE_COLORS = ((36, 43, 56), (38, 62, 73), (49, 66, 61), (58, 47, 67), (81, 59, 43), (42, 60, 65))
+PROFILE_NAMES = ("Shadow", "Ember", "Silver", "Onyx", "Crimson", "Astral", "Obsidian", "Lunar", "Silent", "Mystic", "Frost", "Velvet", "Arcane", "Midnight", "Eclipse", "Azure", "Ivory", "Raven", "Storm", "Spectral")
+PROFILE_SECOND_WORDS = ("Vale", "Drift", "Echo", "Crest", "Veil", "Rune", "Haven", "Shard", "Dusk", "Flame", "Mist", "Hollow", "Warden", "Nexus", "Tide", "Realm", "Horizon", "Grove", "Cipher", "Wisp")
+PROFILE_BIOS = ("An illustrated character from an imagined realm.",
+                "A fantasy character, drawn in shadow and light.",
+                "An animal spirit from a fictional world.")
 PROFILE_MASCOTS = ("orsetto", "gattino", "gufetto", "coniglietto", "volpetta", "panda", "cagnolino", "koala", "pinguino", "ranocchio")
 
 
@@ -1343,8 +1343,8 @@ def profile_avatar(account_id, color, mascot="orsetto"):
             half = int(rx * math.sqrt(max(0, 1 - ((y - cy) / ry) ** 2)))
             rect(cx - half, y, half * 2 + 1, 1, rgb)
     dark = (38, 43, 63)
-    cream = (255, 240, 218)
-    peach = (242, 179, 166)
+    cream = (220, 217, 207)
+    peach = (153, 132, 123)
     ellipse(256, 265, 193, 193, tuple(min(255, c + 26) for c in color))
     if mascot in {'gattino', 'volpetta'}:
         # Orecchie a punta, disegnate a righe.
@@ -1367,12 +1367,12 @@ def profile_avatar(account_id, color, mascot="orsetto"):
         ellipse(125, 235, 56, 107, (157, 101, 64))
         ellipse(387, 235, 56, 107, (157, 101, 64))
     elif mascot == 'ranocchio':
-        ellipse(182, 177, 59, 65, (133, 205, 91))
-        ellipse(330, 177, 59, 65, (133, 205, 91))
+        ellipse(182, 177, 59, 65, (111, 139, 94))
+        ellipse(330, 177, 59, 65, (111, 139, 94))
     elif mascot == 'gufetto':
         ellipse(169, 195, 79, 82, cream)
         ellipse(343, 195, 79, 82, cream)
-    face = (232, 145, 56) if mascot == 'volpetta' else ((133, 205, 91) if mascot == 'ranocchio' else ((180, 185, 192) if mascot == 'koala' else cream))
+    face = (179, 117, 61) if mascot == 'volpetta' else ((111, 139, 94) if mascot == 'ranocchio' else ((180, 185, 192) if mascot == 'koala' else cream))
     if mascot == 'pinguino':
         ellipse(256, 267, 165, 150, dark)
     ellipse(256, 270, 148, 132, face)
@@ -1387,16 +1387,15 @@ def profile_avatar(account_id, color, mascot="orsetto"):
     if mascot == 'gufetto':
         ellipse(194, 247, 53, 57, (255,255,255))
         ellipse(318, 247, 53, 57, (255,255,255))
-    ellipse(198, 247, 16, 24, dark)
-    ellipse(314, 247, 16, 24, dark)
-    ellipse(194, 239, 5, 7, (255,255,255))
-    ellipse(310, 239, 5, 7, (255,255,255))
-    ellipse(161, 292, 22, 13, peach)
-    ellipse(351, 292, 22, 13, peach)
+    ellipse(198, 247, 13, 17, dark)
+    ellipse(314, 247, 13, 17, dark)
+    ellipse(194, 243, 3, 4, (255,255,255))
+    ellipse(310, 243, 3, 4, (255,255,255))
+    rect(178, 219, 39, 5, dark)
+    rect(295, 219, 39, 5, dark)
     ellipse(256, 286, 17, 12, (229,148,55) if mascot in {'gufetto', 'pinguino'} else dark)
     rect(253, 297, 6, 18, dark)
-    ellipse(241, 313, 17, 5, dark)
-    ellipse(271, 313, 17, 5, dark)
+    rect(236, 313, 40, 3, dark)
     if mascot == 'gattino':
         rect(112, 276, 46, 4, dark)
         rect(111, 299, 46, 4, dark)
@@ -1407,8 +1406,8 @@ def profile_avatar(account_id, color, mascot="orsetto"):
     raw = b''.join(b'\x00' + pixels[row*size*3:(row+1)*size*3] for row in range(size))
     return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB',size,size,8,2,0,0,0)) + chunk(b'IDAT',zlib.compress(raw)) + chunk(b'IEND',b'')
 
-PROFILE_NAME_ROOTS = ("Nuv", "Zamp", "Lun", "Pium", "Neb", "Baff", "Zuff", "Brill", "Morb", "Tond", "Frull", "Puff", "Birb", "Mirt", "Fuf", "Dond", "Nimb", "Bubl", "Ruff", "Zig")
-PROFILE_NAME_ENDINGS = ("io", "ix", "etto", "ino", "olo", "ello", "ico", "ino", "otto", "u")
+PROFILE_NAME_ROOTS = ("Night", "Moon", "Star", "Dream", "Dawn", "Dusk", "Ash", "Wind", "Frost", "Void", "Rune", "Mist")
+PROFILE_NAME_ENDINGS = ("fall", "borne", "weave", "bound", "song", "shade", "spark", "glow", "stone", "watch")
 
 
 async def used_profile_identifiers():
@@ -1439,7 +1438,7 @@ async def generate_profile_identity(client, owner_id):
             if name is None:
                 raise ValueError("Nessun nuovo nome disponibile: amplia il generatore")
         names.add(name.casefold())
-        base = name.split()[0].lower()[:8]
+        base = (name.split()[0][:4] + name.split()[1][:4]).lower()
         # Username classici: lettere ASCII, numeri; minimo 5 caratteri.
         # Per questa funzione il target scelto e' 6–10 caratteri.
         for variant in range(3):
@@ -2914,7 +2913,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.8\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -6897,7 +6896,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.8 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7304,7 +7303,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.8 avviato"
+        "V4.9.9 avviato"
     )
 
     application.run_polling()
