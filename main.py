@@ -435,6 +435,13 @@ async def init_db():
             await db.execute("INSERT INTO settings(key, value) VALUES ('contacts_sessions_migrated', '1')")
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS welcome_deletions (
+                chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                delete_at REAL NOT NULL, PRIMARY KEY(chat_id, message_id)
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS welcome_sent (
                 chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
                 sent_at TEXT NOT NULL, message_id INTEGER NOT NULL,
@@ -6663,6 +6670,7 @@ async def post_init(
     global welcome_bot
     welcome_bot = application.bot
     await init_db()
+    await restore_welcome_deletions(application.bot)
     await init_session_features()
     await restore_removed_sessions()
     load_added_sessions()
@@ -6723,7 +6731,7 @@ async def post_shutdown(
 # BENVENUTO NUOVI MEMBRI GRUPPO B
 # =========================================================
 
-WELCOME_DELETE_SECONDS = 10 * 60
+WELCOME_DELETE_SECONDS = 30 * 60
 CHANNEL_URL = "https://t.me/bestprice_2026"
 
 
@@ -6746,12 +6754,32 @@ def _same_telegram_chat_id(a, b):
     return unmarked(a) == unmarked(b)
 
 
-async def _delete_welcome_later(bot, chat_id, message_id):
-    await asyncio.sleep(WELCOME_DELETE_SECONDS)
+def schedule_welcome_deletion(bot, chat_id, message_id, delete_at):
+    task = asyncio.create_task(_delete_welcome_later(bot, chat_id, message_id, delete_at))
+    welcome_tasks.add(task)
+    task.add_done_callback(welcome_tasks.discard)
+
+
+async def restore_welcome_deletions(bot):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT chat_id, message_id, delete_at FROM welcome_deletions")
+        rows = await cursor.fetchall()
+    for chat_id, message_id, delete_at in rows:
+        schedule_welcome_deletion(bot, chat_id, message_id, delete_at)
+
+
+async def _delete_welcome_later(bot, chat_id, message_id, delete_at):
+    await asyncio.sleep(max(0, delete_at - time.time()))
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception as e:
         logger.warning("Impossibile eliminare il benvenuto %s: %s", message_id, e)
+        await add_log(f"⚠️ Benvenuto {message_id} non eliminato nel gruppo {chat_id}: {type(e).__name__}", "WARNING", session_id=0)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM welcome_deletions WHERE chat_id=? AND message_id=?", (chat_id, message_id))
+        await db.commit()
+
 
 
 async def record_membership_event(message, chat, member, event):
@@ -6833,7 +6861,7 @@ async def send_welcome_once(bot, chat_id, member, origin, session_id=0):
                 "Se non desideri restare, premi il pulsante qui sotto: uscirai dal gruppo "
                 "e non verrai invitato di nuovo automaticamente."
             )
-            phase = "sendMessage nel gruppo con destinatario riservato"
+            phase = "sendMessage pubblico nel gruppo"
             sent = await bot.send_message(
                 chat_id=chat_id, text=text, parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -6841,17 +6869,22 @@ async def send_welcome_once(bot, chat_id, member, origin, session_id=0):
                     [InlineKeyboardButton("🔥 SCOPRI LE OFFERTE", url=CHANNEL_URL)],
                     [InlineKeyboardButton("🚪 NON DESIDERO RESTARE", callback_data=f"welcome_exit:{user_id}")],
                 ]),
-                api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": user_id}},
             )
-            phase = "registrazione del benvenuto già inviato"
+            delete_at = time.time() + WELCOME_DELETE_SECONDS
+            schedule_welcome_deletion(bot, chat_id, sent.message_id, delete_at)
+            phase = "registrazione del benvenuto e della scadenza"
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
                     "INSERT OR REPLACE INTO welcome_sent(chat_id, user_id, sent_at, message_id) VALUES (?, ?, ?, ?)",
                     (chat_id, user_id, now_it().isoformat(), sent.message_id),
                 )
+                await db.execute(
+                    "INSERT OR REPLACE INTO welcome_deletions(chat_id,message_id,delete_at) VALUES (?,?,?)",
+                    (chat_id, sent.message_id, delete_at),
+                )
                 await db.commit()
             await add_log(
-                f"👋 BENVENUTO RISERVATO INVIATO — ID {user_id} — {origin} — messaggio {sent.message_id}",
+                f"👋 BENVENUTO PUBBLICO INVIATO — cancellazione dopo 30 minuti — ID {user_id} — {origin} — messaggio {sent.message_id}",
                 session_id=session_id,
             )
             return True
@@ -6900,7 +6933,6 @@ async def welcome_exit(update, context):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="Non riesco a rimuovere il tuo account. Puoi uscire dal menu del gruppo. Non verrai invitato di nuovo.",
-                api_kwargs={"ephemeral_message_parameters": {"receiver_user_id": target, "callback_query_id": query.id}},
             )
         except Exception:
             logger.exception("Impossibile notificare l'errore di uscita")
