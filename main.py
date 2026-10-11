@@ -2578,10 +2578,16 @@ async def members_page_text(page):
     )
 
 
-def members_keyboard():
+async def members_keyboard():
+    total = await extracted_count() if state.get("group_a") else 0
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    current = max(0, min(state["member_page"], pages - 1))
+    state["member_page"] = current
+    previous_page = max(1, current)
+    next_page = min(pages, current + 2)
     return panel_markup([
-        [InlineKeyboardButton("◀️", callback_data="members_prev"),
-         InlineKeyboardButton("▶️", callback_data="members_next")],
+        [InlineKeyboardButton(f"◀️ {previous_page}", callback_data="members_prev" if current > 0 else "noop"),
+         InlineKeyboardButton(f"{next_page} ▶️", callback_data="members_next" if current + 1 < pages else "noop")],
         [InlineKeyboardButton("⚙️ Filtri e fonte", callback_data="member_filters")],
         [InlineKeyboardButton("🧹 Pulisci lista per gruppo B", callback_data="clean_members")],
         [InlineKeyboardButton("🔄 Estrai / aggiorna", callback_data="extract_members")],
@@ -2910,7 +2916,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.8\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.9\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -5223,9 +5229,9 @@ async def buttons(
                                      [(row[0], row[1]) for row in rows if row[1] not in kept_ids])
                 await db.commit()
             state["member_page"] = 0
-            await query.edit_message_text("🧹 PULIZIA COMPLETATA\n\n" + cleanup_report(diag) + f"\nRimasti nella lista: {len(kept)}", reply_markup=members_keyboard())
+            await query.edit_message_text("🧹 PULIZIA COMPLETATA\n\n" + cleanup_report(diag) + f"\nRimasti nella lista: {len(kept)}", reply_markup=await members_keyboard())
         except Exception as exc:
-            await query.edit_message_text("❌ Pulizia non completata — " + safe_connection_error(exc), reply_markup=members_keyboard())
+            await query.edit_message_text("❌ Pulizia non completata — " + safe_connection_error(exc), reply_markup=await members_keyboard())
         return
     if data == "member_filters" or data.startswith("member_filter:"):
         if operation_busy() or state["auto_enabled"]:
@@ -5702,7 +5708,7 @@ async def buttons(
 
         await query.edit_message_text(
             await members_page_text(0),
-            reply_markup=members_keyboard(),
+            reply_markup=await members_keyboard(),
         )
 
     # =====================================================
@@ -5823,7 +5829,7 @@ async def buttons(
 
         await query.edit_message_text(
             await members_page_text(0),
-            reply_markup=members_keyboard(),
+            reply_markup=await members_keyboard(),
         )
 
     elif data == "members_prev":
@@ -5835,7 +5841,7 @@ async def buttons(
 
         await query.edit_message_text(
             await members_page_text(page),
-            reply_markup=members_keyboard(),
+            reply_markup=await members_keyboard(),
         )
 
     elif data == "members_next":
@@ -5858,7 +5864,7 @@ async def buttons(
 
         await query.edit_message_text(
             await members_page_text(page),
-            reply_markup=members_keyboard(),
+            reply_markup=await members_keyboard(),
         )
 
     # =====================================================
@@ -6979,7 +6985,7 @@ async def export_members(message):
         )
         rows = await cursor.fetchall()
     if not rows:
-        await message.reply_text("Nessun membro da esportare. Premi prima Estrai / aggiorna.", reply_markup=members_keyboard())
+        await message.reply_text("Nessun membro da esportare. Premi prima Estrai / aggiorna.", reply_markup=await members_keyboard())
         return
     document = io.BytesIO(members_export_text(rows).encode("utf-8"))
     document.name = f"membri_gruppo_a_{now_it():%Y-%m-%d_%H%M%S}.txt"
@@ -7115,7 +7121,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.8 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.9 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7590,7 +7596,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.8 avviato"
+        "V4.9.9.9 avviato"
     )
 
     application.run_polling()
