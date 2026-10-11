@@ -75,10 +75,10 @@ def InlineKeyboardButton(text, *args, **kwargs):
     return TelegramInlineKeyboardButton(button_label(text), *args, **kwargs)
 
 
-def panel_markup(rows):
+def panel_markup(rows, include_invite_stop=True):
     """Lascia lo stop accessibile nei pannelli amministrativi."""
     rows = [list(row) for row in rows]
-    if operation_busy() or state["auto_enabled"]:
+    if include_invite_stop and (operation_busy() or state["auto_enabled"]):
         if not any(getattr(button, "callback_data", None) == "stop" for row in rows for button in row):
             rows.insert(0, [InlineKeyboardButton("🛑 Ferma inviti", callback_data="stop")])
     return InlineKeyboardMarkup(rows)
@@ -1244,8 +1244,9 @@ async def prepare_screen():
         lines += prepare_job.get("results", [])[-6:]
     rows = [[InlineKeyboardButton(f"👥 Seleziona sessioni ({len(slots)})", callback_data="prep:sessions")]]
     rows.append([InlineKeyboardButton("⚙️ Operazioni da eseguire", callback_data="prep:operations")])
-    rows.extend([[InlineKeyboardButton(f"⏱ Intervallo: {interval} minuti", callback_data="prep:interval")], [InlineKeyboardButton("▶️ Avvia preparazione", callback_data="prep:start"), InlineKeyboardButton("⏹ Interrompi", callback_data="prep:stop")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="prep:menu")], [InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")]])
-    return "\n".join(lines), panel_markup(rows)
+    preparing = prepare_task is not None and not prepare_task.done() and prepare_job.get("status") == "in corso"
+    rows.extend([[InlineKeyboardButton(f"⏱ Intervallo: {interval} minuti", callback_data="prep:interval")], [InlineKeyboardButton("⏹ Interrompi" if preparing else "▶️ Avvia preparazione", callback_data="prep:stop" if preparing else "prep:start")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="prep:menu")], [InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")]])
+    return "\n".join(lines), panel_markup(rows, include_invite_stop=False)
 
 async def prepare_profile(slot, owner):
     client = session_clients[slot]
@@ -1363,7 +1364,7 @@ async def prepare_action(update, context, data):
             suffix = " — non disponibile" if not session_info[slot]["ready"] else ""
             rows.append([InlineKeyboardButton(f"{icon} {session_button_name(slot)}{suffix}", callback_data=f"prep:session:{slot}")])
         rows.append([InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")])
-        await query.edit_message_text(f"👥 SELEZIONA SESSIONI\nSpunta gli account che ti interessano.\nSessioni selezionate: {len(slots)}", reply_markup=panel_markup(rows))
+        await query.edit_message_text(f"👥 SELEZIONA SESSIONI\nSpunta gli account che ti interessano.\nSessioni selezionate: {len(slots)}", reply_markup=panel_markup(rows, include_invite_stop=False))
         return True
     if data == "prep:operations" or data.startswith("prep:toggle:"):
         if data.startswith("prep:toggle:"):
@@ -1385,7 +1386,7 @@ async def prepare_action(update, context, data):
         messages_checked = await get_setting("prepare_messages_selected", "0") == "1"
         rows.insert(1, [InlineKeyboardButton(("✅ " if messages_checked else "⬜️ ") + "📨 Invia messaggi — disabilitato", callback_data="prep:toggle:messages")])
         rows.append([InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")])
-        await query.edit_message_text("⚙️ OPERAZIONI\nSpunta le operazioni da eseguire. Puoi selezionare profili, ingresso nel gruppo B oppure entrambe.\nInvio messaggi disabilitato.", reply_markup=panel_markup(rows))
+        await query.edit_message_text("⚙️ OPERAZIONI\nSpunta le operazioni da eseguire. Puoi selezionare profili, ingresso nel gruppo B oppure entrambe.\nInvio messaggi disabilitato.", reply_markup=panel_markup(rows, include_invite_stop=False))
         return True
     if data == "prep:stop":
         prepare_job["status"] = "interrotta"
@@ -1401,7 +1402,7 @@ async def prepare_action(update, context, data):
         if data == "prep:interval":
             rows = [[InlineKeyboardButton(f"{v} minuti", callback_data=f"prep:interval:{v}")] for v in [15,30,60,120,180,240,360,480]]
             rows.append([InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")])
-            await query.edit_message_text("Scegli l'intervallo tra le operazioni.", reply_markup=panel_markup(rows))
+            await query.edit_message_text("Scegli l'intervallo tra le operazioni.", reply_markup=panel_markup(rows, include_invite_stop=False))
             return True
         parts = data.split(":")
         if len(parts) == 3 and parts[1] == "interval" and parts[2].isdigit() and int(parts[2]) in [15,30,60,120,180,240,360,480]:
@@ -3159,7 +3160,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.15\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.17\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -7366,7 +7367,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.15 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.17 — " + session_info[state["active_session"]]["error"])
 
     await restore_prepare(application)
 
@@ -7843,7 +7844,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.15 avviato"
+        "V4.9.9.17 avviato"
     )
 
     application.run_polling()
