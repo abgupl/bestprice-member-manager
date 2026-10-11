@@ -666,12 +666,12 @@ async def load_settings():
 
     state["max_attempts"] = 3
 
-    state["interval_minutes"] = max(15, int(
+    state["interval_minutes"] = min(480, max(15, int(
         await get_setting(
             "interval_minutes",
-            "10",
+            "15",
         )
-    ))
+    )))
 
     state["contact_interval_minutes"] = int(
         await get_setting("contact_interval_minutes", "5")
@@ -2768,6 +2768,7 @@ def contacts_keyboard():
             InlineKeyboardButton("▶️", callback_data="contacts_next"),
         ],
         [InlineKeyboardButton("⚙️ FILTRI RUBRICA", callback_data="contact_filters")],
+        [InlineKeyboardButton("⏱ Pausa inviti rubrica", callback_data="set_invite_value:contact_interval_minutes")],
         [InlineKeyboardButton("📄 ESPORTA LISTA TXT", callback_data="contacts_export")],
         [InlineKeyboardButton("➕ AGGIUNGI CONTATTI", callback_data="contacts_add")],
         [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
@@ -2818,45 +2819,59 @@ def groups_keyboard():
 
 
 def invites_keyboard():
-    automatic_callback = ("noop" if state["telegram_locked"] else
-                          "auto_status_menu" if state["running"] or state["auto_enabled"] else "start_run")
     return panel_markup([
-        [InlineKeyboardButton("➕ Invito manuale", callback_data="manual_invite"),
-         InlineKeyboardButton("🤖 Automatico", callback_data=automatic_callback)],
-        [InlineKeyboardButton("📩 Invito con link", callback_data="link:menu")],
-        [InlineKeyboardButton("⚙️ Impostazioni", callback_data="invite_settings"),
-         InlineKeyboardButton("⬅️ Menu", callback_data="home")],
+        [InlineKeyboardButton("👤 Invito manuale", callback_data="manual_invite")],
+        [InlineKeyboardButton("🤖 Automatico", callback_data="auto_menu")],
+        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
     ])
+
+
+def automatic_keyboard():
+    rows = []
+    if state["running"] or state["auto_enabled"]:
+        if not state["running"]:
+            rows.append([InlineKeyboardButton("▶️ Avvia ora", callback_data="start_now")])
+        rows.append([InlineKeyboardButton("🛑 Ferma automatico", callback_data="auto_stop")])
+    else:
+        rows.append([InlineKeyboardButton("▶️ Avvia automatico", callback_data="start_run")])
+    rows.extend([
+        [InlineKeyboardButton("🕐 Orario di partenza", callback_data="set_start_time")],
+        [InlineKeyboardButton("🎯 Persone al giorno", callback_data="set_invite_value:daily_target")],
+        [InlineKeyboardButton("⏱ Pausa tra tentativi", callback_data="set_invite_value:interval_minutes")],
+        [InlineKeyboardButton("⬅️ Inviti", callback_data="menu_invites")],
+    ])
+    return panel_markup(rows)
 
 
 def invite_settings_keyboard():
-    return panel_markup([
-        [InlineKeyboardButton("🕐 Orario di partenza", callback_data="set_start_time")],
-        [InlineKeyboardButton("🎯 Persone al giorno", callback_data="set_invite_value:daily_target")],
-        [InlineKeyboardButton("⏱ Pausa automatico", callback_data="set_invite_value:interval_minutes")],
-        [InlineKeyboardButton("📒 Pausa rubrica", callback_data="set_invite_value:contact_interval_minutes")],
-        [InlineKeyboardButton("⬅️ Inviti", callback_data="menu_invites")],
-    ])
+    # Compatibilità con i vecchi callback: le impostazioni ora sono nel pannello AUTO.
+    return automatic_keyboard()
 
 
 INVITE_VALUE_RULES = {
     "daily_target": (1, 50, "PERSONE AL GIORNO", "persone"),
-    "interval_minutes": (15, 120, "PAUSA AUTOMATICO", "minuti"),
+    "interval_minutes": (15, 480, "PAUSA TRA TENTATIVI", "minuti"),
     "contact_interval_minutes": (1, 120, "PAUSA RUBRICA", "minuti"),
 }
 
 
 async def invites_text(settings=False):
+    if settings:
+        return await automatic_text()
     status = await selected_account_status(state["active_session"])
-    return (
-        ("⚙️ IMPOSTAZIONI INVITI\n\n" if settings else "📤 INVITI\n\n")
-        + f"📥 Destinazione: {group_label(state['group_b'])}\n\n"
-        + f"{status}\n"
-        + f"🕐 Partenza: {state['start_time']}\n"
-        + f"🎯 Obiettivo: {state['daily_target']} persone al giorno\n"
-        + f"⏱ Pausa automatico: {state['interval_minutes']} minuti\n"
-        + f"📒 Pausa inviti rubrica: {state['contact_interval_minutes']} minuti"
-    )
+    return ("📤 INVITI\n\n" + f"📥 Destinazione: {group_label(state['group_b'])}\n\n"
+            + status + "\n\nScegli Invito manuale oppure Automatico.")
+
+
+async def automatic_text():
+    status = "▶️ In esecuzione" if state["running"] else ("🕐 Programmato" if state["auto_enabled"] else "⏸ Disattivato")
+    return ("🤖 AUTOMATICO\n\n" + await selected_account_status(state["active_session"])
+            + f"\n\nStato AUTO: {status}"
+            + f"\n📥 Gruppo A: {group_label(state['group_a'])}"
+            + f"\n📤 Gruppo B: {group_label(state['group_b'])}"
+            + f"\n🕐 Orario di partenza: {state['start_time']}"
+            + f"\n🎯 Persone al giorno: {state['daily_target']}"
+            + f"\n⏱ Pausa tra tentativi: {state['interval_minutes']} minuti (massimo 480 = 8 ore)")
 
 
 def diagnostics_menu_keyboard():
@@ -2915,7 +2930,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.4\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.6\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -5039,7 +5054,7 @@ async def buttons(
         report = await refresh_sessions()
         await reply_long(query.message, report, await session_list_keyboard(), edit=True)
         return
-    if data in {"home", "sessions", "menu_invites", "menu_groups", "menu_diagnostics"}:
+    if data in {"home", "sessions", "menu_invites", "menu_groups", "menu_diagnostics", "auto_menu"}:
         for key in ("feature_input", "message_draft", "join_b_draft", "enable_session_pending", "link_consent_pending"):
             context.user_data.pop(key, None)
         state["waiting_for"] = None
@@ -5060,10 +5075,13 @@ async def buttons(
         if gate:
             await callback_notice(query, "🛑 " + gate)
             return
-    if data == "invite_settings":
+    if data in {"auto_menu", "invite_settings", "auto_status_menu"}:
         state["waiting_for"] = None
-        await query.edit_message_text(await invites_text(settings=True), reply_markup=invite_settings_keyboard())
+        await query.edit_message_text(await automatic_text(), reply_markup=automatic_keyboard())
         return
+    stopped_from_automatic = data == "auto_stop"
+    if stopped_from_automatic:
+        data = "stop"
     if data.startswith("set_invite_value:"):
         key = data.split(":", 1)[1]
         if key not in INVITE_VALUE_RULES:
@@ -5076,7 +5094,7 @@ async def buttons(
         await query.edit_message_text(
             f"⚙️ {title}\n\nValore attuale: {state[key]} {unit}.\n"
             f"Scrivi un numero intero da {minimum} a {maximum}.",
-            reply_markup=panel_markup([[InlineKeyboardButton("❌ Annulla", callback_data="invite_settings")]]),
+            reply_markup=panel_markup([[InlineKeyboardButton("❌ Annulla", callback_data="contacts" if key == "contact_interval_minutes" else "auto_menu")]]),
         )
         return
     if data.startswith("delete_session:"):
@@ -5369,7 +5387,7 @@ async def buttons(
             "Scrivi l'orario giornaliero nel formato HH:MM.\n"
             "Esempio: 09:00",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Annulla", callback_data="invite_settings")
+                InlineKeyboardButton("❌ Annulla", callback_data="auto_menu")
             ]]),
         )
 
@@ -5420,9 +5438,7 @@ async def buttons(
             > 15
         ):
 
-            state[
-                "interval_minutes"
-            ] -= 5
+            state["interval_minutes"] = max(15, state["interval_minutes"] - 5)
 
             await set_setting(
                 "interval_minutes",
@@ -5440,12 +5456,10 @@ async def buttons(
 
         if (
             state["interval_minutes"]
-            < 120
+            < 480
         ):
 
-            state[
-                "interval_minutes"
-            ] += 5
+            state["interval_minutes"] = min(480, state["interval_minutes"] + 5)
 
             await set_setting(
                 "interval_minutes",
@@ -5528,7 +5542,7 @@ async def buttons(
                 ),
                 InlineKeyboardButton(
                     "❌ ANNULLA",
-                    callback_data="home",
+                    callback_data="auto_menu",
                 ),
             ]]),
         )
@@ -5678,8 +5692,8 @@ async def buttons(
         )
 
         await query.edit_message_text(
-            await home_text(),
-            reply_markup=main_keyboard(),
+            await automatic_text() if stopped_from_automatic else await home_text(),
+            reply_markup=automatic_keyboard() if stopped_from_automatic else main_keyboard(),
         )
 
     # =====================================================
@@ -6333,7 +6347,10 @@ async def text_input(
         state["waiting_for"] = None
         await set_setting(key, state[key])
         await add_log(f"⚙️ {title} impostato: {state[key]} {unit}")
-        await update.message.reply_text(await invites_text(settings=True), reply_markup=invite_settings_keyboard())
+        if key == "contact_interval_minutes":
+            await update.message.reply_text(f"⏱ Pausa inviti rubrica: {state[key]} minuti\n\n" + await contacts_page_text(state["contact_page"]), reply_markup=contacts_keyboard())
+        else:
+            await update.message.reply_text(await automatic_text(), reply_markup=automatic_keyboard())
         return
 
     if target == "add_session_phone":
@@ -7077,7 +7094,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.4 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.6 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7552,7 +7569,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.4 avviato"
+        "V4.9.9.6 avviato"
     )
 
     application.run_polling()
