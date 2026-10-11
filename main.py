@@ -911,6 +911,62 @@ async def add_log(
     )
 
 
+def readable_log(message):
+    """Riepilogo soltanto; il testo originale resta nel database e nel TXT."""
+    if "🔌 Connessione iniziale" in message or "📥 EVENTO JOIN" in message:
+        return None
+    if "⚙️ Avvio V" in message:
+        message = re.sub(r"\[ACCOUNT [^\]]+\]\s*", "", message)
+        return "🖥 " + message.replace("⚙️ Avvio", "Bot avviato")
+    if "👋 BENVENUTO PUBBLICO INVIATO" in message:
+        member = re.search(r"ID (\d+)", message)
+        return "👋 Benvenuto pubblico inviato\n          Membro: " + (member.group(1) if member else "non indicato") + " · cancellazione dopo 30 minuti"
+    account = re.search(r"\[ACCOUNT [^\]]+\]", message)
+    heading = account.group(0).strip("[]") if account else "SISTEMA"
+    body = re.sub(r"\[ACCOUNT [^\]]+\]\s*", "", message)
+    errors = {
+        "PeerFloodError": ("🔴", "Limitazione Telegram", "Controlla @SpamBot; evita nuovi tentativi"),
+        "FloodWaitError": ("⏳", "Pausa richiesta da Telegram", "Attendi il termine della pausa indicata"),
+        "UserBannedInChannelError": ("🔴", "Account escluso o limitato nel gruppo", "Verifica accesso e restrizioni con gli amministratori"),
+        "ChatWriteForbiddenError": ("🟠", "Scrittura nel gruppo non consentita", "Verifica i permessi nel gruppo"),
+        "ChatAdminRequiredError": ("🟠", "Permessi amministrativi richiesti", "Verifica i permessi dell’account"),
+        "UsernamePurchaseAvailableError": ("🟠", "Username acquistabile", "Genera un altro username"),
+        "UsernameOccupiedError": ("🟠", "Username già occupato", "Genera un altro username"),
+        "UserPrivacyRestrictedError": ("🟡", "Privacy del destinatario", "Non ripetere l’invito allo stesso destinatario"),
+        "UserNotMutualContactError": ("🟡", "Contatto reciproco richiesto", "Verifica i requisiti del destinatario"),
+        "UserNotParticipantError": ("🟡", "Account non partecipante al gruppo", "Verifica l’accesso richiesto dall’operazione"),
+        "InviteRequestSentError": ("🟡", "Richiesta di ingresso in attesa", "Attendi l’approvazione"),
+        "TimeoutError": ("🟡", "Tempo di risposta scaduto; esito da verificare", "Verifica l’esito su Telegram prima di riprovare"),
+    }
+    matched = next((key for key in errors if key in body), None)
+    if matched:
+        icon, problem, action = errors[matched]
+        lower = body.casefold()
+        operation = ("Ingresso nel gruppo B" if "ingresso" in lower or "join" in lower else
+                     "Creazione profilo" if "profilo" in lower else
+                     "Verifica connessione" if "connessione" in lower or "ip fallita" in lower else
+                     "Invio messaggio" if "sendmessage" in lower or "messaggio" in lower else
+                     "Invito" if "invito" in lower or "invitetochannel" in lower or "manuale" in lower else "Operazione account")
+        lines = [f"{icon} {heading}", "Operazione: " + operation, f"Problema: {problem} — {matched}"]
+        # Riporta soltanto misure effettivamente descritte nel messaggio originale.
+        if any(x in lower for x in ("auto fermat", "auto blocc", "programmazione auto fermat", "ciclo e programmazione auto fermat")):
+            lines.append("Esito: AUTO fermato")
+        elif "inviti sospesi" in lower or "inviti bloccati" in lower:
+            lines.append("Esito: inviti sospesi")
+        duration = re.search(r"\b(\d+)\s*(?:seconds|secondi)\b", body, re.I)
+        if duration:
+            lines.append("Attesa indicata: " + next(x for x in duration.groups() if x) + " secondi")
+        lines.append("Azione: " + action)
+        return lines[0] + "\n          " + "\n          ".join(lines[1:])
+    if "VERIFICA IP FALLITA" in body:
+        return f"🟡 {heading}\n          Verifica IP non riuscita\n          " + body.split("VERIFICA IP FALLITA", 1)[1].lstrip(" —")[:180]
+    if "⚙️ PREPARAZIONE —" in body:
+        return "👤 " + heading + "\n          " + body.split("⚙️ PREPARAZIONE —", 1)[1].strip()[:350]
+    if "SPAMBOT" in body and ("UNKNOWN" in body or "NON DETERMINABILE" in body):
+        return f"🟡 {heading}\n          SpamBot: verifica inconcludente\n          I blocchi precedenti restano invariati"
+    return (heading + "\n          " if account else "") + body[:450]
+
+
 async def clear_logs():
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1321,6 +1377,7 @@ async def run_prepare(application):
                 prepare_job["next_at"] = 0
             await save_prepare_job()
         if prepare_job.get("status") == "completata":
+            await add_log("✅ PREPARAZIONE TERMINATA — " + str(prepare_job["index"]) + " operazioni elaborate; consulta i risultati per eventuali errori", session_id=0)
             try:
                 await application.bot.send_message(prepare_job["chat_id"], "✅ Preparazione sessioni completata. Apri Riscalda sessioni per il riepilogo.")
             except Exception:
@@ -1393,6 +1450,7 @@ async def prepare_action(update, context, data):
         if prepare_task and not prepare_task.done():
             prepare_task.cancel()
             await asyncio.gather(prepare_task, return_exceptions=True)
+        await add_log("⏹ PREPARAZIONE INTERROTTA — " + str(prepare_job.get("index", 0)) + "/" + str(len(prepare_job.get("steps", []))) + " operazioni elaborate", session_id=0)
         # Un'operazione interrotta può essere già riuscita su Telegram: non ripeterla.
         await save_prepare_job()
     elif data not in {"prep:menu", "prep:operations"}:
@@ -1419,6 +1477,7 @@ async def prepare_action(update, context, data):
                 return True
             prepare_job = {"status": "in corso", "index": 0, "steps": steps, "interval": interval, "next_at": 0, "inflight": False, "results": [], "group": dict(state["group_b"]) if state["group_b"] else None, "chat_id": update.effective_chat.id}
             await save_prepare_job()
+            await add_log("⚙️ PREPARAZIONE AVVIATA — account: " + ", ".join(str(i) for i in slots) + " — operazioni: " + ", ".join(actions) + f" — intervallo {interval} minuti", session_id=0)
             prepare_task = asyncio.create_task(run_prepare(context.application))
     text, markup = await prepare_screen()
     await query.edit_message_text(text, reply_markup=markup)
@@ -3160,7 +3219,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.17\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.18\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -5278,6 +5337,24 @@ async def buttons(
     data = query.data
     if await prepare_action(update, context, data):
         return
+    if data.startswith("logs_export:"):
+        if update.effective_chat.type != "private":
+            await callback_notice(query, "Esporta dalla chat privata con il bot.")
+            return
+        selected = data.split(":", 1)[1]
+        if selected not in {"all", *(str(i) for i in ACCOUNT_IDS)}:
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            if selected == "all":
+                cur = await db.execute("SELECT created_at,level,message FROM logs ORDER BY id")
+            else:
+                cur = await db.execute("SELECT created_at,level,message FROM logs WHERE session_id=? ORDER BY id", (int(selected),))
+            records = await cur.fetchall()
+        content = "\n".join(f"{stamp} | {level} | {message}" for stamp, level, message in records)
+        document = io.BytesIO((content or "Nessun evento.").encode("utf-8"))
+        document.name = f"log_completo_{selected}_{now_it().strftime('%Y%m%d_%H%M%S')}.txt"
+        await query.message.reply_document(document=document, caption="Log completo: testi originali e dettagli tecnici.")
+        return
     if data == "refresh_sessions":
         if operation_busy():
             await callback_notice(query, "Ferma le operazioni in corso prima di aggiornare le sessioni.")
@@ -6412,10 +6489,10 @@ async def buttons(
             return
         async with aiosqlite.connect(DB_PATH) as db:
             if selected_filter == "all":
-                cursor = await db.execute("SELECT created_at, message FROM logs ORDER BY id DESC LIMIT 20")
+                cursor = await db.execute("SELECT created_at, message FROM logs ORDER BY id DESC LIMIT 300")
             else:
                 cursor = await db.execute(
-                    "SELECT created_at, message FROM logs WHERE session_id = ? ORDER BY id DESC LIMIT 20",
+                    "SELECT created_at, message FROM logs WHERE session_id = ? ORDER BY id DESC LIMIT 300",
                     (int(selected_filter),),
                 )
             rows = await cursor.fetchall()
@@ -6428,19 +6505,25 @@ async def buttons(
                 stamp = dt.strftime("%d/%m/%Y %H:%M:%S %Z")
             except (ValueError, TypeError):
                 stamp = "--:--:--"
-            line = f"{stamp}  {message}"
-            if budget + len(line) + 1 > 3700:
+            formatted = readable_log(message)
+            if formatted is None:
+                continue
+            line = f"{stamp}  {formatted}"
+            if budget + len(line) + 2 > 3600:
                 break
             lines.append(line)
-            budget += len(line) + 1
+            budget += len(line) + 2
+            if len(lines) >= 20:
+                break
         title = "TUTTE LE SESSIONI" if selected_filter == "all" else f"ACCOUNT {selected_filter}"
         await query.edit_message_text(
-            f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n".join(reversed(lines)) or "Nessun evento."),
+            f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n\n".join(lines) or "Nessun evento."),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("TUTTE", callback_data="logs:all")],
                 *[[TelegramInlineKeyboardButton(f"{await session_status_color(i)} {session_button_name(i)}", callback_data=f"logs:{i}")
                    for i in ACCOUNT_IDS[start:start + 3]] for start in range(0, len(ACCOUNT_IDS), 3)],
                 [InlineKeyboardButton("🔄 Aggiorna", callback_data=f"logs:{selected_filter}")],
+                [InlineKeyboardButton("📄 Esporta log completo TXT", callback_data=f"logs_export:{selected_filter}")],
                 [InlineKeyboardButton("🗑 PULISCI TUTTI I LOG", callback_data="clear_logs_confirm")],
                 [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
             ]),
@@ -7367,7 +7450,8 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.17 — " + session_info[state["active_session"]]["error"])
+    failures = [f"ACCOUNT {i}: {session_info[i]['error']}" for i in ACCOUNT_IDS if not session_info[i]["ready"]]
+    await add_log(f"⚙️ Avvio V4.9.9.18 — {len(available)}/{len(ACCOUNT_IDS)} sessioni connesse" + (" — " + "; ".join(failures) if failures else ""), session_id=0)
 
     await restore_prepare(application)
 
@@ -7844,7 +7928,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.17 avviato"
+        "V4.9.9.18 avviato"
     )
 
     application.run_polling()
