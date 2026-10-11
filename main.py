@@ -2003,6 +2003,7 @@ async def resolve_group(value):
             "Gruppo",
         ),
         "input": value,
+        "username": getattr(entity, "username", None),
     }
 
 
@@ -2913,7 +2914,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.2\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.3\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -3563,6 +3564,42 @@ async def join_destination_once(account_id, reference, group):
         return "❌ " + safe_connection_error(exc)
 
 
+async def configured_public_group_reference(account_id, group):
+    """Recupera l'indirizzo pubblico del gruppo già configurato, senza ingresso."""
+    username = group.get("username")
+    if username:
+        return {"private": False, "value": "@" + username.lstrip("@")}
+    saved_input = str(group.get("input") or "").strip()
+    if saved_input and not saved_input.lstrip("-").isdigit():
+        reference = parse_join_reference(saved_input)
+        if not reference["private"]:
+            return reference
+    if welcome_bot is not None:
+        try:
+            group_id = int(group["id"])
+            chat_id = group_id if group_id < 0 else -1000000000000 - group_id
+            chat = await asyncio.wait_for(welcome_bot.get_chat(chat_id), timeout=8)
+            if _same_telegram_chat_id(chat.id, group["id"]) and getattr(chat, "username", None):
+                return {"private": False, "value": "@" + chat.username}
+        except Exception:
+            pass
+    # Un account già presente può conoscere lo username; gli access_hash
+    # delle altre sessioni non vengono riutilizzati.
+    slots = [account_id] + [i for i in ACCOUNT_IDS if i != account_id]
+    for slot in slots:
+        if not session_info[slot]["ready"]:
+            continue
+        try:
+            entity = await asyncio.wait_for(session_clients[slot].get_entity(int(group["id"])), timeout=5)
+            if _same_telegram_chat_id(entity.id, group["id"]) and getattr(entity, "username", None):
+                return {"private": False, "value": "@" + entity.username}
+        except FloodWaitError:
+            raise
+        except Exception:
+            continue
+    return None
+
+
 async def join_b_action(update, context, data):
     if not data.startswith("jb:"):
         return False
@@ -3575,10 +3612,30 @@ async def join_b_action(update, context, data):
         return True
     if data == "jb:setup":
         slot = state["active_session"]
-        context.user_data["join_b_draft"] = {"slot": slot, "owner": session_info[slot]["user_id"], "group": dict(state["group_b"])}
+        if not session_info[slot]["ready"]:
+            await callback_notice(query, "Verifica prima la connessione dell'account.")
+            return True
+        context.user_data.pop("join_b_draft", None)
+        context.user_data.pop("feature_input", None)
+        group = dict(state["group_b"])
+        await query.edit_message_text("🚪 Verifica del gruppo B configurato…\n" + session_label(slot))
+        try:
+            reference = await configured_public_group_reference(slot, group)
+            if reference is not None:
+                await query.edit_message_text("🚪 Ingresso nel gruppo B…\n" + session_label(slot))
+                outcome = await join_destination_once(slot, reference, group)
+                await add_log("🚪 Ingresso account nel gruppo B — " + outcome, session_id=slot)
+                result = await diagnose_destination(slot)
+                await reply_long(query.message, outcome + "\n\n" + format_destination_diagnosis(slot, result),
+                                 await session_card_keyboard(slot), edit=True)
+                return True
+        except Exception as exc:
+            await callback_notice(query, "Ingresso non completato — " + safe_connection_error(exc))
+            return True
+        context.user_data["join_b_draft"] = {"slot": slot, "owner": session_info[slot]["user_id"], "group": group}
         context.user_data["feature_input"] = "join_b_link"
         await query.edit_message_text("🚪 ENTRA NEL GRUPPO B\n" + session_label(slot) +
-            "\nIncolla il link d'invito o lo @username del gruppo B. L'ingresso riguarda soltanto questo account.",
+            "\nNon riesco a recuperare l'indirizzo pubblico del gruppo configurato. Inserisci il suo @username; se è privato, usa il link d'invito.",
             reply_markup=panel_markup([[InlineKeyboardButton("❌ Annulla", callback_data="sessions")]]))
     elif data.startswith("jb:confirm:"):
         pending = context.user_data.pop("join_b_draft", None)
@@ -7019,7 +7076,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.2 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.3 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7426,7 +7483,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.2 avviato"
+        "V4.9.9.3 avviato"
     )
 
     application.run_polling()
