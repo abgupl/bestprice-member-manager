@@ -320,7 +320,8 @@ class AdminPanelMessage:
         return await self._reply("reply_photo", *args, **kwargs)
 
     async def reply_document(self, *args, **kwargs):
-        return await self._reply("reply_document", *args, **kwargs)
+        # I file esportati restano nella chat anche quando si cambia pannello.
+        return await self._message.reply_document(*args, **kwargs)
 
     async def edit_text(self, *args, **kwargs):
         result = await self._message.edit_text(*args, **kwargs)
@@ -2578,36 +2579,15 @@ async def members_page_text(page):
 
 
 def members_keyboard():
-
     return panel_markup([
-        [InlineKeyboardButton("⚙️ FILTRI E FONTE", callback_data="member_filters")],
-        [InlineKeyboardButton("🧹 PULISCI LISTA PER GRUPPO B", callback_data="clean_members")],
-        [
-            InlineKeyboardButton(
-                "◀️",
-                callback_data="members_prev",
-            ),
-            InlineKeyboardButton(
-                "🔄 ESTRAI/AGGIORNA",
-                callback_data="extract_members",
-            ),
-            InlineKeyboardButton(
-                "▶️",
-                callback_data="members_next",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "➕ INVITA PER ID",
-                callback_data="manual_invite",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ INDIETRO",
-                callback_data="menu_groups",
-            )
-        ],
+        [InlineKeyboardButton("⚙️ Filtri e fonte", callback_data="member_filters")],
+        [InlineKeyboardButton("🧹 Pulisci lista per gruppo B", callback_data="clean_members")],
+        [InlineKeyboardButton("🔄 Estrai / aggiorna", callback_data="extract_members")],
+        [InlineKeyboardButton("◀️", callback_data="members_prev"),
+         InlineKeyboardButton("▶️", callback_data="members_next")],
+        [InlineKeyboardButton("📄 Esporta lista TXT", callback_data="members_export")],
+        [InlineKeyboardButton("➕ Invita per ID", callback_data="manual_invite")],
+        [InlineKeyboardButton("⬅️ Indietro", callback_data="menu_groups")],
     ])
 
 
@@ -2930,7 +2910,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.6\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.7\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -5206,6 +5186,12 @@ async def buttons(
         text, markup = await contact_filters_screen()
         await query.edit_message_text(text, reply_markup=markup)
         return
+    if data == "members_export":
+        if update.effective_chat.type != "private":
+            await callback_notice(query, "Esporta dalla chat privata con il bot.")
+            return
+        await export_members(query.message)
+        return
     if data == "contacts_export":
         if update.effective_chat.type != "private":
             await callback_notice(query, "Esporta dalla chat privata con il bot.")
@@ -6970,6 +6956,41 @@ async def start_login_service():
         login_server = None
 
 
+def members_export_text(rows):
+    lines = []
+    for index, (user_id, username, name) in enumerate(rows, 1):
+        username = "".join((username or "").split()).lstrip("@")
+        label = "@" + username if username else " ".join((name or "Senza nome").split())
+        lines.append(f"{index}. {label} — {user_id}")
+    return "\n".join(lines) + "\n"
+
+
+async def export_members(message):
+    group = state.get("group_a")
+    if not group:
+        await message.reply_text("Configura prima il gruppo A.", reply_markup=groups_keyboard())
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id, username, display_name FROM extracted_members WHERE source_id=? "
+            "ORDER BY CASE WHEN username IS NULL THEN 1 ELSE 0 END, "
+            "username COLLATE NOCASE, display_name COLLATE NOCASE, user_id",
+            (group["id"],),
+        )
+        rows = await cursor.fetchall()
+    if not rows:
+        await message.reply_text("Nessun membro da esportare. Premi prima Estrai / aggiorna.", reply_markup=members_keyboard())
+        return
+    document = io.BytesIO(members_export_text(rows).encode("utf-8"))
+    document.name = f"membri_gruppo_a_{now_it():%Y-%m-%d_%H%M%S}.txt"
+    await message.reply_document(
+        document=document, filename=document.name,
+        caption=f"👥 Membri gruppo A: {group['name']}\nTotale esportato: {len(rows)}\n"
+                "Lista completa salvata nell'ultima estrazione, con i filtri allora applicati e le eventuali pulizie successive.",
+    )
+    await add_log(f"📄 Membri gruppo A esportati: {len(rows)} — gruppo {group['id']}", session_id=0)
+
+
 async def export_contacts(message):
     account_id = current_session_id()
     condition = ""
@@ -7094,7 +7115,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.6 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.7 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7569,7 +7590,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.6 avviato"
+        "V4.9.9.7 avviato"
     )
 
     application.run_polling()
