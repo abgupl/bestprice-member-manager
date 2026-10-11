@@ -3219,7 +3219,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.18\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.19\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -6508,7 +6508,9 @@ async def buttons(
             formatted = readable_log(message)
             if formatted is None:
                 continue
-            line = f"{stamp}  {formatted}"
+            formatted = formatted.replace("\n          ", "\n")
+            formatted = formatted.replace(" — ", "\n").replace(" · ", "\n")
+            line = f"🕒 {stamp}\n{formatted}"
             if budget + len(line) + 2 > 3600:
                 break
             lines.append(line)
@@ -6517,7 +6519,7 @@ async def buttons(
                 break
         title = "TUTTE LE SESSIONI" if selected_filter == "all" else f"ACCOUNT {selected_filter}"
         await query.edit_message_text(
-            f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n\n".join(lines) or "Nessun evento."),
+            f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n\n".join(reversed(lines)) or "Nessun evento."),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("TUTTE", callback_data="logs:all")],
                 *[[TelegramInlineKeyboardButton(f"{await session_status_color(i)} {session_button_name(i)}", callback_data=f"logs:{i}")
@@ -7451,7 +7453,7 @@ async def post_init(
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
     failures = [f"ACCOUNT {i}: {session_info[i]['error']}" for i in ACCOUNT_IDS if not session_info[i]["ready"]]
-    await add_log(f"⚙️ Avvio V4.9.9.18 — {len(available)}/{len(ACCOUNT_IDS)} sessioni connesse" + (" — " + "; ".join(failures) if failures else ""), session_id=0)
+    await add_log(f"⚙️ Avvio V4.9.9.19 — {len(available)}/{len(ACCOUNT_IDS)} sessioni connesse" + (" — " + "; ".join(failures) if failures else ""), session_id=0)
 
     await restore_prepare(application)
 
@@ -7928,7 +7930,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.18 avviato"
+        "V4.9.9.19 avviato"
     )
 
     application.run_polling()
