@@ -1208,12 +1208,20 @@ PREP_MODES = {"profiles": "Solo profili", "join": "Solo ingresso nel gruppo B", 
 async def save_prepare_job():
     await set_setting("prepare_job", json.dumps(prepare_job))
 
+async def prepare_choices():
+    try:
+        selected = json.loads(await get_setting("prepare_selected", "{}"))
+        actions = json.loads(await get_setting("prepare_actions", '["profiles", "join"]'))
+    except (TypeError, ValueError):
+        selected, actions = {}, []
+    slots = [i for i in ACCOUNT_IDS if session_info[i]["ready"] and str(selected.get(str(i))) == str(session_info[i]["user_id"])]
+    return slots, [a for a in ("profiles", "join") if a in actions]
+
 async def prepare_screen():
-    count = int(await get_setting("prepare_count", "1"))
+    slots, actions = await prepare_choices()
     interval = int(await get_setting("prepare_interval", "60"))
-    mode = await get_setting("prepare_mode", "both")
-    slots = [i for i in ACCOUNT_IDS if session_info[i]["ready"]][:count]
-    lines = ["⚙️ PREPARA SESSIONI", "", "🎨 Crea i profili mancanti", "📨 Invio messaggi — non disponibile", "🚪 Entra nel gruppo B, se non già presente", "", f"Sessioni richieste: {count}", "Account: " + (", ".join(session_button_name(i) for i in slots) or "nessuno disponibile"), f"Operazioni: {PREP_MODES.get(mode, mode)}", f"Intervallo: {interval} minuti"]
+    labels = {"profiles": "🎨 Crea profili", "join": "🚪 Entra nel gruppo B"}
+    lines = ["⚙️ PREPARA SESSIONI", "", "Spunta gli account e le operazioni da eseguire.", "I profili già creati e gli account già nel gruppo B vengono saltati.", "📨 Invio messaggi — disabilitato", "", f"Sessioni selezionate: {len(slots)}", "Account: " + (", ".join(session_button_name(i) for i in slots) or "nessuno"), "Operazioni: " + (", ".join(labels[a] for a in actions) or "nessuna"), f"Intervallo: {interval} minuti"]
     if prepare_job:
         lines += ["", "Stato: " + prepare_job.get("status", ""), f"Avanzamento: {prepare_job.get('index', 0)}/{len(prepare_job.get('steps', []))}"]
         if prepare_job.get("current"):
@@ -1221,7 +1229,13 @@ async def prepare_screen():
         if prepare_job.get("next_at") and prepare_job.get("status") == "in corso":
             lines.append("Prossima operazione: " + datetime.fromtimestamp(prepare_job["next_at"], tz=now_it().tzinfo).strftime("%d/%m %H:%M"))
         lines += prepare_job.get("results", [])[-6:]
-    rows = [[InlineKeyboardButton(f"👥 Numero sessioni: {count}", callback_data="prep:count")], [InlineKeyboardButton("🎨 Crea profili", callback_data="prep:mode:profiles")], [InlineKeyboardButton("📨 Invia messaggi — disabilitato", callback_data="prep:disabled")], [InlineKeyboardButton("🚪 Entra nel gruppo B", callback_data="prep:mode:join")], [InlineKeyboardButton("⚙️ Entrambe le operazioni", callback_data="prep:mode:both")], [InlineKeyboardButton(f"⏱ Intervallo: {interval} minuti", callback_data="prep:interval")], [InlineKeyboardButton("▶️ Avvia preparazione", callback_data="prep:start"), InlineKeyboardButton("⏹ Interrompi", callback_data="prep:stop")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="prep:menu")], [InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")]]
+    rows = []
+    for slot in ACCOUNT_IDS:
+        icon = "☑️" if slot in slots else "⬜️"
+        suffix = " — non disponibile" if not session_info[slot]["ready"] else ""
+        rows.append([InlineKeyboardButton(f"{icon} {session_button_name(slot)}{suffix}", callback_data=f"prep:session:{slot}")])
+    rows.append([InlineKeyboardButton("⚙️ Operazioni da eseguire", callback_data="prep:operations")])
+    rows.extend([[InlineKeyboardButton(f"⏱ Intervallo: {interval} minuti", callback_data="prep:interval")], [InlineKeyboardButton("▶️ Avvia preparazione", callback_data="prep:start"), InlineKeyboardButton("⏹ Interrompi", callback_data="prep:stop")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="prep:menu")], [InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")]])
     return "\n".join(lines), panel_markup(rows)
 
 async def prepare_profile(slot, owner):
@@ -1321,6 +1335,28 @@ async def prepare_action(update, context, data):
     state["waiting_for"] = None
     for key in ("feature_input", "message_draft", "join_b_draft"):
         context.user_data.pop(key, None)
+    if data == "prep:operations" or data.startswith("prep:toggle:"):
+        if data.startswith("prep:toggle:"):
+            if operation_busy() or state["auto_enabled"]:
+                await callback_notice(query, "Interrompi le operazioni prima di cambiare la selezione.")
+                return True
+            _, actions = await prepare_choices()
+            action = data.split(":")[-1]
+            if action == "messages":
+                checked = await get_setting("prepare_messages_selected", "0") == "1"
+                await set_setting("prepare_messages_selected", "0" if checked else "1")
+            elif action in {"profiles", "join"}:
+                actions.remove(action) if action in actions else actions.append(action)
+                await set_setting("prepare_actions", json.dumps(actions))
+        _, actions = await prepare_choices()
+        rows = []
+        for action, label in (("profiles", "🎨 Crea profili"), ("join", "🚪 Entra nel gruppo B")):
+            rows.append([InlineKeyboardButton(("☑️ " if action in actions else "⬜️ ") + label, callback_data=f"prep:toggle:{action}")])
+        messages_checked = await get_setting("prepare_messages_selected", "0") == "1"
+        rows.insert(1, [InlineKeyboardButton(("☑️ " if messages_checked else "⬜️ ") + "📨 Invia messaggi — disabilitato", callback_data="prep:toggle:messages")])
+        rows.append([InlineKeyboardButton("⬅️ Prepara sessioni", callback_data="prep:menu")])
+        await query.edit_message_text("⚙️ OPERAZIONI\nSpunta le operazioni da eseguire. Puoi selezionare profili, ingresso nel gruppo B oppure entrambe.\nInvio messaggi disabilitato.", reply_markup=panel_markup(rows))
+        return True
     if data == "prep:stop":
         prepare_job["status"] = "interrotta"
         if prepare_task and not prepare_task.done():
@@ -1328,32 +1364,35 @@ async def prepare_action(update, context, data):
             await asyncio.gather(prepare_task, return_exceptions=True)
         # Un'operazione interrotta può essere già riuscita su Telegram: non ripeterla.
         await save_prepare_job()
-    elif data != "prep:menu":
+    elif data not in {"prep:menu", "prep:operations"}:
         if operation_busy() or state["auto_enabled"]:
             await callback_notice(query, "Interrompi le operazioni e disattiva AUTO prima di modificare o avviare la preparazione.")
             return True
-        if data in {"prep:count", "prep:interval"}:
-            values = list(range(1, len(ACCOUNT_IDS)+1)) if data.endswith("count") else [15,30,60,120,180,240,360,480]
-            key = "count" if data.endswith("count") else "interval"
-            rows = [[InlineKeyboardButton(str(v) + (" minuti" if key == "interval" else " sessioni"), callback_data=f"prep:{key}:{v}")] for v in values]
+        if data == "prep:interval":
+            rows = [[InlineKeyboardButton(f"{v} minuti", callback_data=f"prep:interval:{v}")] for v in [15,30,60,120,180,240,360,480]]
             rows.append([InlineKeyboardButton("⬅️ Prepara sessioni", callback_data="prep:menu")])
-            await query.edit_message_text("Scegli il numero di sessioni." if key == "count" else "Scegli l'intervallo tra le operazioni.", reply_markup=panel_markup(rows))
+            await query.edit_message_text("Scegli l'intervallo tra le operazioni.", reply_markup=panel_markup(rows))
             return True
         parts = data.split(":")
-        if len(parts) == 3 and parts[1] in {"count", "interval", "mode"}:
-            key, value = parts[1:]
-            valid = value in PREP_MODES if key == "mode" else value.isdigit() and (1 <= int(value) <= len(ACCOUNT_IDS) if key == "count" else int(value) in [15,30,60,120,180,240,360,480])
-            if valid:
-                await set_setting("prepare_" + key, value)
+        if len(parts) == 3 and parts[1] == "session" and parts[2].isdigit():
+            slot = int(parts[2])
+            if slot not in ACCOUNT_IDS or not session_info[slot]["ready"]:
+                await callback_notice(query, "Sessione non disponibile: verifica la connessione.")
+                return True
+            slots, _ = await prepare_choices()
+            if slot in slots:
+                slots.remove(slot)
+            else:
+                slots.append(slot)
+            await set_setting("prepare_selected", json.dumps({str(i): session_info[i]["user_id"] for i in slots}))
+        elif len(parts) == 3 and parts[1] == "interval" and parts[2].isdigit() and int(parts[2]) in [15,30,60,120,180,240,360,480]:
+            await set_setting("prepare_interval", parts[2])
         elif data == "prep:start":
-            count = int(await get_setting("prepare_count", "1"))
-            mode = await get_setting("prepare_mode", "both")
-            slots = [i for i in ACCOUNT_IDS if session_info[i]["ready"]][:count]
-            if len(slots) != count or mode not in PREP_MODES or (mode != "profiles" and not state["group_b"]):
-                await callback_notice(query, "Servono tutte le sessioni richieste connesse e, per l'ingresso, il gruppo B configurato.")
+            slots, actions = await prepare_choices()
+            if not slots or not actions or ("join" in actions and not state["group_b"]):
+                await callback_notice(query, "Spunta almeno una sessione e un’operazione; configura il gruppo B per l’ingresso.")
                 return True
             interval = int(await get_setting("prepare_interval", "60"))
-            actions = ["profiles", "join"] if mode == "both" else [mode]
             steps = [{"slot": i, "owner": session_info[i]["user_id"], "action": a} for i in slots for a in actions]
             if (len(steps) - 1) * interval > 48 * 60:
                 await callback_notice(query, "Questa combinazione supera le 48 ore: riduci l’intervallo o il numero di sessioni.")
@@ -3101,7 +3140,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.10\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.12\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -7308,7 +7347,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.10 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.12 — " + session_info[state["active_session"]]["error"])
 
     await restore_prepare(application)
 
@@ -7785,7 +7824,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.10 avviato"
+        "V4.9.9.12 avviato"
     )
 
     application.run_polling()
