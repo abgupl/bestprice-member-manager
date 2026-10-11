@@ -1199,9 +1199,7 @@ async def sessions_text():
 
 def sessions_keyboard():
     return panel_markup([
-        [InlineKeyboardButton("🔄 Verifica e aggiorna sessioni", callback_data="refresh_sessions")],
         [InlineKeyboardButton("📋 Seleziona sessione", callback_data="sf:list")],
-        [InlineKeyboardButton("🔎 Verifica tutte", callback_data="sf:all")],
         [InlineKeyboardButton("🧪 Test messaggio", callback_data="msg:setup")],
         [InlineKeyboardButton("➕ Aggiungi sessione", callback_data="add_session")],
         [InlineKeyboardButton("⬅️ Menu", callback_data="home")],
@@ -1214,6 +1212,7 @@ async def session_list_keyboard():
         record = await registry_for(slot)
         icon = await session_status_color(slot, record)
         rows.append([TelegramInlineKeyboardButton(f"{icon} {session_button_name(slot)}", callback_data=f"select_session:{slot}")])
+    rows.append([InlineKeyboardButton("🔄 Verifica e aggiorna sessioni", callback_data="refresh_sessions")])
     rows.append([InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")])
     return panel_markup(rows)
 
@@ -1273,6 +1272,7 @@ async def account_management_keyboard(account_id):
     remaining = wait_remaining(record)
     info = session_info[account_id]
     rows = [[InlineKeyboardButton("🔌 Verifica connessione e SpamBot", callback_data=f"check_session:{account_id}")],
+            [InlineKeyboardButton("📨 Messaggi ricevuti", callback_data=f"inbox:list:{account_id}:0")],
             [InlineKeyboardButton("🎲 Genera profilo", callback_data=f"profile_new:{account_id}")]]
     if remaining is None and info["user_id"]:
         rows.append([InlineKeyboardButton("⏳ Inizia attesa", callback_data="sf:age")])
@@ -2913,7 +2913,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.2\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -3253,11 +3253,144 @@ async def reply_long(message, text, markup=None, edit=False):
         cut = cut if cut > 0 else 3500
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
-    for index, chunk in enumerate(chunks or ["Nessun risultato"]):
+    chunks = chunks or ["Nessun risultato"]
+    for index, chunk in enumerate(chunks):
+        keyboard = markup if index == len(chunks) - 1 else None
         if edit and index == 0:
-            await message.edit_text(chunk, reply_markup=markup)
+            await message.edit_text(chunk, reply_markup=keyboard, parse_mode=None)
         else:
-            await message.reply_text(chunk, reply_markup=markup)
+            await message.reply_text(chunk, reply_markup=keyboard, parse_mode=None)
+
+
+INBOX_PAGE_SIZE = 10
+INBOX_DIALOG_LIMIT = 100
+INBOX_CACHE_SECONDS = 10 * 60
+
+
+def inbox_message_preview(message, limit=160):
+    text = (getattr(message, "message", None) or "").strip()
+    kind = ""
+    if getattr(message, "photo", None):
+        kind = "📷 Foto"
+    elif getattr(message, "voice", None):
+        kind = "🎤 Messaggio vocale"
+    elif getattr(message, "video", None):
+        kind = "🎬 Video"
+    elif getattr(message, "audio", None):
+        kind = "🎵 Audio"
+    elif getattr(message, "sticker", None):
+        kind = "🎨 Sticker"
+    elif getattr(message, "document", None):
+        kind = "📎 Documento"
+    elif getattr(message, "media", None):
+        kind = "📎 Contenuto multimediale"
+    elif getattr(message, "action", None):
+        kind = "ℹ️ Evento della chat"
+    value = (kind + (" — " if kind and text else "") + text) or "Messaggio senza testo"
+    return value if len(value) <= limit else value[:limit] + "… [testo abbreviato]"
+
+
+def inbox_message_date(message):
+    stamp = getattr(message, "date", None)
+    if stamp is None:
+        return "data non disponibile"
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=ZoneInfo("UTC"))
+    return stamp.astimezone(ITALY_TZ).strftime("%d/%m %H:%M")
+
+
+async def inbox_action(update, context, data):
+    if not data.startswith("inbox:"):
+        return False
+    query = update.callback_query
+    if not is_admin(update) or update.effective_chat.type != "private":
+        await callback_notice(query, "Apri Messaggi ricevuti nella tua chat privata con il bot.")
+        return True
+    try:
+        parts = data.split(":")
+        action = parts[1]
+        if action == "list":
+            slot, page = int(parts[2]), max(0, int(parts[3]))
+            owner = session_info.get(slot, {}).get("user_id")
+            if slot != state["active_session"] or not owner or not session_info[slot]["ready"]:
+                raise ValueError("Sessione cambiata o disconnessa: riapri Gestisci account.")
+            client = session_clients[slot]
+            await query.edit_message_text("📨 Caricamento chat…\n" + session_label(slot))
+            dialogs = list(await asyncio.wait_for(client.get_dialogs(limit=INBOX_DIALOG_LIMIT), timeout=30))
+            # Ordine cronologico, anche per le chat fissate in alto nell'app.
+            dialogs.sort(key=lambda d: getattr(getattr(d, "message", None), "date", None).timestamp()
+                         if getattr(getattr(d, "message", None), "date", None) else 0, reverse=True)
+            # Gli avvisi di accesso dell'account Telegram non sono una casella messaggi ordinaria.
+            dialogs = [d for d in dialogs if getattr(d.entity, "id", None) != 777000]
+            total = len(dialogs)
+            page = min(page, max(0, (total - 1) // INBOX_PAGE_SIZE))
+            shown = dialogs[page * INBOX_PAGE_SIZE:(page + 1) * INBOX_PAGE_SIZE]
+            cache = context.user_data.setdefault("inbox_chats", {})
+            now = time.time()
+            for key in list(cache):
+                if now - cache[key]["created_at"] > INBOX_CACHE_SECONDS:
+                    del cache[key]
+            lines = ["📨 MESSAGGI RICEVUTI", session_label(slot),
+                     f"Pagina {page + 1} — ultime {total} chat disponibili (massimo {INBOX_DIALOG_LIMIT}).", ""]
+            rows = []
+            for dialog in shown:
+                title = str(dialog.name or "Chat senza nome")[:70]
+                entity = dialog.entity
+                username = getattr(entity, "username", None)
+                recent = await asyncio.wait_for(client.get_messages(dialog.input_entity, limit=20), timeout=15)
+                received = next((m for m in recent if not getattr(m, "out", False) and not getattr(m, "action", None)), None)
+                unread = int(getattr(dialog, "unread_count", 0) or 0)
+                lines.extend([title + (" · @" + username if username else ""), f"Non letti: {unread}",
+                              (inbox_message_date(received) + " — " + inbox_message_preview(received))
+                              if received else "Nessun messaggio ricevuto negli ultimi 20.", ""])
+                token = secrets.token_hex(6)
+                cache[token] = {"slot": slot, "owner": owner, "peer": dialog.input_entity,
+                                "title": title, "page": page, "created_at": now}
+                rows.append([InlineKeyboardButton(f"{'📩' if unread else '💬'} {title[:40]}", callback_data=f"inbox:chat:{token}:0")])
+            if not shown:
+                lines.append("Nessuna conversazione disponibile.")
+            nav = []
+            if page:
+                nav.append(InlineKeyboardButton("⬅️ Precedenti", callback_data=f"inbox:list:{slot}:{page-1}"))
+            if (page + 1) * INBOX_PAGE_SIZE < total:
+                nav.append(InlineKeyboardButton("Successive ➡️", callback_data=f"inbox:list:{slot}:{page+1}"))
+            if nav:
+                rows.append(nav)
+            rows.extend([[InlineKeyboardButton("🔄 Aggiorna", callback_data=f"inbox:list:{slot}:{page}")],
+                         [InlineKeyboardButton("⬅️ Gestisci account", callback_data="sf:manage")]])
+            await reply_long(query.message, "\n".join(lines), panel_markup(rows), edit=True)
+        elif action == "chat":
+            token, offset = parts[2], max(0, int(parts[3]))
+            entry = context.user_data.get("inbox_chats", {}).get(token)
+            if not entry or time.time() - entry["created_at"] > INBOX_CACHE_SECONDS:
+                raise ValueError("Elenco scaduto: riapri Messaggi ricevuti.")
+            slot = entry["slot"]
+            if slot != state["active_session"] or session_info.get(slot, {}).get("user_id") != entry["owner"] or not session_info[slot]["ready"]:
+                raise ValueError("Account cambiato o disconnesso: riapri Messaggi ricevuti.")
+            await query.edit_message_text("📨 Lettura della conversazione…\n" + session_label(slot))
+            messages = list(await asyncio.wait_for(session_clients[slot].get_messages(entry["peer"], limit=20, offset_id=offset), timeout=20))
+            lines = ["📨 " + entry["title"], session_label(slot), "Ultimi 20 messaggi" if not offset else "Messaggi precedenti", ""]
+            for message in reversed(messages):
+                direction = "📤 Inviato" if getattr(message, "out", False) else "📥 Ricevuto"
+                sender = getattr(message, "sender_id", None)
+                lines.extend([direction + " · " + inbox_message_date(message) + (f" · ID {sender}" if sender else ""),
+                              inbox_message_preview(message, 1200), ""])
+            if not messages:
+                lines.append("Nessun messaggio disponibile.")
+            lines.append("Consultazione senza risposte e senza segnare i messaggi come letti.")
+            rows = [[InlineKeyboardButton("🔄 Ultimi messaggi", callback_data=f"inbox:chat:{token}:0")]]
+            if len(messages) == 20:
+                rows.append([InlineKeyboardButton("⬅️ 20 precedenti", callback_data=f"inbox:chat:{token}:{min(m.id for m in messages)}")])
+            rows.extend([[InlineKeyboardButton("⬅️ Altre chat", callback_data=f"inbox:list:{slot}:{entry['page']}")],
+                         [InlineKeyboardButton("⬅️ Gestisci account", callback_data="sf:manage")]])
+            await reply_long(query.message, "\n".join(lines), panel_markup(rows), edit=True)
+        else:
+            raise ValueError("Pulsante messaggi non valido.")
+    except FloodWaitError as exc:
+        await callback_notice(query, f"Telegram richiede una pausa di {exc.seconds} secondi prima di leggere nuovamente.")
+    except Exception as exc:
+        await callback_notice(query, "Lettura non completata — " + safe_connection_error(exc))
+    return True
 
 
 async def session_features_action(update, context, data):
@@ -4846,14 +4979,16 @@ async def buttons(
             return
         await query.edit_message_text("🔄 Verifica delle sessioni in corso… AUTO verrà disattivato.")
         report = await refresh_sessions()
-        await reply_long(query.message, report, sessions_keyboard(), edit=True)
+        await reply_long(query.message, report, await session_list_keyboard(), edit=True)
         return
     if data in {"home", "sessions", "menu_invites", "menu_groups", "menu_diagnostics"}:
         for key in ("feature_input", "message_draft", "join_b_draft", "enable_session_pending", "link_consent_pending"):
             context.user_data.pop(key, None)
         state["waiting_for"] = None
-    if data.startswith(("sf:", "jb:", "msg:", "link:")):
+    if data.startswith(("sf:", "jb:", "msg:", "link:", "inbox:")):
         state["waiting_for"] = None
+    if await inbox_action(update, context, data):
+        return
     if await session_features_action(update, context, data):
         return
     if await join_b_action(update, context, data):
@@ -5092,19 +5227,7 @@ async def buttons(
                       session_id=account_id)
         await query_spambot(account_id)
         report = await session_diagnostic_text(account_id)
-        # Mantiene tutte le informazioni anche quando il report supera il limite Telegram.
-        chunks = []
-        current = ""
-        for line in report.splitlines():
-            if len(current) + len(line) + 1 > 3800:
-                chunks.append(current)
-                current = ""
-            current += line + "\n"
-        if current:
-            chunks.append(current)
-        await query.edit_message_text(chunks[0], reply_markup=diagnostic_keyboard())
-        for chunk in chunks[1:]:
-            await query.message.reply_text(chunk, reply_markup=diagnostic_keyboard())
+        await reply_long(query.message, report, diagnostic_keyboard(), edit=True)
         return
     if data.startswith("unlock:"):
         if data != f"unlock:{state['active_session']}":
@@ -6896,7 +7019,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.2 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7303,7 +7426,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9 avviato"
+        "V4.9.9.2 avviato"
     )
 
     application.run_polling()
