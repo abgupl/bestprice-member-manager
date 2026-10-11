@@ -265,15 +265,112 @@ def pinned_session(func):
     return wrapped
 
 
+async def delete_admin_panel_message(bot, chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as exc:
+        logger.info("Pannello precedente non eliminato (%s): %s", message_id, type(exc).__name__)
+
+
+class AdminPanelRender:
+    """Raggruppa i messaggi di una schermata per rimuoverli alla navigazione."""
+    def __init__(self, query, context):
+        self.query = query
+        self.context = context
+        self.source = query.message
+        self.sent_ids = []
+        self.edited = False
+
+    async def finish(self):
+        if not self.source or not (self.edited or self.sent_ids):
+            return
+        chat_id = self.source.chat.id
+        source_id = self.source.message_id
+        previous = self.context.user_data.get("admin_panel_messages", [])
+        keep = set(self.sent_ids)
+        if self.edited:
+            keep.add(source_id)
+        # Non elimina nulla finché la nuova schermata non è stata prodotta.
+        for old_chat, old_id in previous:
+            if old_chat == chat_id and old_id not in keep:
+                await delete_admin_panel_message(self.context.bot, old_chat, old_id)
+        if not self.edited and not any(c == chat_id and m == source_id for c, m in previous):
+            await delete_admin_panel_message(self.context.bot, chat_id, source_id)
+        self.context.user_data["admin_panel_messages"] = [(chat_id, i) for i in sorted(keep)]
+
+
+class AdminPanelMessage:
+    def __init__(self, message, render):
+        self._message = message
+        self._render = render
+
+    def __getattr__(self, name):
+        return getattr(self._message, name)
+
+    async def _reply(self, method, *args, **kwargs):
+        sent = await getattr(self._message, method)(*args, **kwargs)
+        self._render.sent_ids.append(sent.message_id)
+        return sent
+
+    async def reply_text(self, *args, **kwargs):
+        return await self._reply("reply_text", *args, **kwargs)
+
+    async def reply_photo(self, *args, **kwargs):
+        return await self._reply("reply_photo", *args, **kwargs)
+
+    async def reply_document(self, *args, **kwargs):
+        return await self._reply("reply_document", *args, **kwargs)
+
+    async def edit_text(self, *args, **kwargs):
+        result = await self._message.edit_text(*args, **kwargs)
+        self._render.edited = True
+        return result
+
+
+class AdminPanelQuery:
+    def __init__(self, query, render):
+        self._query = query
+        self._render = render
+        self.message = AdminPanelMessage(query.message, render)
+
+    def __getattr__(self, name):
+        return getattr(self._query, name)
+
+    async def edit_message_text(self, *args, **kwargs):
+        result = await self._query.edit_message_text(*args, **kwargs)
+        self._render.edited = True
+        return result
+
+
+class AdminPanelUpdate:
+    def __init__(self, update, render):
+        self._update = update
+        self.callback_query = AdminPanelQuery(update.callback_query, render)
+
+    def __getattr__(self, name):
+        return getattr(self._update, name)
+
+
 def serialized_control(func):
     @wraps(func)
     async def wrapped(*args, **kwargs):
         async with control_lock:
             token = session_context.set(state["active_session"])
+            render = None
+            call_args = args
+            if args and getattr(args[0], "callback_query", None) and is_admin(args[0]):
+                query = args[0].callback_query
+                if query.message is not None:
+                    render = AdminPanelRender(query, args[1])
+                    call_args = (AdminPanelUpdate(args[0], render),) + args[1:]
             try:
-                return await func(*args, **kwargs)
+                return await func(*call_args, **kwargs)
             finally:
-                session_context.reset(token)
+                try:
+                    if render is not None:
+                        await render.finish()
+                finally:
+                    session_context.reset(token)
     return wrapped
 
 
@@ -1102,6 +1199,7 @@ async def sessions_text():
 
 def sessions_keyboard():
     return panel_markup([
+        [InlineKeyboardButton("🔄 Verifica e aggiorna sessioni", callback_data="refresh_sessions")],
         [InlineKeyboardButton("📋 Seleziona sessione", callback_data="sf:list")],
         [InlineKeyboardButton("🔎 Verifica tutte", callback_data="sf:all")],
         [InlineKeyboardButton("🧪 Test messaggio", callback_data="msg:setup")],
@@ -2655,7 +2753,6 @@ def group_label(group):
 def main_keyboard():
     return panel_markup([
         [InlineKeyboardButton("👥 Gestione sessioni", callback_data="sessions")],
-        [InlineKeyboardButton("🔄 Verifica e aggiorna sessioni", callback_data="refresh_sessions")],
         [InlineKeyboardButton("👥 Gruppi e membri", callback_data="menu_groups")],
         [InlineKeyboardButton("📒 Rubrica", callback_data="contacts")],
         [InlineKeyboardButton("📤 Inviti", callback_data="menu_invites")],
@@ -2770,7 +2867,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.6\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.7\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -4655,10 +4752,14 @@ async def start(
         await public_invite_start(update, context)
         return
 
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         await home_text(),
         reply_markup=main_keyboard(),
     )
+    for chat_id, message_id in context.user_data.get("admin_panel_messages", []):
+        if chat_id == sent.chat.id:
+            await delete_admin_panel_message(context.bot, chat_id, message_id)
+    context.user_data["admin_panel_messages"] = [(sent.chat.id, sent.message_id)]
 
 
 # =========================================================
@@ -4699,8 +4800,7 @@ async def buttons(
             return
         await query.edit_message_text("🔄 Verifica delle sessioni in corso… AUTO verrà disattivato.")
         report = await refresh_sessions()
-        await reply_long(query.message, report, main_keyboard(), edit=True)
-        await query.message.reply_text(await home_text(), reply_markup=main_keyboard())
+        await reply_long(query.message, report, sessions_keyboard(), edit=True)
         return
     if data in {"home", "sessions", "menu_invites", "menu_groups", "menu_diagnostics"}:
         for key in ("feature_input", "message_draft", "join_b_draft", "enable_session_pending", "link_consent_pending"):
@@ -6750,7 +6850,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.6 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.7 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7157,7 +7257,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.6 avviato"
+        "V4.9.7 avviato"
     )
 
     application.run_polling()
