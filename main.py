@@ -4,6 +4,7 @@ import logging
 import math
 import re
 import html
+import unicodedata
 import json
 import secrets
 import io
@@ -2914,7 +2915,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.3\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.4\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -7076,7 +7077,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.3 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.4 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7380,8 +7381,75 @@ def _message_contains_link(message):
     return bool(content and _LINK_RE.search(content))
 
 
+# Parole complete: evita falsi positivi come "successo" o "classico".
+_CHAT_BAD_WORDS = (
+    "cazzo", "cazzi", "cazzata", "cazzate", "cazzone", "cazzoni", "cazzuto",
+    "incazzato", "incazzata", "incazzati", "incazzate", "incazzare",
+    "vaffanculo", "fanculo", "affanculo", "merda", "merde", "merdoso", "merdosa",
+    "stronzo", "stronza", "stronzi", "stronze", "stronzata", "stronzate",
+    "coglione", "cogliona", "coglioni", "coglionata", "coglionate",
+    "minchia", "minchione", "minchioni", "minchiata", "minchiate",
+    "puttana", "puttane", "puttanata", "puttanate", "troia", "troie",
+    "bastardo", "bastarda", "bastardi", "bastarde", "cretino", "cretina", "cretini", "cretine",
+    "ricchione", "ricchioni", "frocio", "froci", "fottiti", "fottere",
+    "fottuto", "fottuta", "fottuti", "fottute",
+    "fuck", "fucking", "fucker", "motherfucker", "shit", "bullshit", "bitch", "bitches", "asshole",
+)
+_CHAT_EXPLICIT_WORDS = (
+    "sesso", "sessuale", "sessuali", "sessualmente", "sex", "sexy", "sexting",
+    "porno", "porn", "pornografia", "pornografico", "pornografica", "pornografici", "pornografiche",
+    "erotico", "erotica", "erotici", "erotiche", "erotismo", "hardcore", "onlyfans",
+    "scopare", "scopata", "scopate", "scopami", "scopiamo", "trombare", "trombata", "trombate",
+    "pompino", "pompini", "pompinara", "segaiolo",
+    "masturbazione", "masturbare", "masturbarsi", "orgasmo", "orgasmi",
+    "sborra", "sborrare", "sborrata", "sborrate", "sborro", "sborri",
+    "figa", "fighe", "fica", "fregna", "cock", "dick", "pussy", "blowjob", "handjob",
+    "escort", "prostituta", "prostitute", "prostituzione", "nudes", "naked",
+)
+_CHAT_BLOCKED_PHRASES = (
+    "porco dio", "porca madonna", "dio cane", "dio porco", "figlio di puttana",
+    "figlia di puttana", "testa di cazzo", "pezzo di merda", "vai a cagare",
+    "foto intime", "foto hot", "video hot", "chat hot", "chat erotica", "incontri sessuali",
+    "send nudes", "sex chat", "farsi una sega", "faccio una sega", "fai una sega",
+    "sei un finocchio",
+)
+
+
+def normalize_chat_content(content):
+    content = unicodedata.normalize("NFKD", content.casefold())
+    content = "".join(c for c in content if unicodedata.category(c) not in {"Mn", "Cf"})
+    return content.translate(str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t"}))
+
+
+def blocked_word_pattern(words):
+    # Gestisce punti, asterischi e lettere separate (es. c.a.z.z.o).
+    patterns = []
+    for word in sorted(set(words), key=len, reverse=True):
+        patterns.append(r"[\W_]*".join(re.escape(c) for c in word))
+    return re.compile(r"(?<!\w)(?:" + "|".join(patterns) + r")(?!\w)")
+
+
+_CHAT_BAD_RE = blocked_word_pattern(_CHAT_BAD_WORDS)
+_CHAT_EXPLICIT_RE = blocked_word_pattern(_CHAT_EXPLICIT_WORDS)
+_CHAT_PHRASES_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(r"[\W_]*".join(re.escape(c) for c in phrase.replace(" ", ""))
+                             for phrase in _CHAT_BLOCKED_PHRASES) + r")(?!\w)"
+)
+
+
+def message_cleanliness_reason(message):
+    content = normalize_chat_content(getattr(message, "text", None) or getattr(message, "caption", None) or "")
+    if not content:
+        return None
+    if _CHAT_BAD_RE.search(content):
+        return "parolacce o insulti"
+    if _CHAT_EXPLICIT_RE.search(content) or _CHAT_PHRASES_RE.search(content):
+        return "espressioni sessuali esplicite o offensive"
+    return None
+
+
 async def moderate_group_b_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Nel Gruppo B elimina silenziosamente i messaggi degli utenti che contengono link."""
+    """Elimina nel gruppo B link, parolacce e contenuti testuali sessuali espliciti."""
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
@@ -7397,10 +7465,11 @@ async def moderate_group_b_links(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Non toccare i messaggi inviati dal bot stesso.
-    if user and user.is_bot:
+    if user and user.id == context.bot.id:
         return
 
-    if not _message_contains_link(message):
+    reason = "link" if _message_contains_link(message) else message_cleanliness_reason(message)
+    if not reason:
         return
 
     try:
@@ -7413,14 +7482,14 @@ async def moderate_group_b_links(update: Update, context: ContextTypes.DEFAULT_T
             if user and user.username
             else (user.full_name if user else "utente")
         )
-        await add_log(f"🗑 Link eliminato nel Gruppo B — {who}", session_id=0)
+        await add_log(f"🗑 Messaggio eliminato nel Gruppo B — motivo: {reason} — {who}", session_id=0)
     except Exception as e:
         logger.warning(
-            "Impossibile eliminare messaggio con link nel Gruppo B %s: %s",
+            "Impossibile eliminare messaggio moderato nel Gruppo B %s: %s",
             message.message_id,
             e,
         )
-        await add_log("⚠️ Link rilevato nel Gruppo B ma eliminazione non riuscita", session_id=0)
+        await add_log(f"⚠️ Messaggio con {reason} nel Gruppo B: eliminazione non riuscita", session_id=0)
 
 # =========================================================
 # MAIN
@@ -7483,7 +7552,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.3 avviato"
+        "V4.9.9.4 avviato"
     )
 
     application.run_polling()
