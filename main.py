@@ -1287,13 +1287,34 @@ async def account_management_keyboard(account_id):
 
 PROFILE_COLORS = ((211, 45, 55), (25, 112, 182), (32, 143, 106), (111, 67, 174), (202, 112, 26), (35, 127, 145))
 PROFILE_NAMES = ("Nuvio", "Zampix", "Lunetto", "Puffolo", "Morbix", "Tondino", "Frullix", "Baffolo", "Piumix", "Nebulino", "Zuffolo", "Brillix")
-PROFILE_BIOS = ("Mascotte della community. Account gestito dal team.",
-                "Account di gestione della community con avatar mascotte.",
-                "Mascotte virtuale del team. Supporto alla community.")
-PROFILE_MASCOTS = ("orsetto", "gattino", "gufetto")
+PROFILE_SECOND_WORDS = ("Birbante", "Sorridente", "Sognatore", "Vivace", "Curioso", "Allegro", "Gentile", "Buffo", "Soffice", "Solare", "Scattante", "Gioioso")
+PROFILE_BIOS = ("Un piccolo personaggio cartoon, una grande fantasia. 🎨",
+                "Zampe, sorrisi e un pizzico di fantasia. 🐾",
+                "Una mascotte cartoon dal sorriso contagioso. ✨")
+PROFILE_MASCOTS = ("orsetto", "gattino", "gufetto", "coniglietto", "volpetta", "panda", "cagnolino", "koala", "pinguino", "ranocchio")
+
+
+async def choose_profile_mascot(account_id, owner_id):
+    used = set()
+    for slot in ACCOUNT_IDS:
+        other_owner = session_info[slot].get("user_id")
+        if other_owner and other_owner != owner_id:
+            mascot = await get_setting(f"profile_mascot_{other_owner}", "")
+            if mascot:
+                used.add(mascot)
+    choices = [animal for animal in PROFILE_MASCOTS if animal not in used]
+    if not choices:
+        raise ValueError("Tutti gli animali disponibili sono assegnati: amplia il catalogo avatar")
+    current = await get_setting(f"profile_mascot_{owner_id}", "")
+    # Alla rigenerazione cambia animale quando ce n'è un altro libero.
+    alternatives = [animal for animal in choices if animal != current]
+    selected = secrets.choice(alternatives or choices)
+    await set_setting(f"profile_mascot_{owner_id}", selected)
+    return selected
+
 
 def profile_avatar(account_id, color, mascot="orsetto"):
-    """Mascotte illustrata + slot, PNG senza dipendenze esterne."""
+    """Animale cartoon, PNG senza dipendenze esterne e senza numeri sul volto."""
     size = 512
     pixels = bytearray(bytes(color) * (size * size))
     def rect(x, y, w, h, rgb):
@@ -1325,21 +1346,44 @@ def profile_avatar(account_id, color, mascot="orsetto"):
     cream = (255, 240, 218)
     peach = (242, 179, 166)
     ellipse(256, 265, 193, 193, tuple(min(255, c + 26) for c in color))
-    if mascot == 'gattino':
+    if mascot in {'gattino', 'volpetta'}:
         # Orecchie a punta, disegnate a righe.
         for y in range(90, 210):
             width = (y - 90) // 2
             rect(155 - width, y, width * 2 + 1, 1, cream)
             rect(357 - width, y, width * 2 + 1, 1, cream)
-    elif mascot == 'orsetto':
-        ellipse(151, 166, 64, 66, cream)
-        ellipse(361, 166, 64, 66, cream)
+    elif mascot in {'orsetto', 'panda', 'koala'}:
+        ear_color = dark if mascot == 'panda' else ((180, 185, 192) if mascot == 'koala' else cream)
+        ellipse(151, 166, 64, 66, ear_color)
+        ellipse(361, 166, 64, 66, ear_color)
         ellipse(151, 166, 35, 37, peach)
         ellipse(361, 166, 35, 37, peach)
-    else:
+    elif mascot == 'coniglietto':
+        ellipse(184, 140, 39, 112, cream)
+        ellipse(328, 140, 39, 112, cream)
+        ellipse(184, 140, 18, 78, peach)
+        ellipse(328, 140, 18, 78, peach)
+    elif mascot == 'cagnolino':
+        ellipse(125, 235, 56, 107, (157, 101, 64))
+        ellipse(387, 235, 56, 107, (157, 101, 64))
+    elif mascot == 'ranocchio':
+        ellipse(182, 177, 59, 65, (133, 205, 91))
+        ellipse(330, 177, 59, 65, (133, 205, 91))
+    elif mascot == 'gufetto':
         ellipse(169, 195, 79, 82, cream)
         ellipse(343, 195, 79, 82, cream)
-    ellipse(256, 270, 148, 132, cream)
+    face = (232, 145, 56) if mascot == 'volpetta' else ((133, 205, 91) if mascot == 'ranocchio' else ((180, 185, 192) if mascot == 'koala' else cream))
+    if mascot == 'pinguino':
+        ellipse(256, 267, 165, 150, dark)
+    ellipse(256, 270, 148, 132, face)
+    if mascot == 'panda':
+        ellipse(194, 245, 42, 49, dark)
+        ellipse(318, 245, 42, 49, dark)
+    if mascot == 'koala':
+        ellipse(256, 272, 32, 46, (74, 71, 80))
+    if mascot == 'volpetta':
+        ellipse(213, 305, 62, 45, cream)
+        ellipse(299, 305, 62, 45, cream)
     if mascot == 'gufetto':
         ellipse(194, 247, 53, 57, (255,255,255))
         ellipse(318, 247, 53, 57, (255,255,255))
@@ -1349,7 +1393,7 @@ def profile_avatar(account_id, color, mascot="orsetto"):
     ellipse(310, 239, 5, 7, (255,255,255))
     ellipse(161, 292, 22, 13, peach)
     ellipse(351, 292, 22, 13, peach)
-    ellipse(256, 286, 17, 12, (229,148,55) if mascot == 'gufetto' else dark)
+    ellipse(256, 286, 17, 12, (229,148,55) if mascot in {'gufetto', 'pinguino'} else dark)
     rect(253, 297, 6, 18, dark)
     ellipse(241, 313, 17, 5, dark)
     ellipse(271, 313, 17, 5, dark)
@@ -1358,8 +1402,6 @@ def profile_avatar(account_id, color, mascot="orsetto"):
         rect(111, 299, 46, 4, dark)
         rect(354, 276, 46, 4, dark)
         rect(355, 299, 46, 4, dark)
-    ellipse(256, 416, 65, 47, dark)
-    text(str(account_id).zfill(2), 389, 8)
     def chunk(kind, payload):
         return struct.pack('>I', len(payload)) + kind + payload + struct.pack('>I', zlib.crc32(kind + payload) & 0xffffffff)
     raw = b''.join(b'\x00' + pixels[row*size*3:(row+1)*size*3] for row in range(size))
@@ -1382,7 +1424,7 @@ async def used_profile_identifiers():
 
 async def generate_profile_identity(client, owner_id):
     names, usernames = await used_profile_identifiers()
-    remaining = [name for name in PROFILE_NAMES if name.casefold() not in names]
+    remaining = [first + " " + second for first in PROFILE_NAMES for second in PROFILE_SECOND_WORDS if (first + " " + second).casefold() not in names]
     for attempt in range(12):
         if remaining:
             name = secrets.choice(remaining)
@@ -1390,14 +1432,14 @@ async def generate_profile_identity(client, owner_id):
         else:
             name = None
             for _ in range(300):
-                candidate = secrets.choice(PROFILE_NAME_ROOTS) + secrets.choice(PROFILE_NAME_ENDINGS)
+                candidate = secrets.choice(PROFILE_NAME_ROOTS) + secrets.choice(PROFILE_NAME_ENDINGS) + " " + secrets.choice(PROFILE_SECOND_WORDS)
                 if candidate.casefold() not in names:
                     name = candidate
                     break
             if name is None:
                 raise ValueError("Nessun nuovo nome disponibile: amplia il generatore")
         names.add(name.casefold())
-        base = name.lower()[:8]
+        base = name.split()[0].lower()[:8]
         # Username classici: lettere ASCII, numeri; minimo 5 caratteri.
         # Per questa funzione il target scelto e' 6–10 caratteri.
         for variant in range(3):
@@ -1411,7 +1453,7 @@ async def generate_profile_identity(client, owner_id):
             try:
                 available = bool(await asyncio.wait_for(client(CheckUsernameRequest(username)), 12))
             except Exception as exc:
-                if type(exc).__name__ in {"UsernameOccupiedError", "UsernameInvalidError"}:
+                if type(exc).__name__ in {"UsernameOccupiedError", "UsernameInvalidError", "UsernamePurchaseAvailableError"}:
                     continue
                 raise
             if not available:
@@ -1436,7 +1478,12 @@ async def recheck_profile_identity(client, pending):
             raise ValueError("Il nome e' ora utilizzato da un'altra sessione: rigenera il profilo")
         if (info.get("username") or "").casefold() == pending["username"].casefold():
             raise ValueError("Lo username e' ora utilizzato da un'altra sessione: rigenera il profilo")
-    available = bool(await asyncio.wait_for(client(CheckUsernameRequest(pending["username"])), 12))
+    try:
+        available = bool(await asyncio.wait_for(client(CheckUsernameRequest(pending["username"])), 12))
+    except Exception as exc:
+        if type(exc).__name__ in {"UsernameOccupiedError", "UsernameInvalidError", "UsernamePurchaseAvailableError"}:
+            raise ValueError("Lo username non è più assegnabile gratuitamente: rigenera il profilo. Nessuna modifica eseguita.") from exc
+        raise
     if not available:
         raise ValueError("Lo username non e' piu' disponibile: nessuna modifica eseguita. Rigenera il profilo")
 
@@ -1480,7 +1527,7 @@ async def profile_action(update, context):
                        'nonce': secrets.token_hex(6), 'first_name': role,
                        'last_name': '', 'bio': secrets.choice(PROFILE_BIOS),
                        'username': username if available else None,
-                       'color': secrets.choice(PROFILE_COLORS), 'mascot': secrets.choice(PROFILE_MASCOTS)}
+                       'color': secrets.choice(PROFILE_COLORS), 'mascot': await choose_profile_mascot(account_id, me.id)}
             avatar = profile_avatar(account_id, pending['color'], pending['mascot'])
             caption = (f"🎲 ANTEPRIMA ACCOUNT {account_id} — ID {me.id}\n\n"
                        f"Nome: {pending['first_name']}\nAvatar: {pending['mascot']}\n"
@@ -2867,7 +2914,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.7\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.8\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -6850,7 +6897,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.7 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.8 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7257,7 +7304,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.7 avviato"
+        "V4.9.8 avviato"
     )
 
     application.run_polling()
