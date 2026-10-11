@@ -986,6 +986,8 @@ async def bind_session_owner(account_id, user_id):
                              (f"session_{account_id}_{flag}",))
             session_info[account_id][flag] = False
         await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, str(user_id)))
+        await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                         (f"session_{account_id}_bound_at", now_it().isoformat()))
         await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('auto_enabled', '0')")
         await db.commit()
     state["auto_enabled"] = False
@@ -1014,7 +1016,7 @@ async def connect_session(account_id):
         await bind_session_owner(account_id, me.id)
         info.update(ready=True, user_id=me.id,
                     name=telegram_profile_name(me), display_name=telegram_profile_name(me), username=me.username,
-                    error="Connessa e autorizzata")
+                    phone=getattr(me, "phone", None), error="Connessa e autorizzata")
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE session_registry SET last_check=? WHERE owner_id=?", (now_it().isoformat(), me.id))
             await db.commit()
@@ -1027,6 +1029,42 @@ async def connect_session(account_id):
                 await db.commit()
         logger.warning("ACCOUNT %s: %s", account_id, info["error"])
         await client.disconnect()
+
+
+async def refresh_sessions():
+    """Verifica le credenziali già caricate, senza azzerare l'età degli stessi ID."""
+    state["auto_enabled"] = False
+    await set_setting("auto_enabled", "0")
+    lines = ["🔄 VERIFICA SESSIONI", "AUTO disattivato durante il controllo.", ""]
+    for account_id in ACCOUNT_IDS:
+        previous_owner = await get_setting(f"session_{account_id}_owner")
+        client = session_clients.get(account_id)
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=10)
+            except Exception as exc:
+                await add_log("⚠️ Disconnessione prima del refresh: " + safe_connection_error(exc), session_id=account_id)
+        await connect_session(account_id)
+        info = session_info[account_id]
+        if not info["ready"]:
+            lines.append(f"❌ ACCOUNT {account_id} — Connessione fallita: {info['error']}")
+            continue
+        changed = previous_owner != str(info["user_id"])
+        result = "Nuovo account rilevato" if changed else "Account invariato"
+        phone = str(info.get("phone") or "")
+        lines.extend([f"{'🆕' if changed else '✅'} ACCOUNT {account_id} — {result}",
+                      "Nome: " + info["name"],
+                      "Numero: " + ("+" + phone.lstrip("+") if phone else "non disponibile"),
+                      "ID Telegram: " + str(info["user_id"]),
+                      "Stato: " + await session_status_label(account_id), ""])
+    available = [i for i in ACCOUNT_IDS if session_info[i]["ready"]]
+    if available and state["active_session"] not in available:
+        state["active_session"] = available[0]
+        await set_setting("active_session", state["active_session"])
+    sync_session_state()
+    lines.append("Se compare ancora il vecchio numero, completa il deploy Railway del servizio con le nuove variabili. Il refresh verifica le credenziali caricate all'avvio.")
+    await add_log("🔄 Verifica sessioni completata; AUTO resta disattivato", session_id=0)
+    return "\n".join(lines)
 
 
 async def select_session(account_id):
@@ -1547,6 +1585,7 @@ def classify_spambot_reply(reply):
     limited = any(phrase in text for phrase in (
         "your account is now limited", "your account is limited",
         "your account has been limited", "your account will be automatically released",
+        "while the account is limited, you will not be able to send messages",
         "il tuo account è attualmente limitato", "il tuo account è stato limitato",
     ))
     if clear and not limited:
@@ -1681,15 +1720,19 @@ async def session_diagnostic_text(account_id):
     deadline = float(await get_setting(f"auto_next_invite_{owner}", "0"))
     remaining = max(0, deadline - now_it().timestamp())
     lines.extend(["", "⏱ Pausa AUTO residua: " + (f"circa {math.ceil(remaining / 60)} minuti" if remaining else "nessuna")])
+    bound_at = await get_setting(f"session_{account_id}_bound_at", "")
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT created_at, message FROM logs WHERE session_id = ? AND "
+            "SELECT created_at, message FROM logs WHERE session_id = ? AND created_at >= ? AND "
             "(message LIKE '%PeerFlood%' OR message LIKE '%FloodWait%' OR message LIKE '%PROBLEMA GRUPPO B%') ORDER BY id DESC LIMIT 1",
-            (account_id,),
+            (account_id, bound_at),
         )
         row = await cursor.fetchone()
     if row:
-        lines.extend(["", "📋 Ultimo errore rilevante registrato: " + row[0], row[1][:450]])
+        label = "Ultimo errore dall'associazione dell'account" if bound_at else "Storico dello slot — attribuzione all'account attuale non verificata"
+        lines.extend(["", "📋 " + label + ": " + row[0], row[1][:450]])
+    elif bound_at:
+        lines.extend(["", "📋 Nessun errore rilevante registrato dall'associazione dell'account attuale."])
     lines.extend(["", "⚠️ Nessun test d'invito eseguito. Telegram non fornisce qui una certificazione preventiva dell'assenza di limiti antispam.",
                   "PeerFlood indica una limitazione sugli inviti, non necessariamente un ban completo. Non rimuovere il blocco per riprovare."])
     return "\n".join(lines)
@@ -2612,6 +2655,7 @@ def group_label(group):
 def main_keyboard():
     return panel_markup([
         [InlineKeyboardButton("👥 Gestione sessioni", callback_data="sessions")],
+        [InlineKeyboardButton("🔄 Verifica e aggiorna sessioni", callback_data="refresh_sessions")],
         [InlineKeyboardButton("👥 Gruppi e membri", callback_data="menu_groups")],
         [InlineKeyboardButton("📒 Rubrica", callback_data="contacts")],
         [InlineKeyboardButton("📤 Inviti", callback_data="menu_invites")],
@@ -2726,7 +2770,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.5\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.6\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -4649,6 +4693,15 @@ async def buttons(
     await query.answer()
 
     data = query.data
+    if data == "refresh_sessions":
+        if operation_busy():
+            await callback_notice(query, "Ferma le operazioni in corso prima di aggiornare le sessioni.")
+            return
+        await query.edit_message_text("🔄 Verifica delle sessioni in corso… AUTO verrà disattivato.")
+        report = await refresh_sessions()
+        await reply_long(query.message, report, main_keyboard(), edit=True)
+        await query.message.reply_text(await home_text(), reply_markup=main_keyboard())
+        return
     if data in {"home", "sessions", "menu_invites", "menu_groups", "menu_diagnostics"}:
         for key in ("feature_input", "message_draft", "join_b_draft", "enable_session_pending", "link_consent_pending"):
             context.user_data.pop(key, None)
@@ -6697,7 +6750,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.5 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.6 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7104,7 +7157,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.5 avviato"
+        "V4.9.6 avviato"
     )
 
     application.run_polling()
