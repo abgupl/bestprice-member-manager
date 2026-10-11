@@ -2580,11 +2580,11 @@ async def members_page_text(page):
 
 def members_keyboard():
     return panel_markup([
+        [InlineKeyboardButton("◀️", callback_data="members_prev"),
+         InlineKeyboardButton("▶️", callback_data="members_next")],
         [InlineKeyboardButton("⚙️ Filtri e fonte", callback_data="member_filters")],
         [InlineKeyboardButton("🧹 Pulisci lista per gruppo B", callback_data="clean_members")],
         [InlineKeyboardButton("🔄 Estrai / aggiorna", callback_data="extract_members")],
-        [InlineKeyboardButton("◀️", callback_data="members_prev"),
-         InlineKeyboardButton("▶️", callback_data="members_next")],
         [InlineKeyboardButton("📄 Esporta lista TXT", callback_data="members_export")],
         [InlineKeyboardButton("➕ Invita per ID", callback_data="manual_invite")],
         [InlineKeyboardButton("⬅️ Indietro", callback_data="menu_groups")],
@@ -2910,7 +2910,7 @@ async def home_text():
     else:
         automatic = "⏸ Automatico disattivato"
     return (
-        "👥 BESTPRICE MEMBER MANAGER V4.9.9.7\n\n"
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.8\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
@@ -7115,7 +7115,7 @@ async def post_init(
         state["auto_enabled"] = False
         await set_setting("auto_enabled", "0")
         await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
-    await add_log("⚙️ Avvio V4.9.9.7 — " + session_info[state["active_session"]]["error"])
+    await add_log("⚙️ Avvio V4.9.9.8 — " + session_info[state["active_session"]]["error"])
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7590,7 +7590,7 @@ def main():
 
     logger.info(
         "BestPrice Member Manager "
-        "V4.9.9.7 avviato"
+        "V4.9.9.8 avviato"
     )
 
     application.run_polling()
