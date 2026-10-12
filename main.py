@@ -249,7 +249,7 @@ user_client = SelectedClient()
 
 
 def operation_busy():
-    return ((scheduled_message_task is not None and not scheduled_message_task.done()) or (prepare_task is not None and not prepare_task.done()) or state["running"] or state["contact_queue_running"]
+    return ((prepare_task is not None and not prepare_task.done()) or state["running"] or state["contact_queue_running"]
             or state["manual_running"]
             or (worker_task is not None and not worker_task.done())
             or (contact_task is not None and not contact_task.done()))
@@ -1297,7 +1297,7 @@ async def prepare_screen():
         lines += prepare_job.get("results", [])[-6:]
     rows = [[InlineKeyboardButton(f"👥 Seleziona sessioni ({len(slots)})", callback_data="prep:sessions")]]
     rows.append([InlineKeyboardButton("⚙️ Operazioni da eseguire", callback_data="prep:operations")])
-    rows.append([InlineKeyboardButton("📨 Messaggi programmati", callback_data="scheduled:menu")])
+    rows.append([InlineKeyboardButton("📨 Invia messaggi", callback_data="preparemsg:menu")])
     preparing = prepare_task is not None and not prepare_task.done() and prepare_job.get("status") == "in corso"
     rows.extend([[InlineKeyboardButton(f"⏱ Intervallo: {interval} minuti", callback_data="prep:interval")], [InlineKeyboardButton("⏹ Interrompi" if preparing else "▶️ Avvia preparazione", callback_data="prep:stop" if preparing else "prep:start")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="prep:menu")], [InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")]])
     return "\n".join(lines), panel_markup(rows, include_invite_stop=False)
@@ -1524,165 +1524,49 @@ async def prepare_action(update, context, data):
     text, markup = await prepare_screen()
     await query.edit_message_text(text, reply_markup=markup)
     return True
-scheduled_message_task = None
-scheduled_message_job = {}
-
-async def scheduled_message_screen():
+async def prepare_message_screen():
     slots, _ = await prepare_choices()
     text = await get_setting("scheduled_message_text", "ciao")
-    recipients = json.loads(await get_setting("scheduled_message_recipients", "[]"))
-    stamp = await get_setting("scheduled_message_start", "non impostata")
-    lines = ["📨 MESSAGGI PROGRAMMATI", "", "Mittenti: " + (", ".join(session_button_name(i) for i in slots) or "seleziona le sessioni nel menu precedente"), "Destinatari: " + (", ".join(recipients) or "nessuno"), "Testo: " + text, "Programmazione: " + stamp, "", "Ogni destinatario riceve un solo messaggio. I mittenti vengono assegnati a turno. Gli invii sono separati dalla preparazione dei profili e dall’ingresso nel gruppo B."]
-    if scheduled_message_job:
-        lines += ["", "Stato: " + scheduled_message_job.get("status", ""), f"Avanzamento: {scheduled_message_job.get('index', 0)}/{len(scheduled_message_job.get('steps', []))}"]
-        lines += scheduled_message_job.get("results", [])[-3:]
-    rows = [[InlineKeyboardButton("✏️ Testo del messaggio", callback_data="scheduled:text")], [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]]
+    lines = ["📨 INVIA MESSAGGI", "", "Account selezionati: " + (", ".join(session_button_name(i) for i in slots) or "nessuno"), "Testo: " + text, "", "Ogni account selezionato invia questo testo agli altri account selezionati. Per avviare, spunta Invia messaggi nelle operazioni e premi Avvia preparazione in Riscalda sessioni."]
+    rows = [[InlineKeyboardButton("✏️ Testo del messaggio", callback_data="preparemsg:text")], [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]]
     return "\n".join(lines)[:3900], panel_markup(rows, include_invite_stop=False)
 
-async def save_scheduled_messages():
-    await set_setting("scheduled_message_job", json.dumps(scheduled_message_job))
-
-async def run_scheduled_messages(application):
-    try:
-        while scheduled_message_job.get("status") == "programmato" and scheduled_message_job["index"] < len(scheduled_message_job["steps"]):
-            delay = scheduled_message_job["next_at"] - now_it().timestamp()
-            if delay > 0:
-                await asyncio.sleep(min(delay, 30))
-                continue
-            step = scheduled_message_job["steps"][scheduled_message_job["index"]]
-            scheduled_message_job["inflight"] = True
-            await save_scheduled_messages()
-            draft = {"sender_slot": step["slot"], "sender_id": step["owner"], "nonce": scheduled_message_job["nonce"], "kind": "scheduled", "text": scheduled_message_job["text"], "recipients": [step["recipient"]]}
-            result = await execute_message_batch(draft, application.bot)
-            scheduled_message_job["results"].append(result)
-            scheduled_message_job["index"] += 1
-            scheduled_message_job["inflight"] = False
-            # Nessuna rotazione per aggirare errori: al primo mancato invio ferma tutta la coda.
-            if "✅" not in result:
-                scheduled_message_job["status"] = "interrotto: verifica l’esito nei log"
-            elif scheduled_message_job["index"] == len(scheduled_message_job["steps"]):
-                scheduled_message_job["status"] = "completato"
-            scheduled_message_job["next_at"] = now_it().timestamp() + scheduled_message_job["interval"] * 60
-            await save_scheduled_messages()
-        await add_log("📨 MESSAGGI PROGRAMMATI — " + scheduled_message_job.get("status", "") + f" — {scheduled_message_job.get('index', 0)} destinatari elaborati", session_id=0)
-        try:
-            await application.bot.send_message(scheduled_message_job["chat_id"], "📨 Messaggi programmati: " + scheduled_message_job["status"] + ". Apri il pannello per il riepilogo.")
-        except Exception:
-            logger.exception("Notifica messaggi programmati non consegnata")
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        scheduled_message_job["status"] = "interrotto per errore"
-        scheduled_message_job.setdefault("results", []).append(safe_connection_error(exc))
-        await save_scheduled_messages()
-        await add_log("📨 MESSAGGI PROGRAMMATI — " + safe_connection_error(exc), "ERROR", session_id=0)
-
-async def scheduled_message_action(update, context, data):
-    global scheduled_message_job, scheduled_message_task
-    if not data.startswith("scheduled:"):
+async def prepare_message_action(update, context, data):
+    if not data.startswith("preparemsg:"):
         return False
     query = update.callback_query
     if update.effective_chat.type != "private":
         await callback_notice(query, "Usa la chat privata con il bot.")
         return True
-    context.user_data.pop("scheduled_input", None)
+    context.user_data.pop("prepare_message_input", None)
     state["waiting_for"] = None
     context.user_data.pop("feature_input", None)
-    if data == "scheduled:stop":
-        scheduled_message_job["status"] = "interrotto"
-        if scheduled_message_task and not scheduled_message_task.done():
-            scheduled_message_task.cancel()
-            await asyncio.gather(scheduled_message_task, return_exceptions=True)
-        await save_scheduled_messages()
-        await add_log("⏹ Messaggi programmati interrotti dall’amministratore", session_id=0)
-    elif data != "scheduled:menu":
+    if data == "preparemsg:text":
         if operation_busy() or state["auto_enabled"]:
-            await callback_notice(query, "Interrompi le operazioni e disattiva AUTO prima di configurare o avviare gli invii.")
+            await callback_notice(query, "Interrompi le operazioni e disattiva AUTO prima di modificare il testo.")
             return True
-        prompts = {"scheduled:recipients": "Incolla gli @username dei destinatari consenzienti, uno per riga (massimo 50).", "scheduled:text": "Scrivi il testo da inviare (massimo 1000 caratteri).", "scheduled:time": "Scrivi data, ora italiana e intervallo in minuti:\nGG/MM/AAAA HH:MM | minuti\nEsempio: 12/10/2026 10:00 | 60\nIntervallo consentito: da 15 a 480 minuti."}
-        if data in prompts:
-            context.user_data["scheduled_input"] = data.split(":")[1]
-            await query.edit_message_text(prompts[data], reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Messaggi programmati", callback_data="scheduled:menu")]], include_invite_stop=False))
-            return True
-        if data == "scheduled:start":
-            slots, _ = await prepare_choices()
-            usernames = json.loads(await get_setting("scheduled_message_recipients", "[]"))
-            start_at = float(await get_setting("scheduled_message_timestamp", "0"))
-            if not slots or not usernames or start_at <= now_it().timestamp():
-                await callback_notice(query, "Seleziona i mittenti, inserisci i destinatari e imposta una data futura.")
-                return True
-            steps, seen = [], set()
-            all_owners = {info.get("user_id") for info in session_info.values()}
-            try:
-                for index, username in enumerate(usernames):
-                    slot = slots[index % len(slots)]
-                    record = await registry_for(slot)
-                    if session_info[slot]["telegram_locked"] or record.get("halted_reason"):
-                        raise ValueError("Mittente sospeso: verifica la diagnostica")
-                    recipient = await resolve_message_recipient(session_clients[slot], username)
-                    if recipient["id"] in all_owners:
-                        raise ValueError("Seleziona destinatari esterni alle sessioni gestite")
-                    if recipient["id"] not in seen:
-                        steps.append({"slot": slot, "owner": session_info[slot]["user_id"], "recipient": recipient})
-                        seen.add(recipient["id"])
-            except Exception as exc:
-                await callback_notice(query, "Programmazione non avviata — " + safe_connection_error(exc))
-                return True
-            scheduled_message_job = {"status": "programmato", "index": 0, "steps": steps, "text": await get_setting("scheduled_message_text", "ciao"), "nonce": secrets.token_hex(8), "interval": int(await get_setting("scheduled_message_interval", "60")), "next_at": start_at, "inflight": False, "results": [], "chat_id": update.effective_chat.id}
-            await save_scheduled_messages()
-            await add_log(f"📨 MESSAGGI PROGRAMMATI AVVIATI — {len(steps)} destinatari — inizio " + await get_setting("scheduled_message_start", ""), session_id=0)
-            scheduled_message_task = asyncio.create_task(run_scheduled_messages(context.application))
-    text, markup = await scheduled_message_screen()
+        context.user_data["prepare_message_input"] = True
+        await query.edit_message_text("Scrivi il testo da inviare (massimo 1000 caratteri).", reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Invia messaggi", callback_data="preparemsg:menu")]], include_invite_stop=False))
+        return True
+    text, markup = await prepare_message_screen()
     await query.edit_message_text(text, reply_markup=markup)
     return True
 
-async def scheduled_message_input(update, context):
-    target = context.user_data.get("scheduled_input")
-    if not target:
+async def prepare_message_input(update, context):
+    if not context.user_data.get("prepare_message_input"):
         return False
     if update.effective_chat.type != "private" or operation_busy() or state["auto_enabled"]:
         await update.message.reply_text("Interrompi le operazioni prima di cambiare le impostazioni.")
         return True
     value = update.message.text.strip()
-    try:
-        if target == "recipients":
-            usernames = list(dict.fromkeys(line.strip().lower() for line in value.splitlines() if line.strip()))
-            if not 1 <= len(usernames) <= 50 or any(not re.fullmatch(r"@[a-z][a-z0-9_]{3,31}", x) for x in usernames):
-                raise ValueError("Usa da 1 a 50 @username validi, uno per riga")
-            await set_setting("scheduled_message_recipients", json.dumps(usernames))
-        elif target == "text":
-            if not value or len(value) > 1000:
-                raise ValueError("Scrivi da 1 a 1000 caratteri")
-            await set_setting("scheduled_message_text", value)
-        elif target == "time":
-            stamp, minutes = [part.strip() for part in value.split("|")]
-            dt = datetime.strptime(stamp, "%d/%m/%Y %H:%M").replace(tzinfo=ITALY_TZ)
-            interval = int(minutes)
-            if dt <= now_it() or not 15 <= interval <= 480:
-                raise ValueError("Usa una data futura e un intervallo da 15 a 480 minuti")
-            await set_setting("scheduled_message_timestamp", dt.timestamp())
-            await set_setting("scheduled_message_interval", interval)
-            await set_setting("scheduled_message_start", stamp + f" · ogni {interval} minuti")
-        context.user_data.pop("scheduled_input", None)
-    except (ValueError, TypeError) as exc:
-        await update.message.reply_text("❌ " + str(exc))
+    if not value or len(value) > 1000:
+        await update.message.reply_text("❌ Scrivi da 1 a 1000 caratteri")
         return True
-    text, markup = await scheduled_message_screen()
+    await set_setting("scheduled_message_text", value)
+    context.user_data.pop("prepare_message_input", None)
+    text, markup = await prepare_message_screen()
     await update.message.reply_text(text, reply_markup=markup)
     return True
-
-async def restore_scheduled_messages(application):
-    global scheduled_message_job, scheduled_message_task
-    try:
-        scheduled_message_job = json.loads(await get_setting("scheduled_message_job", "{}"))
-    except (TypeError, ValueError):
-        scheduled_message_job = {}
-    if scheduled_message_job.get("status") == "programmato":
-        if scheduled_message_job.get("inflight") or operation_busy() or state["auto_enabled"]:
-            scheduled_message_job["status"] = "interrotto: verifica prima di riprogrammare"
-            await save_scheduled_messages()
-        else:
-            scheduled_message_task = asyncio.create_task(run_scheduled_messages(application))
 
 
 async def restore_prepare(application):
@@ -5537,10 +5421,10 @@ async def buttons(
     await query.answer()
 
     data = query.data
-    if await scheduled_message_action(update, context, data):
+    if await prepare_message_action(update, context, data):
         return
     if data in {"home", "sessions"} or data.startswith("prep:"):
-        context.user_data.pop("scheduled_input", None)
+        context.user_data.pop("prepare_message_input", None)
     if await prepare_action(update, context, data):
         return
     if data.startswith("logs_export:"):
@@ -6852,7 +6736,7 @@ async def text_input(
         await deny_access(update)
         return
 
-    if await scheduled_message_input(update, context):
+    if await prepare_message_input(update, context):
         return
     if await feature_text_input(update, context):
         return
@@ -7664,7 +7548,6 @@ async def post_init(
     await add_log(f"⚙️ Avvio V4.9.9.20 — {len(available)}/{len(ACCOUNT_IDS)} sessioni connesse" + (" — " + "; ".join(failures) if failures else ""), session_id=0)
 
     await restore_prepare(application)
-    await restore_scheduled_messages(application)
 
     global scheduler_task
     scheduler_task = asyncio.create_task(
@@ -7679,7 +7562,7 @@ async def post_shutdown(
     global scheduler_task, worker_task, contact_task
     state["running"] = False
     state["stop_requested"] = True
-    tasks = [task for task in (scheduler_task, worker_task, contact_task, login_cleanup_task, prepare_task, scheduled_message_task) if task is not None]
+    tasks = [task for task in (scheduler_task, worker_task, contact_task, login_cleanup_task, prepare_task) if task is not None]
     tasks.extend(list(welcome_tasks))
     for task in tasks:
         task.cancel()
