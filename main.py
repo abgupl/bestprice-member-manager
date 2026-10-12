@@ -1279,8 +1279,8 @@ async def prepare_screen():
     lines = [
         "🔥 RISCALDA SESSIONI", "",
         "Seleziona gli account e spunta le operazioni da eseguire:", "",
-        "🎨 Crea profili: genera i profili mancanti; quelli già preparati vengono mantenuti.",
-        "📨 Invia messaggi: invia un 'ciao' automatico incrociato tra tutti gli account selezionati.",
+        "🎨 Crea profili: salta gli account con username già impostato o profilo già preparato.",
+        "📨 Invia messaggi: invia il testo impostato dagli account selezionati a tutte le sessioni disponibili, escludendo sé stessi.",
         "🚪 Entra nel gruppo B: esegue l’ingresso soltanto per gli account non ancora presenti.", "",
         "⏱ Imposta la pausa tra le operazioni e premi Avvia preparazione.", "",
         f"Sessioni selezionate: {len(slots)}",
@@ -1304,6 +1304,9 @@ async def prepare_screen():
 async def prepare_profile(slot, owner):
     client = session_clients[slot]
     me = await asyncio.wait_for(client.get_me(), 15)
+    if getattr(me, "username", None):
+        session_info[slot]["username"] = me.username
+        return "✅ Username già impostato; creazione profilo saltata"
     name = telegram_profile_name(me)
     prepared = await get_setting(f"profile_prepared_{owner}", "")
     if prepared:
@@ -1366,8 +1369,11 @@ async def run_prepare(application):
                         raise ValueError("Indirizzo gruppo B non disponibile: configura username o link")
                     result = await join_destination_once(slot, reference, group)
                 elif action_type == "messages":
-                    target_username = step.get("target_username")
                     target_owner = step.get("target_owner")
+                    target_info = session_info.get(step.get("target_slot"), {})
+                    if target_info.get("user_id") != target_owner:
+                        raise ValueError("Account destinatario cambiato: invio annullato")
+                    target_username = target_info.get("username") or step.get("target_username")
                     recipient = None
                     if target_username:
                         try:
@@ -1498,8 +1504,10 @@ async def prepare_action(update, context, data):
                 elif a == "messages":
                     for sender_slot in slots:
                         sender_owner = session_info[sender_slot]["user_id"]
-                        for target_slot in slots:
-                            if sender_slot == target_slot:
+                        for target_slot in ACCOUNT_IDS:
+                            if not session_info[target_slot]["ready"] or not session_info[target_slot].get("user_id"):
+                                continue
+                            if sender_slot == target_slot or sender_owner == session_info[target_slot]["user_id"]:
                                 continue
                             target_owner = session_info[target_slot]["user_id"]
                             target_username = session_info[target_slot].get("username")
@@ -1527,7 +1535,7 @@ async def prepare_action(update, context, data):
 async def prepare_message_screen():
     slots, _ = await prepare_choices()
     text = await get_setting("scheduled_message_text", "ciao")
-    lines = ["📨 INVIA MESSAGGI", "", "Account selezionati: " + (", ".join(session_button_name(i) for i in slots) or "nessuno"), "Testo: " + text, "", "Ogni account selezionato invia questo testo agli altri account selezionati. Per avviare, spunta Invia messaggi nelle operazioni e premi Avvia preparazione in Riscalda sessioni."]
+    lines = ["📨 INVIA MESSAGGI", "", "Account selezionati: " + (", ".join(session_button_name(i) for i in slots) or "nessuno"), "Testo: " + text, "", "Ogni account selezionato invia questo testo a tutte le sessioni disponibili, escludendo sé stesso. Per avviare, spunta Invia messaggi nelle operazioni e premi Avvia preparazione in Riscalda sessioni."]
     rows = [[InlineKeyboardButton("✏️ Testo del messaggio", callback_data="preparemsg:text")], [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]]
     return "\n".join(lines)[:3900], panel_markup(rows, include_invite_stop=False)
 
