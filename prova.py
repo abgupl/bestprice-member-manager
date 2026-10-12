@@ -1,0 +1,8150 @@
+import os
+import asyncio
+import logging
+import math
+import re
+import html
+import unicodedata
+import json
+import secrets
+import io
+import struct
+import zlib
+import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, parse_qs
+from contextvars import ContextVar
+from functools import wraps
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import importlib.util
+
+import aiosqlite
+
+from telegram import Update, InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from telethon import TelegramClient, utils
+from telethon.sessions import StringSession
+from telethon.errors import (
+    FloodWaitError,
+    PeerFloodError,
+    UserPrivacyRestrictedError,
+    UserNotMutualContactError,
+    UserAlreadyParticipantError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PasswordHashInvalidError,
+)
+from telethon.tl.functions.channels import (
+    InviteToChannelRequest,
+    GetParticipantRequest,
+    JoinChannelRequest,
+)
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.functions.contacts import GetContactsRequest
+from telethon.tl.functions.account import GetAuthorizationsRequest, CheckUsernameRequest, UpdateProfileRequest, UpdateUsernameRequest
+from telethon.tl.functions.photos import UploadProfilePhotoRequest
+from telethon.tl.types import Channel, Chat, User, ChannelParticipantsAdmins, UserStatusOnline, UserStatusOffline
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+def button_label(text):
+    """Uniforma soltanto le etichette dei pulsanti."""
+    text = str(text).lower()
+    for index, character in enumerate(text):
+        if character.isalpha():
+            return text[:index] + character.upper() + text[index + 1:]
+    return text
+
+
+def InlineKeyboardButton(text, *args, **kwargs):
+    return TelegramInlineKeyboardButton(button_label(text), *args, **kwargs)
+
+
+def panel_markup(rows, include_invite_stop=True):
+    """Lascia lo stop accessibile nei pannelli amministrativi."""
+    rows = [list(row) for row in rows]
+    if include_invite_stop and (operation_busy() or state["auto_enabled"]):
+        if not any(getattr(button, "callback_data", None) == "stop" for row in rows for button in row):
+            rows.insert(0, [InlineKeyboardButton("🛑 Ferma inviti", callback_data="stop")])
+    return InlineKeyboardMarkup(rows)
+
+
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+TELEGRAM_SESSION = os.environ["TELEGRAM_SESSION"]
+ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
+# L'accesso al pannello è indipendente dagli account Telethon.
+ADMIN_USER_IDS = {ADMIN_USER_ID}
+if os.environ.get("ADMIN_USER_ID_2", "").strip():
+    ADMIN_USER_IDS.add(int(os.environ["ADMIN_USER_ID_2"]))
+
+DB_PATH = "/data/manager.db"
+ITALY_TZ = ZoneInfo("Europe/Rome")
+PAGE_SIZE = 20
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# TELETHON
+# =========================================================
+
+ACCOUNT_IDS = tuple(range(1, 7))
+session_clients = {}
+session_info = {}
+session_context = ContextVar("telegram_account", default=None)
+control_lock = asyncio.Lock()
+contact_task = None
+welcome_bot = None
+welcome_lock = asyncio.Lock()
+welcome_tasks = set()
+
+def account_suffix(account_id):
+    return "" if account_id == 1 else f"_{account_id}"
+
+
+def proxy_for_account(account_id):
+    slot = int(os.environ.get(f"SESSION_PROXY_{account_id}", "1" if account_id <= 3 else "2"))
+    if slot not in (1, 2):
+        raise ValueError("SESSION_PROXY deve essere 1 oppure 2")
+    host = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
+    if not host:
+        raise ValueError(f"PROXY_{slot}_HOST mancante")
+    port = int(os.environ.get(f"PROXY_{slot}_PORT", "50101"))
+    if not 1 <= port <= 65535:
+        raise ValueError("Porta proxy non valida")
+    if importlib.util.find_spec("python_socks") is None:
+        raise ValueError("Installa python-socks[asyncio] in requirements.txt")
+    username = os.environ.get(f"PROXY_{slot}_USERNAME", "")
+    password = os.environ.get(f"PROXY_{slot}_PASSWORD", "")
+    if bool(username) != bool(password):
+        raise ValueError("Username e password proxy devono essere entrambi presenti")
+    return slot, {
+        "proxy_type": "socks5", "addr": host, "port": port, "rdns": True,
+        "username": username or None, "password": password or None,
+    }
+
+
+for account_id in ACCOUNT_IDS:
+    suffix = account_suffix(account_id)
+    session_string = os.environ.get(f"TELEGRAM_SESSION{suffix}", "").strip()
+    info = {"ready": False, "name": f"ACCOUNT {account_id}", "user_id": None,
+            "error": "Sessione non configurata", "telegram_locked": False,
+            "telegram_restriction_detected": False, "proxy_slot": None}
+    session_info[account_id] = info
+    if session_string:
+        try:
+            slot, proxy = proxy_for_account(account_id)
+            info["proxy_slot"] = slot
+            options = {}
+            for env_name, argument in (("DEVICE_MODEL", "device_model"),
+                                       ("SYSTEM_VERSION", "system_version"),
+                                       ("APP_VERSION", "app_version"),
+                                       ("LANG_CODE", "lang_code"),
+                                       ("SYSTEM_LANG_CODE", "system_lang_code")):
+                value = os.environ.get(f"{env_name}{suffix}", "").strip()
+                if value:
+                    options[argument] = value
+            session_clients[account_id] = TelegramClient(
+                StringSession(session_string),
+                int(os.environ.get(f"API_ID{suffix}") or API_ID),
+                os.environ.get(f"API_HASH{suffix}") or API_HASH,
+                proxy=proxy, flood_sleep_threshold=0, **options,
+            )
+            info["error"] = "Connessione da verificare"
+        except Exception as exc:
+            info["error"] = f"Configurazione non valida ({type(exc).__name__})"
+
+
+def safe_connection_error(exc):
+    message = str(exc)
+    for slot in (1, 2):
+        for field in ("PASSWORD", "USERNAME"):
+            value = os.environ.get(f"PROXY_{slot}_{field}", "")
+            if value:
+                message = message.replace(value, "[riservato]")
+    return f"{type(exc).__name__}: {message[:180]}"
+
+
+def current_session_id():
+    return session_context.get() or state["active_session"]
+
+
+def session_label(account_id=None):
+    account_id = account_id or current_session_id()
+    return f"ACCOUNT {account_id} — {session_info[account_id]['name']}"
+
+
+def session_button_name(account_id):
+    """Solo il nome pubblico del profilo, mai lo username o il numero dello slot."""
+    info = session_info[account_id]
+    name = str(info.get("display_name") or info.get("name") or "").strip()
+    if not name or name.startswith("@") or name == f"ACCOUNT {account_id}" or name == "Account aggiunto":
+        return "Nome non impostato"
+    return name[:45]
+
+
+def telegram_profile_name(user):
+    return " ".join(value for value in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if value).strip() or "Nome non impostato"
+
+
+def recorded_error_type(info, record):
+    # Prima il motivo della sospensione, poi il dettaglio dell'ultimo errore.
+    # Non si deduce un errore Telegram dalla sola presenza di un blocco locale.
+    for detail in (record.get("halted_reason"), record.get("last_error")):
+        match = re.search(r"\b([A-Z][A-Za-z0-9]*(?:Error|Timeout)|RetryAfter)\b", detail or "")
+        if match:
+            return match.group(1)
+    return "Motivo non registrato"
+
+
+async def session_status_color(account_id, record=None):
+    record = record if record is not None else await registry_for(account_id)
+    info = session_info[account_id]
+    if not info["ready"] or info["telegram_locked"] or info["telegram_restriction_detected"] or record.get("halted_reason"):
+        return "🔴"
+    if wait_remaining(record) != 0 or not record.get("approved"):
+        return "🟡"
+    return "🟢"
+
+
+class SelectedClient:
+    """Ogni task usa la sessione fissata all'avvio dell'operazione."""
+    def _client(self):
+        account_id = current_session_id()
+        if not session_info[account_id]["ready"]:
+            raise RuntimeError(f"ACCOUNT {account_id}: sessione non disponibile")
+        return session_clients[account_id]
+
+    def __getattr__(self, name):
+        return getattr(self._client(), name)
+
+    async def __call__(self, request):
+        return await self._client()(request)
+
+
+user_client = SelectedClient()
+
+
+def operation_busy():
+    return ((scheduled_message_task is not None and not scheduled_message_task.done()) or (prepare_task is not None and not prepare_task.done()) or state["running"] or state["contact_queue_running"]
+            or state["manual_running"]
+            or (worker_task is not None and not worker_task.done())
+            or (contact_task is not None and not contact_task.done()))
+
+
+def pinned_session(func):
+    @wraps(func)
+    async def wrapped(*args, **kwargs):
+        token = session_context.set(current_session_id())
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            session_context.reset(token)
+    return wrapped
+
+
+async def delete_admin_panel_message(bot, chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as exc:
+        logger.info("Pannello precedente non eliminato (%s): %s", message_id, type(exc).__name__)
+
+
+class AdminPanelRender:
+    """Raggruppa i messaggi di una schermata per rimuoverli alla navigazione."""
+    def __init__(self, query, context):
+        self.query = query
+        self.context = context
+        self.source = query.message
+        self.sent_ids = []
+        self.edited = False
+
+    async def finish(self):
+        if not self.source or not (self.edited or self.sent_ids):
+            return
+        chat_id = self.source.chat.id
+        source_id = self.source.message_id
+        previous = self.context.user_data.get("admin_panel_messages", [])
+        keep = set(self.sent_ids)
+        if self.edited:
+            keep.add(source_id)
+        # Non elimina nulla finché la nuova schermata non è stata prodotta.
+        for old_chat, old_id in previous:
+            if old_chat == chat_id and old_id not in keep:
+                await delete_admin_panel_message(self.context.bot, old_chat, old_id)
+        if not self.edited and not any(c == chat_id and m == source_id for c, m in previous):
+            await delete_admin_panel_message(self.context.bot, chat_id, source_id)
+        self.context.user_data["admin_panel_messages"] = [(chat_id, i) for i in sorted(keep)]
+
+
+class AdminPanelMessage:
+    def __init__(self, message, render):
+        self._message = message
+        self._render = render
+
+    def __getattr__(self, name):
+        return getattr(self._message, name)
+
+    async def _reply(self, method, *args, **kwargs):
+        sent = await getattr(self._message, method)(*args, **kwargs)
+        self._render.sent_ids.append(sent.message_id)
+        return sent
+
+    async def reply_text(self, *args, **kwargs):
+        return await self._reply("reply_text", *args, **kwargs)
+
+    async def reply_photo(self, *args, **kwargs):
+        return await self._reply("reply_photo", *args, **kwargs)
+
+    async def reply_document(self, *args, **kwargs):
+        # I file esportati restano nella chat anche quando si cambia pannello.
+        return await self._message.reply_document(*args, **kwargs)
+
+    async def edit_text(self, *args, **kwargs):
+        result = await self._message.edit_text(*args, **kwargs)
+        self._render.edited = True
+        return result
+
+
+class AdminPanelQuery:
+    def __init__(self, query, render):
+        self._query = query
+        self._render = render
+        self.message = AdminPanelMessage(query.message, render)
+
+    def __getattr__(self, name):
+        return getattr(self._query, name)
+
+    async def edit_message_text(self, *args, **kwargs):
+        result = await self._query.edit_message_text(*args, **kwargs)
+        self._render.edited = True
+        return result
+
+
+class AdminPanelUpdate:
+    def __init__(self, update, render):
+        self._update = update
+        self.callback_query = AdminPanelQuery(update.callback_query, render)
+
+    def __getattr__(self, name):
+        return getattr(self._update, name)
+
+
+def serialized_control(func):
+    @wraps(func)
+    async def wrapped(*args, **kwargs):
+        async with control_lock:
+            token = session_context.set(state["active_session"])
+            render = None
+            call_args = args
+            if args and getattr(args[0], "callback_query", None) and is_admin(args[0]):
+                query = args[0].callback_query
+                if query.message is not None:
+                    render = AdminPanelRender(query, args[1])
+                    call_args = (AdminPanelUpdate(args[0], render),) + args[1:]
+            try:
+                return await func(*call_args, **kwargs)
+            finally:
+                try:
+                    if render is not None:
+                        await render.finish()
+                finally:
+                    session_context.reset(token)
+    return wrapped
+
+
+# =========================================================
+# STATO
+# =========================================================
+
+state = {
+    "active_session": 1,
+    "manual_running": False,
+    "group_a": None,
+    "group_b": None,
+
+    "daily_target": 1,
+    "max_attempts": 3,
+    "interval_minutes": 10,
+    "contact_interval_minutes": 5,
+    "contact_queue_running": False,
+    "start_time": "09:00",
+    "auto_enabled": False,
+    "last_autostart_day": "",
+
+    "running": False,
+    "stop_requested": False,
+    "telegram_locked": False,
+    "telegram_restriction_detected": False,
+
+    "waiting_for": None,
+
+    "member_page": 0,
+    "contact_page": 0,
+    "manual_ids": [],
+    "manual_refs": [],
+
+    "extract_diag": {
+        "telegram_count": 0,
+        "received": 0,
+        "bots": 0,
+        "deleted": 0,
+        "duplicates": 0,
+        "saved": 0,
+    },
+
+    "last_event": "Nessuna attività",
+}
+
+worker_task = None
+scheduler_task = None
+worker_lock = asyncio.Lock()
+
+
+# =========================================================
+# DATA / ORA
+# =========================================================
+
+def now_it():
+    return datetime.now(ITALY_TZ)
+
+
+def today_it():
+    return now_it().date().isoformat()
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+async def init_db():
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS processed (
+                user_id INTEGER NOT NULL,
+                source_id INTEGER NOT NULL,
+                destination_id INTEGER NOT NULL,
+                username TEXT,
+                display_name TEXT,
+                status TEXT NOT NULL,
+                processed_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    user_id,
+                    source_id,
+                    destination_id
+                )
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                day TEXT PRIMARY KEY,
+                migrated INTEGER DEFAULT 0,
+                attempts INTEGER DEFAULT 0,
+                privacy INTEGER DEFAULT 0,
+                already INTEGER DEFAULT 0,
+                errors INTEGER DEFAULT 0,
+                unconfirmed INTEGER DEFAULT 0
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS extracted_members (
+                source_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                display_name TEXT,
+                extracted_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    source_id,
+                    user_id
+                )
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS extracted_contacts (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                display_name TEXT,
+                phone TEXT,
+                extracted_at TEXT NOT NULL
+            )
+        """)
+
+        cursor = await db.execute("PRAGMA table_info(logs)")
+        if "session_id" not in {row[1] for row in await cursor.fetchall()}:
+            await db.execute("ALTER TABLE logs ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
+        await db.execute("CREATE INDEX IF NOT EXISTS logs_session_id ON logs(session_id, id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_contacts (
+                session_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                username TEXT, display_name TEXT, phone TEXT, extracted_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, user_id)
+            )
+        """)
+        cursor = await db.execute("SELECT value FROM settings WHERE key = 'contacts_sessions_migrated'")
+        if not await cursor.fetchone():
+            await db.execute("""
+                INSERT OR IGNORE INTO session_contacts
+                SELECT 1, user_id, username, display_name, phone, extracted_at
+                FROM extracted_contacts
+            """)
+            await db.execute("INSERT INTO settings(key, value) VALUES ('contacts_sessions_migrated', '1')")
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS welcome_deletions (
+                chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                delete_at REAL NOT NULL, PRIMARY KEY(chat_id, message_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS welcome_sent (
+                chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                sent_at TEXT NOT NULL, message_id INTEGER NOT NULL,
+                PRIMARY KEY(chat_id, user_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS invitation_optout (
+                chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, requested_at TEXT NOT NULL,
+                PRIMARY KEY(chat_id, user_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS invitation_recovery (
+                session_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                source_id INTEGER NOT NULL, destination_id INTEGER NOT NULL,
+                attempted_at TEXT NOT NULL,
+                PRIMARY KEY(session_id, user_id, source_id, destination_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS privacy_rejections (
+                account_user_id INTEGER NOT NULL, target_user_id INTEGER NOT NULL,
+                destination_id INTEGER NOT NULL, reason TEXT NOT NULL, detected_at TEXT NOT NULL,
+                PRIMARY KEY(account_user_id, target_user_id, destination_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS membership_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL, event TEXT NOT NULL, actor_id INTEGER,
+                event_date TEXT, observed_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS membership_events_lookup ON membership_events(chat_id,user_id,id)")
+
+        # Compatibilità con database precedenti
+        try:
+            await db.execute(
+                """
+                ALTER TABLE daily_stats
+                ADD COLUMN unconfirmed INTEGER DEFAULT 0
+                """
+            )
+        except Exception:
+            pass
+
+        await db.commit()
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+async def set_setting(key, value):
+    if key in {"telegram_locked", "telegram_restriction_detected"}:
+        account_id = current_session_id()
+        session_info[account_id][key] = str(value) == "1"
+        key = f"session_{account_id}_{key}"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+            """
+            INSERT INTO settings(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key)
+            DO UPDATE SET value = excluded.value
+            """,
+            (key, str(value)),
+        )
+
+        await db.commit()
+
+
+async def get_setting(key, default=None):
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT value
+            FROM settings
+            WHERE key = ?
+            """,
+            (key,),
+        )
+
+        row = await cursor.fetchone()
+
+    return row[0] if row else default
+
+
+async def save_group(prefix, group):
+
+    await set_setting(
+        f"{prefix}_id",
+        group["id"],
+    )
+
+    await set_setting(
+        f"{prefix}_name",
+        group["name"],
+    )
+
+    await set_setting(
+        f"{prefix}_input",
+        group["input"],
+    )
+
+
+async def load_settings():
+
+    state["daily_target"] = int(
+        await get_setting(
+            "daily_target",
+            "1",
+        )
+    )
+
+    state["max_attempts"] = 3
+
+    state["interval_minutes"] = min(480, max(15, int(
+        await get_setting(
+            "interval_minutes",
+            "15",
+        )
+    )))
+
+    state["contact_interval_minutes"] = int(
+        await get_setting("contact_interval_minutes", "5")
+    )
+
+    state["start_time"] = await get_setting(
+        "start_time",
+        "09:00",
+    )
+
+    state["auto_enabled"] = (
+        await get_setting(
+            "auto_enabled",
+            "0",
+        ) == "1"
+    )
+
+    state["last_autostart_day"] = await get_setting(
+        "last_autostart_day",
+        "",
+    )
+
+    for account_id in ACCOUNT_IDS:
+        for key in ("telegram_locked", "telegram_restriction_detected"):
+            value = await get_setting(f"session_{account_id}_{key}")
+            if value is None:
+                value = await get_setting(key, "0") if account_id == 1 else "0"
+                await set_setting(f"session_{account_id}_{key}", value)
+            session_info[account_id][key] = value == "1"
+    selected = await get_setting("active_session", "1")
+    state["active_session"] = int(selected) if selected in {str(i) for i in ACCOUNT_IDS} else ACCOUNT_IDS[0]
+    sync_session_state()
+
+    for prefix in (
+        "group_a",
+        "group_b",
+    ):
+
+        group_id = await get_setting(
+            f"{prefix}_id"
+        )
+
+        name = await get_setting(
+            f"{prefix}_name"
+        )
+
+        input_value = await get_setting(
+            f"{prefix}_input"
+        )
+
+        if (
+            group_id
+            and name
+            and input_value
+        ):
+
+            if str(
+                input_value
+            ).lstrip("-").isdigit():
+
+                input_value = int(
+                    input_value
+                )
+
+            state[prefix] = {
+                "id": int(group_id),
+                "name": name,
+                "input": input_value,
+            }
+
+
+# =========================================================
+# STATISTICHE
+# =========================================================
+
+async def ensure_today():
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+            """
+            INSERT OR IGNORE
+            INTO daily_stats(day)
+            VALUES (?)
+            """,
+            (today_it(),),
+        )
+
+        await db.commit()
+
+
+async def increment_stat(
+    field,
+    amount=1,
+):
+
+    allowed = {
+        "migrated",
+        "attempts",
+        "privacy",
+        "already",
+        "errors",
+        "unconfirmed",
+    }
+
+    if field not in allowed:
+        raise ValueError(
+            "Campo statistico non valido"
+        )
+
+    await ensure_today()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+            f"""
+            UPDATE daily_stats
+            SET {field} = {field} + ?
+            WHERE day = ?
+            """,
+            (
+                amount,
+                today_it(),
+            ),
+        )
+
+        await db.commit()
+
+
+async def get_today_stats():
+
+    await ensure_today()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT
+                migrated,
+                attempts,
+                privacy,
+                already,
+                errors,
+                unconfirmed
+            FROM daily_stats
+            WHERE day = ?
+            """,
+            (today_it(),),
+        )
+
+        row = await cursor.fetchone()
+
+    return {
+        "migrated": row[0],
+        "attempts": row[1],
+        "privacy": row[2],
+        "already": row[3],
+        "errors": row[4],
+        "unconfirmed": row[5],
+    }
+
+
+async def get_total_stats():
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cursor = await db.execute("""
+            SELECT
+                COALESCE(SUM(migrated), 0),
+                COALESCE(SUM(attempts), 0),
+                COALESCE(SUM(privacy), 0),
+                COALESCE(SUM(already), 0),
+                COALESCE(SUM(errors), 0),
+                COALESCE(SUM(unconfirmed), 0)
+            FROM daily_stats
+        """)
+
+        row = await cursor.fetchone()
+
+    return {
+        "migrated": row[0],
+        "attempts": row[1],
+        "privacy": row[2],
+        "already": row[3],
+        "errors": row[4],
+        "unconfirmed": row[5],
+    }
+
+
+# =========================================================
+# LOG
+# =========================================================
+
+async def add_log(
+    message,
+    level="INFO",
+    session_id=None,
+):
+    account_id = current_session_id() if session_id is None else session_id
+    if account_id:
+        message = f"[{session_label(account_id)}] {message}"
+    attempt = attempt_context.get()
+    if attempt:
+        message = f"[{attempt}] {message}"
+    state["last_event"] = message
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+            """
+            INSERT INTO logs(
+                created_at,
+                level,
+                message,
+                session_id
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                now_it().isoformat(),
+                level,
+                message,
+                account_id,
+            ),
+        )
+
+        if (level == "ERROR" or (level == "WARNING" and any(code in message for code in ("PeerFlood", "FloodWait", "PRESENZA NON VERIFICABILE")))) and account_id and account_id in session_info:
+            await db.execute("UPDATE session_registry SET last_error=? WHERE owner_id=?",
+                             (now_it().isoformat() + " — " + message[:500], session_info[account_id].get("user_id")))
+        await db.commit()
+
+    logger.info(
+        "%s | %s",
+        level,
+        message,
+    )
+
+
+def readable_log(message):
+    if "🔌 Connessione iniziale" in message or "📥 EVENTO JOIN" in message:
+        return None
+    if ⚙️ Avvio V" in message:
+        message = re.sub(r"\[ACCOUNT [^\]]+\]\s*", "", message)
+        return "🖥 " + message.replace("⚙️ Avvio", "Bot avviato")
+    if "👋 BENVENUTO PUBBLICO INVIATO" in message:
+        member = re.search(r"ID (\d+)", message)
+        return "👋 Benvenuto pubblico inviato\n          Membro: " + (member.group(1) if member else "non indicato") + " · cancellazione dopo 30 minuti"
+    account = re.search(r"\[ACCOUNT [^\]]+\]", message)
+    heading = account.group(0).strip("[]") if account else "SISTEMA"
+    body = re.sub(r"\[ACCOUNT [^\]]+\]\s*", "", message)
+    
+    errors = {
+        "PeerFloodError": ("🔴", "Limitazione Telegram", "Controlla @SpamBot; evita nuovi tentativi"),
+        "FloodWaitError": ("⏳", "Pausa richiesta da Telegram", "Attendi il termine della pausa indicata"),
+        "UserBannedInChannelError": ("🔴", "Account escluso o limitato nel gruppo", "Verifica accesso e restrizioni con gli amministratori"),
+        "ChatWriteForbiddenError": ("🟠", "Scrittura nel gruppo non consentita", "Verifica i permessi nel gruppo"),
+        "ChatAdminRequiredError": ("🟠", "Permessi amministrativi richiesti", "Verifica i permessi dell’account"),
+        "UsernamePurchaseAvailableError": ("🟠", "Username acquistabile", "Genera un altro username"),
+        "UsernameOccupiedError": ("🟠", "Username già occupato", "Genera un altro username"),
+        "UserPrivacyRestrictedError": ("🟡", "Privacy del destinatario", "Non ripetere l’invito allo stesso destinatario"),
+        "UserNotMutualContactError": ("🟡", "Contatto reciproco richiesto", "Verifica i requisiti del destinatario"),
+        "UserNotParticipantError": ("🟡", "Account non partecipante al gruppo", "Verifica l’accesso richiesto dall’operazione"),
+        "InviteRequestSentError": ("🟡", "Richiesta di ingresso in attesa", "Attendi l’approvazione"),
+        "TimeoutError": ("🟡", "Tempo di risposta scaduto; esito da verificare", "Verifica l’esito su Telegram prima di riprovare"),
+    }
+    
+    matched = next((key for key in errors if key in body), None)
+    if matched:
+        icon, problem, action = errors[matched]
+        lower = body.casefold()
+        operation = ("Ingresso nel gruppo B" if "ingresso" in lower or "join" in lower else
+                     "Creazione profilo" if "profilo" in lower else
+                     "Verifica connessione" if "connessione" in lower or "ip fallita" in lower else
+                     "Invio messaggio" if "sendmessage" in lower or "messaggio" in lower else
+                     "Invito" if "invito" in lower or "invitetochannel" in lower or "manuale" in lower else "Operazione account")
+        lines = [f"{icon} {heading}", "Operazione: " + operation, f"Problema: {problem} — {matched}"]
+        if any(x in lower for x in ("auto fermat", "auto blocc", "programmazione auto fermat", "ciclo e programmazione auto fermat")):
+            lines.append("Esito: AUTO fermato")
+        elif "inviti sospesi" in lower or "inviti bloccati" in lower:
+            lines.append("Esito: inviti sospesi")
+        duration = re.search(r"\b(\d+)\s*(?:seconds|secondi)\b", body, re.I)
+        if duration:
+            lines.append("Attesa indicata: " + next(x for x in duration.groups() if x) + " secondi")
+        lines.append("Azione: " + action)
+        return lines[0] + "\n          " + "\n          ".join(lines[1:])
+    if "VERIFICA IP FALLITA" in body:
+        return f"🟡 {heading}\n          Verifica IP non riuscita\n          " + body.split("VERIFICA IP FALLITA", 1)[1].lstrip(" —")[:180]
+    if "⚙️ PREPARAZIONE —" in body:
+        return "👤 " + heading + "\n          " + body.split("⚙️ PREPARAZIONE —", 1)[1].strip()[:350]
+    if "SPAMBOT" in body and ("UNKNOWN" in body or "NON DETERMINABILE" in body):
+        return f"🟡 {heading}\n          SpamBot: verifica inconcludente\n          I blocchi precedenti restano invariati"
+    return (heading + "\n          " if account else "") + body[:450]
+
+async def clear_logs():
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+            "DELETE FROM logs"
+        )
+
+        await db.commit()
+
+    state["last_event"] = (
+        "Log cancellato"
+    )
+
+
+# =========================================================
+# PROCESSATI
+# =========================================================
+
+async def save_processed(
+    user,
+    status,
+):
+
+    username = getattr(
+        user,
+        "username",
+        None,
+    )
+
+    display_name = " ".join(
+        value
+        for value in [
+            getattr(
+                user,
+                "first_name",
+                None,
+            ),
+            getattr(
+                user,
+                "last_name",
+                None,
+            ),
+        ]
+        if value
+    )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+            """
+            INSERT OR REPLACE
+            INTO processed
+            (
+                user_id,
+                source_id,
+                destination_id,
+                username,
+                display_name,
+                status,
+                processed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user.id,
+                state["group_a"]["id"],
+                state["group_b"]["id"],
+                username,
+                display_name,
+                status,
+                now_it().isoformat(),
+            ),
+        )
+
+        await db.commit()
+
+
+async def invitation_opted_out(user_id, chat_id=None):
+    if chat_id is None:
+        chat_id = int(state["group_b"]["id"])
+        if chat_id > 0:
+            chat_id = -1000000000000 - chat_id
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM invitation_optout WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        return await cursor.fetchone() is not None
+
+
+async def was_processed(user_id):
+    if await invitation_opted_out(user_id):
+        return True
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT status
+            FROM processed
+            WHERE user_id = ?
+              AND source_id = ?
+              AND destination_id = ?
+            LIMIT 1
+            """,
+            (
+                user_id,
+                state["group_a"]["id"],
+                state["group_b"]["id"],
+            ),
+        )
+
+        row = await cursor.fetchone()
+
+    if row is None or row[0] in {"UNCONFIRMED", "VERIFY_PENDING"}:
+        return False
+    if row[0] == "NOT_ADDED":
+        return await recovery_used(user_id)
+    return True
+
+
+async def processed_status(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT status FROM processed WHERE user_id = ? AND source_id = ? AND destination_id = ?",
+            (user_id, state["group_a"]["id"], state["group_b"]["id"]),
+        )
+        row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def recovery_used(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM invitation_recovery WHERE session_id = ? AND user_id = ? AND source_id = ? AND destination_id = ?",
+            (current_session_id(), user_id, state["group_a"]["id"], state["group_b"]["id"]),
+        )
+        return await cursor.fetchone() is not None
+
+
+async def reserve_recovery(user_id):
+    """Un solo nuovo tentativo di recupero per sessione, utente e coppia di gruppi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO invitation_recovery VALUES (?, ?, ?, ?, ?)",
+            (current_session_id(), user_id, state["group_a"]["id"], state["group_b"]["id"], now_it().isoformat()),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+def sync_session_state():
+    info = session_info[state["active_session"]]
+    state["telegram_locked"] = info["telegram_locked"]
+    state["telegram_restriction_detected"] = info["telegram_restriction_detected"]
+
+
+async def bind_session_owner(account_id, user_id):
+    """Lo stato account segue l'identità Telegram, non il numero dello slot."""
+    key = f"session_{account_id}_owner"
+    previous = await get_setting(key)
+    await register_session_age(account_id, user_id, previous_owner=previous)
+    if previous == str(user_id):
+        return
+    # Primo binding della V4.7: le sessioni precedenti vengono sostituite.
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM session_contacts WHERE session_id = ?", (account_id,))
+        await db.execute("DELETE FROM invitation_recovery WHERE session_id = ?", (account_id,))
+        for flag in ("telegram_locked", "telegram_restriction_detected"):
+            await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, '0')",
+                             (f"session_{account_id}_{flag}",))
+            session_info[account_id][flag] = False
+        await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, str(user_id)))
+        await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                         (f"session_{account_id}_bound_at", now_it().isoformat()))
+        await db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('auto_enabled', '0')")
+        await db.commit()
+    state["auto_enabled"] = False
+    if account_id == state["active_session"]:
+        sync_session_state()
+    await add_log(f"👤 ACCOUNT {account_id} associato all'ID {user_id}; rubriche e blocchi locali del precedente slot azzerati. AUTO disattivato.", session_id=0)
+
+
+async def connect_session(account_id):
+    if account_id not in session_info:
+        raise ValueError("Sessione non valida")
+    info = session_info[account_id]
+    client = session_clients.get(account_id)
+    if client is None:
+        return
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30)
+        if not await asyncio.wait_for(client.is_user_authorized(), timeout=15):
+            raise ValueError("Sessione non autorizzata: rigenera la stringa")
+        me = await asyncio.wait_for(client.get_me(), timeout=15)
+        if me is None or getattr(me, "bot", False):
+            raise ValueError("È necessario un account utente Telegram")
+        for other_id, other in session_info.items():
+            if other_id != account_id and other["ready"] and other["user_id"] == me.id:
+                raise ValueError("Questo account è già presente in un altro slot: usa account distinti")
+        await bind_session_owner(account_id, me.id)
+        info.update(ready=True, user_id=me.id,
+                    name=telegram_profile_name(me), display_name=telegram_profile_name(me), username=me.username,
+                    phone=getattr(me, "phone", None), error="Connessa e autorizzata")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE session_registry SET last_check=? WHERE owner_id=?", (now_it().isoformat(), me.id))
+            await db.commit()
+    except Exception as exc:
+        info["ready"] = False
+        info["error"] = safe_connection_error(exc)
+        if info.get("user_id"):
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE session_registry SET last_error=? WHERE owner_id=?", (now_it().isoformat() + " — " + info["error"], info["user_id"]))
+                await db.commit()
+        logger.warning("ACCOUNT %s: %s", account_id, info["error"])
+        await client.disconnect()
+
+
+async def refresh_sessions():
+    """Verifica le credenziali già caricate, senza azzerare l'età degli stessi ID."""
+    state["auto_enabled"] = False
+    await set_setting("auto_enabled", "0")
+    lines = ["🔄 VERIFICA SESSIONI", "AUTO disattivato durante il controllo.", ""]
+    for account_id in ACCOUNT_IDS:
+        previous_owner = await get_setting(f"session_{account_id}_owner")
+        client = session_clients.get(account_id)
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=10)
+            except Exception as exc:
+                await add_log("⚠️ Disconnessione prima del refresh: " + safe_connection_error(exc), session_id=account_id)
+        await connect_session(account_id)
+        info = session_info[account_id]
+        if not info["ready"]:
+            lines.append(f"❌ ACCOUNT {account_id} — Connessione fallita: {info['error']}")
+            continue
+        changed = previous_owner != str(info["user_id"])
+        result = "Nuovo account rilevato" if changed else "Account invariato"
+        phone = str(info.get("phone") or "")
+        lines.extend([f"{'🆕' if changed else '✅'} ACCOUNT {account_id} — {result}",
+                      "Nome: " + info["name"],
+                      "Numero: " + ("+" + phone.lstrip("+") if phone else "non disponibile"),
+                      "ID Telegram: " + str(info["user_id"]),
+                      "Stato: " + await session_status_label(account_id), ""])
+    available = [i for i in ACCOUNT_IDS if session_info[i]["ready"]]
+    if available and state["active_session"] not in available:
+        state["active_session"] = available[0]
+        await set_setting("active_session", state["active_session"])
+    sync_session_state()
+    lines.append("Se compare ancora il vecchio numero, completa il deploy Railway del servizio con le nuove variabili. Il refresh verifica le credenziali caricate all'avvio.")
+    await add_log("🔄 Verifica sessioni completata; AUTO resta disattivato", session_id=0)
+    return "\n".join(lines)
+
+
+async def select_session(account_id):
+    if account_id not in session_info:
+        raise ValueError("Sessione non valida")
+    if operation_busy():
+        raise ValueError("Attendi la fine delle operazioni prima di cambiare sessione")
+    if account_id == state["active_session"]:
+        return
+    old_label = session_label(state["active_session"])
+    # Il cambio richiede una nuova attivazione esplicita dell'automatico.
+    state["auto_enabled"] = False
+    await set_setting("auto_enabled", "0")
+    state["active_session"] = account_id
+    session_context.set(account_id)
+    sync_session_state()
+    await set_setting("active_session", account_id)
+    state["waiting_for"] = None
+    state["manual_ids"] = []
+    state["manual_refs"] = []
+    state["prepared_session"] = None
+    state["member_page"] = 0
+    state["contact_page"] = 0
+    await add_log(f"👤 Sessione selezionata — precedente: {old_label}. Automatico disattivato: riattivalo esplicitamente.")
+
+
+async def sessions_text():
+    ready = sum(bool(session_info[i]["ready"]) for i in ACCOUNT_IDS)
+    return ("👥 GESTIONE SESSIONI\n\n"
+            f"Sessioni: {len(ACCOUNT_IDS)} · connesse: {ready}\n"
+            f"Selezionata: {session_label(state['active_session'])}\n\n"
+            "Apri l'elenco per scegliere un account e vedere la sua scheda. "
+            "Le nuove sessioni attendono 48 ore dall'aggiunta; quelle già presenti non ricominciano l'attesa.")
+
+
+
+# Preparazione amministrativa: nessun invio di messaggi tra sessioni.
+prepare_task = None
+prepare_job = {}
+PREP_MODES = {"profiles": "Solo profili", "join": "Solo ingresso nel gruppo B", "both": "Profili e ingresso nel gruppo B"}
+
+async def save_prepare_job():
+    await set_setting("prepare_job", json.dumps(prepare_job))
+
+async def prepare_choices():
+    try:
+        selected = json.loads(await get_setting("prepare_selected", "{}"))
+        actions = json.loads(await get_setting("prepare_actions", '["profiles", "join", "messages"]'))
+    except (TypeError, ValueError):
+        selected, actions = {}, []
+    slots = [i for i in ACCOUNT_IDS if session_info[i]["ready"] and str(selected.get(str(i))) == str(session_info[i]["user_id"])]
+    return slots, [a for a in ("profiles", "join", "messages") if a in actions]
+
+async def prepare_screen():
+    slots, actions = await prepare_choices()
+    interval = int(await get_setting("prepare_interval", "60"))
+    labels = {"profiles": "🎨 Crea profili", "join": "🚪 Entra nel gruppo B", "messages": "📨 Invia messaggi"}
+    lines = [
+        "🔥 RISCALDA SESSIONI", "",
+        "Seleziona gli account e spunta le operazioni da eseguire:", "",
+        "🎨 Crea profili: genera i profili mancanti; quelli già preparati vengono mantenuti.",
+        "📨 Invia messaggi: invia un 'ciao' automatico incrociato tra tutti gli account selezionati.",
+        "🚪 Entra nel gruppo B: esegue l’ingresso soltanto per gli account non ancora presenti.", "",
+        "⏱ Imposta la pausa tra le operazioni e premi Avvia preparazione.", "",
+        f"Sessioni selezionate: {len(slots)}",
+        "Account: " + (", ".join(session_button_name(i) for i in slots) or "nessuno"),
+        "Operazioni: " + (", ".join(labels[a] for a in actions if a in labels) or "nessuna"),
+        f"Intervallo: {interval} minuti",
+    ]
+    if prepare_job:
+        lines += ["", "Stato: " + prepare_job.get("status", ""), f"Avanzamento: {prepare_job.get('index', 0)}/{len(prepare_job.get('steps', []))}"]
+        if prepare_job.get("current"):
+            lines.append("Operazione: " + prepare_job["current"])
+        if prepare_job.get("next_at") and prepare_job.get("status") == "in corso":
+            lines.append("Prossima operazione: " + datetime.fromtimestamp(prepare_job["next_at"], tz=now_it().tzinfo).strftime("%d/%m %H:%M"))
+        lines += prepare_job.get("results", [])[-6:]
+    rows = [[InlineKeyboardButton(f"👥 Seleziona sessioni ({len(slots)})", callback_data="prep:sessions")]]
+    rows.append([InlineKeyboardButton(⚙️ Operazioni da eseguire", callback_data="prep:operations")])
+    rows.append([InlineKeyboardButton("📨 Messaggi programmati", callback_data="scheduled:menu")])
+    preparing = prepare_task is not None and not prepare_task.done() and prepare_job.get("status") == "in corso"
+    rows.extend([[InlineKeyboardButton(f"⏱ Intervallo: {interval} minuti", callback_data="prep:interval")], [InlineKeyboardButton("⏹ Interrompi" if preparing else "▶️ Avvia preparazione", callback_data="prep:stop" if preparing else "prep:start")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="prep:menu")], [InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")]])
+    return "\n".join(lines), panel_markup(rows, include_invite_stop=False)
+async def prepare_profile(slot, owner):
+    client = session_clients[slot]
+    me = await asyncio.wait_for(client.get_me(), 15)
+    name = telegram_profile_name(me)
+    prepared = await get_setting(f"profile_prepared_{owner}", "")
+    if prepared:
+        return "✅ Profilo già preparato"
+    # Riconosce anche i profili applicati prima dell'introduzione del pannello.
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT 1 FROM generated_profile_history WHERE owner_id=? AND name=? AND username=? LIMIT 1", (owner, name, getattr(me, "username", None) or ""))
+        existing = await cur.fetchone()
+    if existing and getattr(me, "photo", None):
+        await set_setting(f"profile_prepared_{owner}", "1")
+        return "✅ Profilo esistente riconosciuto"
+    if float(await get_setting(f"profile_pause_{slot}", "0")) > now_it().timestamp():
+        return "⏳ Pausa Telegram attiva; profilo saltato"
+    role, username = await generate_profile_identity(client, owner)
+    pending = {"first_name": role, "last_name": "", "username": username, "bio": secrets.choice(PROFILE_BIOS)}
+    await recheck_profile_identity(client, pending)
+    await asyncio.wait_for(client(UpdateProfileRequest(first_name=role, last_name="", about=pending["bio"])), 20)
+    await asyncio.wait_for(client(UpdateUsernameRequest(username)), 20)
+    mascot = await choose_profile_mascot(slot, owner)
+    photo = io.BytesIO(profile_avatar(slot, secrets.choice(PROFILE_COLORS), mascot))
+    photo.name = f"mascotte_account_{slot}.png"
+    uploaded = await asyncio.wait_for(client.upload_file(photo), 30)
+    await asyncio.wait_for(client(UploadProfilePhotoRequest(file=uploaded)), 20)
+    await set_setting(f"profile_prepared_{owner}", "1")
+    session_info[slot].update(name=role, display_name=role, username=username)
+    return "✅ Profilo creato: " + role
+
+async def run_prepare(application):
+    try:
+        while prepare_job.get("status") == "in corso" and prepare_job["index"] < len(prepare_job["steps"]):
+            delay = prepare_job.get("next_at", 0) - now_it().timestamp()
+            if delay > 0:
+                await asyncio.sleep(min(delay, 30))
+                continue
+            step = prepare_job["steps"][prepare_job["index"]]
+            slot = step["slot"]
+            action_type = step.get("type") or step.get("action", "profiles")
+            prepare_job["current"] = f"ACCOUNT {slot} — " + ("profilo" if action_type == "profiles" else "ingresso nel gruppo B" if action_type == "join" else f"messaggio ad account {step.get('target_slot')}")
+            prepare_job["inflight"] = True
+            await save_prepare_job()
+            try:
+                if slot not in ACCOUNT_IDS or not session_info[slot]["ready"]:
+                    raise ValueError("Sessione non disponibile")
+                client = session_clients[slot]
+                
+                me = await asyncio.wait_for(client.get_me(), 15)
+                owner = step.get("owner")
+                if not me or (owner and me.id != owner) or (owner and session_info[slot]["user_id"] != owner):
+                    raise ValueError("Account cambiato: operazione annullata per sicurezza")
+
+                if action_type == "profiles":
+                    result = await prepare_profile(slot, me.id)
+                elif action_type == "join":
+                    group = prepare_job["group"]
+                    reference = await configured_public_group_reference(slot, group)
+                    if reference is None:
+                        raw = group.get("input", "")
+                        reference = parse_join_reference(raw) if raw and not str(raw).lstrip("-").isdigit() else None
+                    if reference is None:
+                        raise ValueError("Indirizzo gruppo B non disponibile: configura username o link")
+                    result = await join_destination_once(slot, reference, group)
+                elif action_type == "messages":
+                    target_username = step.get("target_username")
+                    target_owner = step.get("target_owner")
+                    recipient = None
+                    if target_username:
+                        try:
+                            recipient = await client.get_entity("@" + target_username.lstrip("@"))
+                        except Exception:
+                            pass
+                    if recipient is None and target_owner:
+                        try:
+                            recipient = await client.get_entity(target_owner)
+                        except Exception:
+                            pass
+                    if recipient is None:
+                        raise ValueError(f"Impossibile trovare il contatto per l'account target {step.get('target_slot')}")
+                    await asyncio.wait_for(client.send_message(recipient, step["text"], parse_mode=None), 20)
+                    result = f"✅ Messaggio inviato ad account {step.get('target_slot')}"
+            except Exception as exc:
+                if isinstance(exc, FloodWaitError):
+                    await set_setting(f"profile_pause_{slot}", now_it().timestamp() + exc.seconds)
+                result = ⚠️ " + safe_connection_error(exc)
+                
+            prepare_job["results"].append(f"ACCOUNT {slot}: {result}")
+            await add_log("⚙️ PREPARAZIONE — " + result, session_id=slot)
+            prepare_job["index"] += 1
+            prepare_job["inflight"] = False
+            prepare_job["next_at"] = now_it().timestamp() + prepare_job["interval"] * 60
+            if prepare_job["index"] == len(prepare_job["steps"]):
+                prepare_job["status"] = "completata"
+                prepare_job["next_at"] = 0
+            await save_prepare_job()
+            
+        if prepare_job.get("status") == "completata":
+            await add_log("✅ PREPARAZIONE TERMINATA — " + str(prepare_job["index"]) + " operazioni elaborate; consulta i risultati per eventuali errori", session_id=0)
+            try:
+                await application.bot.send_message(prepare_job["chat_id"], "✅ Preparazione sessioni completata. Apri Riscalda sessioni per il riepilogo.")
+            except Exception:
+                logger.exception("Notifica preparazione non consegnata")
+                
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        prepare_job["status"] = "interrotta per errore"
+        prepare_job.setdefault("results", []).append(safe_connection_error(exc))
+        await save_prepare_job()
+
+async def prepare_action(update, context, data):
+    global prepare_task, prepare_job
+    if not data.startswith("prep:"):
+        return False
+    query = update.callback_query
+    if update.effective_chat.type != "private":
+        await callback_notice(query, "Usa la chat privata con il bot.")
+        return True
+    if data == "prep:disabled":
+        return True
+    state["waiting_for"] = None
+    for key in ("feature_input", "message_draft", "join_b_draft"):
+        context.user_data.pop(key, None)
+    if data == "prep:sessions" or data.startswith("prep:session:"):
+        slots, _ = await prepare_choices()
+        if data.startswith("prep:session:"):
+            if operation_busy() or state["auto_enabled"]:
+                await callback_notice(query, "Interrompi le operazioni prima di cambiare la selezione.")
+                return True
+            value = data.split(":")[-1]
+            slot = int(value) if value.isdigit() else 0
+            if slot not in ACCOUNT_IDS or not session_info[slot]["ready"]:
+                await callback_notice(query, "Sessione non disponibile: verifica la connessione.")
+                return True
+            slots.remove(slot) if slot in slots else slots.append(slot)
+            await set_setting("prepare_selected", json.dumps({str(i): session_info[i]["user_id"] for i in slots}))
+        rows = []
+        for slot in ACCOUNT_IDS:
+            icon = "✅" if slot in slots else ⬜️"
+            suffix = " — non disponibile" if not session_info[slot]["ready"] else ""
+            rows.append([InlineKeyboardButton(f"{icon} {session_button_name(slot)}{suffix}", callback_data=f"prep:session:{slot}")])
+        rows.append([InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")])
+        await query.edit_message_text(f"👥 SELEZIONA SESSIONI\nSpunta gli account che ti interessano.\nSessioni selezionate: {len(slots)}", reply_markup=panel_markup(rows, include_invite_stop=False))
+        return True
+    if data == "prep:operations" or data.startswith("prep:toggle:"):
+        if data.startswith("prep:toggle:"):
+            if operation_busy() or state["auto_enabled"]:
+                await callback_notice(query, "Interrompi le operazioni prima di cambiare la selezione.")
+                return True
+            _, actions = await prepare_choices()
+            action = data.split(":")[-1]
+            if action in {"profiles", "join", "messages"}:
+                actions.remove(action) if action in actions else actions.append(action)
+                await set_setting("prepare_actions", json.dumps(actions))
+        _, actions = await prepare_choices()
+        rows = []
+        for action, label in (("profiles", "🎨 Crea profili"), ("join", "🚪 Entra nel gruppo B"), ("messages", "📨 Invia messaggi")):
+            rows.append([InlineKeyboardButton(("✅ " if action in actions else "⬜️ ") + label, callback_data=f"prep:toggle:{action}")])
+        rows.append([InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")])
+        await query.edit_message_text("⚙️ OPERAZIONI\nSpunta le operazioni da eseguire tra profili, ingresso gruppo B e invio messaggi incrociati.", reply_markup=panel_markup(rows, include_invite_stop=False))
+        return True
+    if data == "prep:stop":
+        prepare_job["status"] = "interrotta"
+        if prepare_task and not prepare_task.done():
+            prepare_task.cancel()
+            await asyncio.gather(prepare_task, return_exceptions=True)
+        await add_log("⏹ PREPARAZIONE INTERROTTA — " + str(prepare_job.get("index", 0)) + "/" + str(len(prepare_job.get("steps", []))) + " operazioni elaborate", session_id=0)
+        await save_prepare_job()
+    elif data not in {"prep:menu", "prep:operations"}:
+        if operation_busy() or state["auto_enabled"]:
+            await callback_notice(query, "Interrompi le operazioni e disattiva AUTO prima di modificare o avviare la preparazione.")
+            return True
+        if data == "prep:interval":
+            rows = [[InlineKeyboardButton(f"{v} minuti", callback_data=f"prep:interval:{v}")] for v in [15,30,60,120,180,240,360,480]]
+            rows.append([InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")])
+            await query.edit_message_text("Scegli l'intervallo tra le operazioni.", reply_markup=panel_markup(rows, include_invite_stop=False))
+            return True
+        parts = data.split(":")
+        if len(parts) == 3 and parts[1] == "interval" and parts[2].isdigit() and int(parts[2]) in [15,30,60,120,180,240,360,480]:
+            await set_setting("prepare_interval", parts[2])
+        elif data == "prep:start":
+            slots, actions = await prepare_choices()
+            if not slots or not actions or ("join" in actions and not state["group_b"]):
+                await callback_notice(query, "Spunta almeno una sessione e un’operazione; configura il gruppo B per l’ingresso.")
+                return True
+            interval = int(await get_setting("prepare_interval", "60"))
+            text_template = await get_setting("scheduled_message_text", "ciao")
+            
+            steps = []
+            for a in actions:
+                if a in {"profiles", "join"}:
+                    for i in slots:
+                        steps.append({"type": a, "slot": i, "owner": session_info[i]["user_id"]})
+                elif a == "messages":
+                    for sender_slot in slots:
+                        sender_owner = session_info[sender_slot]["user_id"]
+                        for target_slot in slots:
+                            if sender_slot == target_slot:
+                                continue
+                            target_owner = session_info[target_slot]["user_id"]
+                            target_username = session_info[target_slot].get("username")
+                            steps.append({
+                                "type": "messages",
+                                "slot": sender_slot,
+                                "owner": sender_owner,
+                                "target_slot": target_slot,
+                                "target_owner": target_owner,
+                                "target_username": target_username,
+                                "text": text_template
+                            })
+
+            if (len(steps) - 1) * interval > 48 * 60:
+                await callback_notice(query, "Questa combinazione supera le 48 ore: riduci l’intervallo o il numero di sessioni.")
+                return True
+            prepare_job = {"status": "in corso", "index": 0, "steps": steps, "interval": interval, "next_at": 0, "inflight": False, "results": [], "group": dict(state["group_b"]) if state["group_b"] else None, "chat_id": update.effective_chat.id}
+            await save_prepare_job()
+            await add_log("⚙️ PREPARAZIONE AVVIATA — account: " + ", ".join(str(i) for i in slots) + " — operazioni: " + ", ".join(actions) + f" — intervallo {interval} minuti", session_id=0)
+            prepare_task = asyncio.create_task(run_prepare(context.application))
+            
+    text, markup = await prepare_screen()
+    await query.edit_message_text(text, reply_markup=markup)
+    return True
+scheduled_message_task = None
+scheduled_message_job = {}
+
+async def scheduled_message_screen():
+    slots, _ = await prepare_choices()
+    text = await get_setting("scheduled_message_text", "ciao")
+    recipients = json.loads(await get_setting("scheduled_message_recipients", "[]"))
+    stamp = await get_setting("scheduled_message_start", "non impostata")
+    lines = ["📨 MESSAGGI PROGRAMMATI", "", "Mittenti: " + (", ".join(session_button_name(i) for i in slots) or "seleziona le sessioni nel menu precedente"), "Destinatari: " + (", ".join(recipients) or "nessuno"), "Testo: " + text, "Programmazione: " + stamp, "", "Ogni destinatario riceve un solo messaggio. I mittenti vengono assegnati a turno. Gli invii sono separati dalla preparazione dei profili e dall’ingresso nel gruppo B."]
+    if scheduled_message_job:
+        lines += ["", "Stato: " + scheduled_message_job.get("status", ""), f"Avanzamento: {scheduled_message_job.get('index', 0)}/{len(scheduled_message_job.get('steps', []))}"]
+        lines += scheduled_message_job.get("results", [])[-3:]
+    active = scheduled_message_task is not None and not scheduled_message_task.done()
+    rows = [[InlineKeyboardButton("📋 Destinatari", callback_data="scheduled:recipients")], [InlineKeyboardButton("✏️ Testo del messaggio", callback_data="scheduled:text")], [InlineKeyboardButton("🕒 Programmazione", callback_data="scheduled:time")], [InlineKeyboardButton("⏹ Interrompi" if active else "▶️ Avvia invio", callback_data="scheduled:stop" if active else "scheduled:start")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="scheduled:menu")], [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]]
+    return "\n".join(lines)[:3900], panel_markup(rows, include_invite_stop=False)
+
+async def save_scheduled_messages():
+    await set_setting("scheduled_message_job", json.dumps(scheduled_message_job))
+
+async def run_scheduled_messages(application):
+    try:
+        while scheduled_message_job.get("status") == "programmato" and scheduled_message_job["index"] < len(scheduled_message_job["steps"]):
+            delay = scheduled_message_job["next_at"] - now_it().timestamp()
+            if delay > 0:
+                await asyncio.sleep(min(delay, 30))
+                continue
+            step = scheduled_message_job["steps"][scheduled_message_job["index"]]
+            scheduled_message_job["inflight"] = True
+            await save_scheduled_messages()
+            draft = {"sender_slot": step["slot"], "sender_id": step["owner"], "nonce": scheduled_message_job["nonce"], "kind": "scheduled", "text": scheduled_message_job["text"], "recipients": [step["recipient"]]}
+            result = await execute_message_batch(draft, application.bot)
+            scheduled_message_job["results"].append(result)
+            scheduled_message_job["index"] += 1
+            scheduled_message_job["inflight"] = False
+            # Nessuna rotazione per aggirare errori: al primo mancato invio ferma tutta la coda.
+            if "✅" not in result:
+                scheduled_message_job["status"] = "interrotto: verifica l’esito nei log"
+            elif scheduled_message_job["index"] == len(scheduled_message_job["steps"]):
+                scheduled_message_job["status"] = "completato"
+            scheduled_message_job["next_at"] = now_it().timestamp() + scheduled_message_job["interval"] * 60
+            await save_scheduled_messages()
+        await add_log("📨 MESSAGGI PROGRAMMATI — " + scheduled_message_job.get("status", "") + f" — {scheduled_message_job.get('index', 0)} destinatari elaborati", session_id=0)
+        try:
+            await application.bot.send_message(scheduled_message_job["chat_id"], "📨 Messaggi programmati: " + scheduled_message_job["status"] + ". Apri il pannello per il riepilogo.")
+        except Exception:
+            logger.exception("Notifica messaggi programmati non consegnata")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        scheduled_message_job["status"] = "interrotto per errore"
+        scheduled_message_job.setdefault("results", []).append(safe_connection_error(exc))
+        await save_scheduled_messages()
+        await add_log("📨 MESSAGGI PROGRAMMATI — " + safe_connection_error(exc), "ERROR", session_id=0)
+
+async def scheduled_message_action(update, context, data):
+    global scheduled_message_job, scheduled_message_task
+    if not data.startswith("scheduled:"):
+        return False
+    query = update.callback_query
+    if update.effective_chat.type != "private":
+        await callback_notice(query, "Usa la chat privata con il bot.")
+        return True
+    context.user_data.pop("scheduled_input", None)
+    state["waiting_for"] = None
+    context.user_data.pop("feature_input", None)
+    if data == "scheduled:stop":
+        scheduled_message_job["status"] = "interrotto"
+        if scheduled_message_task and not scheduled_message_task.done():
+            scheduled_message_task.cancel()
+            await asyncio.gather(scheduled_message_task, return_exceptions=True)
+        await save_scheduled_messages()
+        await add_log("⏹ Messaggi programmati interrotti dall’amministratore", session_id=0)
+    elif data != "scheduled:menu":
+        if operation_busy() or state["auto_enabled"]:
+            await callback_notice(query, "Interrompi le operazioni e disattiva AUTO prima di configurare o avviare gli invii.")
+            return True
+        prompts = {"scheduled:recipients": "Incolla gli @username dei destinatari consenzienti, uno per riga (massimo 50).", "scheduled:text": "Scrivi il testo da inviare (massimo 1000 caratteri).", "scheduled:time": "Scrivi data, ora italiana e intervallo in minuti:\nGG/MM/AAAA HH:MM | minuti\nEsempio: 12/10/2026 10:00 | 60\nIntervallo consentito: da 15 a 480 minuti."}
+        if data in prompts:
+            context.user_data["scheduled_input"] = data.split(":")[1]
+            await query.edit_message_text(prompts[data], reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Messaggi programmati", callback_data="scheduled:menu")]], include_invite_stop=False))
+            return True
+        if data == "scheduled:start":
+            slots, _ = await prepare_choices()
+            usernames = json.loads(await get_setting("scheduled_message_recipients", "[]"))
+            start_at = float(await get_setting("scheduled_message_timestamp", "0"))
+            if not slots or not usernames or start_at <= now_it().timestamp():
+                await callback_notice(query, "Seleziona i mittenti, inserisci i destinatari e imposta una data futura.")
+                return True
+            steps, seen = [], set()
+            all_owners = {info.get("user_id") for info in session_info.values()}
+            try:
+                for index, username in enumerate(usernames):
+                    slot = slots[index % len(slots)]
+                    record = await registry_for(slot)
+                    if session_info[slot]["telegram_locked"] or record.get("halted_reason"):
+                        raise ValueError("Mittente sospeso: verifica la diagnostica")
+                    recipient = await resolve_message_recipient(session_clients[slot], username)
+                    if recipient["id"] in all_owners:
+                        raise ValueError("Seleziona destinatari esterni alle sessioni gestite")
+                    if recipient["id"] not in seen:
+                        steps.append({"slot": slot, "owner": session_info[slot]["user_id"], "recipient": recipient})
+                        seen.add(recipient["id"])
+            except Exception as exc:
+                await callback_notice(query, "Programmazione non avviata — " + safe_connection_error(exc))
+                return True
+            scheduled_message_job = {"status": "programmato", "index": 0, "steps": steps, "text": await get_setting("scheduled_message_text", "ciao"), "nonce": secrets.token_hex(8), "interval": int(await get_setting("scheduled_message_interval", "60")), "next_at": start_at, "inflight": False, "results": [], "chat_id": update.effective_chat.id}
+            await save_scheduled_messages()
+            await add_log(f"📨 MESSAGGI PROGRAMMATI AVVIATI — {len(steps)} destinatari — inizio " + await get_setting("scheduled_message_start", ""), session_id=0)
+            scheduled_message_task = asyncio.create_task(run_scheduled_messages(context.application))
+    text, markup = await scheduled_message_screen()
+    await query.edit_message_text(text, reply_markup=markup)
+    return True
+
+async def scheduled_message_input(update, context):
+    target = context.user_data.get("scheduled_input")
+    if not target:
+        return False
+    if update.effective_chat.type != "private" or operation_busy() or state["auto_enabled"]:
+        await update.message.reply_text("Interrompi le operazioni prima di cambiare le impostazioni.")
+        return True
+    value = update.message.text.strip()
+    try:
+        if target == "recipients":
+            usernames = list(dict.fromkeys(line.strip().lower() for line in value.splitlines() if line.strip()))
+            if not 1 <= len(usernames) <= 50 or any(not re.fullmatch(r"@[a-z][a-z0-9_]{3,31}", x) for x in usernames):
+                raise ValueError("Usa da 1 a 50 @username validi, uno per riga")
+            await set_setting("scheduled_message_recipients", json.dumps(usernames))
+        elif target == "text":
+            if not value or len(value) > 1000:
+                raise ValueError("Scrivi da 1 a 1000 caratteri")
+            await set_setting("scheduled_message_text", value)
+        elif target == "time":
+            stamp, minutes = [part.strip() for part in value.split("|")]
+            dt = datetime.strptime(stamp, "%d/%m/%Y %H:%M").replace(tzinfo=ITALY_TZ)
+            interval = int(minutes)
+            if dt <= now_it() or not 15 <= interval <= 480:
+                raise ValueError("Usa una data futura e un intervallo da 15 a 480 minuti")
+            await set_setting("scheduled_message_timestamp", dt.timestamp())
+            await set_setting("scheduled_message_interval", interval)
+            await set_setting("scheduled_message_start", stamp + f" · ogni {interval} minuti")
+        context.user_data.pop("scheduled_input", None)
+    except (ValueError, TypeError) as exc:
+        await update.message.reply_text("❌ " + str(exc))
+        return True
+    text, markup = await scheduled_message_screen()
+    await update.message.reply_text(text, reply_markup=markup)
+    return True
+
+async def restore_scheduled_messages(application):
+    global scheduled_message_job, scheduled_message_task
+    try:
+        scheduled_message_job = json.loads(await get_setting("scheduled_message_job", "{}"))
+    except (TypeError, ValueError):
+        scheduled_message_job = {}
+    if scheduled_message_job.get("status") == "programmato":
+        if scheduled_message_job.get("inflight") or operation_busy() or state["auto_enabled"]:
+            scheduled_message_job["status"] = "interrotto: verifica prima di riprogrammare"
+            await save_scheduled_messages()
+        else:
+            scheduled_message_task = asyncio.create_task(run_scheduled_messages(application))
+
+
+async def restore_prepare(application):
+    global prepare_job, prepare_task
+    try:
+        prepare_job = json.loads(await get_setting("prepare_job", "{}"))
+    except (ValueError, TypeError):
+        prepare_job = {}
+    if prepare_job.get("status") == "in corso":
+        if prepare_job.get("inflight"):
+            prepare_job["status"] = "interrotta: verifica l'ultima operazione prima di riavviare"
+            await save_prepare_job()
+        elif state["auto_enabled"] or operation_busy():
+            prepare_job["status"] = "interrotta: altra operazione attiva"
+            await save_prepare_job()
+        else:
+            prepare_task = asyncio.create_task(run_prepare(application))
+
+
+def sessions_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("📋 Seleziona sessione", callback_data="sf:list")],
+        [InlineKeyboardButton("🔥 Riscalda sessioni", callback_data="prep:menu")],
+        [InlineKeyboardButton("🧪 Test messaggio", callback_data="msg:setup")],
+        [InlineKeyboardButton("➕ Aggiungi sessione", callback_data="add_session")],
+        [InlineKeyboardButton("⬅️ Menu", callback_data="home")],
+    ])
+
+
+async def session_list_keyboard():
+    rows = []
+    for slot in ACCOUNT_IDS:
+        record = await registry_for(slot)
+        icon = await session_status_color(slot, record)
+        rows.append([TelegramInlineKeyboardButton(f"{icon} {session_button_name(slot)}", callback_data=f"select_session:{slot}")])
+    rows.append([InlineKeyboardButton("🔄 Verifica e aggiorna sessioni", callback_data="refresh_sessions")])
+    rows.append([InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")])
+    return panel_markup(rows)
+
+
+async def session_card_text(account_id):
+    info = session_info[account_id]
+    record = await registry_for(account_id)
+    stamp = record.get("inserted_at")
+    if record.get("legacy_session"):
+        age = "Sessione già presente da giorni — attesa iniziale non richiesta"
+        inserted = "data storica non registrata — preesistente all’aggiornamento"
+    elif stamp:
+        date = datetime.fromisoformat(stamp)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=ITALY_TZ)
+        age = f"{max(0, int((now_it() - date).total_seconds() // 3600))} ore"
+        inserted = stamp
+    else:
+        age, inserted = "non disponibile", "non disponibile"
+    try:
+        diagnosis = json.loads(record.get("diagnosis", "{}"))
+    except (ValueError, TypeError):
+        diagnosis = {}
+    group_state = diagnosis.get("membership", "non verificato") if diagnosis.get("group_id") == (state["group_b"] or {}).get("id") else "non verificato per il gruppo attuale"
+    return "\n".join([
+        "👤 SCHEDA SESSIONE", session_button_name(account_id),
+        "Username: " + ("@" + info["username"] if info.get("username") else "non impostato"),
+        "Colore: " + await session_status_color(account_id, record),
+        f"ID: {info['user_id'] or 'non disponibile'}",
+        "Stato: " + await session_status_label(account_id, record),
+        "Inserimento: " + inserted, "Età: " + age,
+        "Connessione: " + info["error"][:180],
+        f"Proxy: {info['proxy_slot'] or 'diretto / non configurato'}",
+        "Ultima verifica: " + (record.get("last_check") or "non disponibile"),
+        "Gruppo B (ultima diagnosi): " + group_state,
+        "Ultimo errore: " + (record.get("last_error") or "nessuno registrato")[:300],
+        "", "Il cambio sessione disattiva AUTO. I blocchi Telegram restano invariati.",
+    ])
+
+
+async def session_card_keyboard(account_id):
+    record = await registry_for(account_id)
+    try:
+        diagnosis = json.loads(record.get("diagnosis", "{}"))
+    except (ValueError, TypeError):
+        diagnosis = {}
+    rows = [[InlineKeyboardButton("🔎 Diagnostica", callback_data="sf:diagnose")]]
+    if diagnosis.get("group_id") == (state["group_b"] or {}).get("id") and diagnosis.get("membership") == "absent":
+        rows.append([InlineKeyboardButton("🚪 Entra nel gruppo B", callback_data="jb:setup")])
+    rows.append([InlineKeyboardButton("⚙️ Gestisci account", callback_data="sf:manage")])
+    rows.append([InlineKeyboardButton("⬅️ Elenco sessioni", callback_data="sf:list")])
+    return panel_markup(rows)
+
+
+async def account_management_keyboard(account_id):
+    record = await registry_for(account_id)
+    remaining = wait_remaining(record)
+    info = session_info[account_id]
+    rows = [[InlineKeyboardButton("🔌 Verifica connessione e SpamBot", callback_data=f"check_session:{account_id}")],
+            [InlineKeyboardButton("📨 Messaggi ricevuti", callback_data=f"inbox:list:{account_id}:0")],
+            [InlineKeyboardButton("🎲 Genera profilo", callback_data=f"profile_new:{account_id}")]]
+    if remaining is None and info["user_id"]:
+        rows.append([InlineKeyboardButton("⏳ Inizia attesa", callback_data="sf:age")])
+    elif remaining == 0 and (not record.get("approved") or record.get("halted_reason")) and not info["telegram_locked"] and not info["telegram_restriction_detected"]:
+        rows.append([InlineKeyboardButton("✅ Abilita sessione", callback_data="sf:enable")])
+    if info["telegram_locked"]:
+        rows.append([InlineKeyboardButton("🔒 Gestisci blocco", callback_data="unlock_confirm")])
+    rows.extend([[InlineKeyboardButton("🗑 Elimina sessione", callback_data=f"delete_session:{account_id}")],
+                 [InlineKeyboardButton("⬅️ Scheda sessione", callback_data="sf:card")]])
+    return panel_markup(rows)
+
+
+PROFILE_COLORS = ((36, 43, 56), (38, 62, 73), (49, 66, 61), (58, 47, 67), (81, 59, 43), (42, 60, 65))
+PROFILE_NAMES = ("Shadow", "Ember", "Silver", "Onyx", "Crimson", "Astral", "Obsidian", "Lunar", "Silent", "Mystic", "Frost", "Velvet", "Arcane", "Midnight", "Eclipse", "Azure", "Ivory", "Raven", "Storm", "Spectral")
+PROFILE_SECOND_WORDS = ("Vale", "Drift", "Echo", "Crest", "Veil", "Rune", "Haven", "Shard", "Dusk", "Flame", "Mist", "Hollow", "Warden", "Nexus", "Tide", "Realm", "Horizon", "Grove", "Cipher", "Wisp")
+PROFILE_BIOS = ("An illustrated character from an imagined realm.",
+                "A fantasy character, drawn in shadow and light.",
+                "An animal spirit from a fictional world.")
+PROFILE_MASCOTS = ("orsetto", "gattino", "gufetto", "coniglietto", "volpetta", "panda", "cagnolino", "koala", "pinguino", "ranocchio")
+
+
+async def choose_profile_mascot(account_id, owner_id):
+    used = set()
+    for slot in ACCOUNT_IDS:
+        other_owner = session_info[slot].get("user_id")
+        if other_owner and other_owner != owner_id:
+            mascot = await get_setting(f"profile_mascot_{other_owner}", "")
+            if mascot:
+                used.add(mascot)
+    choices = [animal for animal in PROFILE_MASCOTS if animal not in used]
+    if not choices:
+        raise ValueError("Tutti gli animali disponibili sono assegnati: amplia il catalogo avatar")
+    current = await get_setting(f"profile_mascot_{owner_id}", "")
+    # Alla rigenerazione cambia animale quando ce n'è un altro libero.
+    alternatives = [animal for animal in choices if animal != current]
+    selected = secrets.choice(alternatives or choices)
+    await set_setting(f"profile_mascot_{owner_id}", selected)
+    return selected
+
+
+def profile_avatar(account_id, color, mascot="orsetto"):
+    """Animale cartoon, PNG senza dipendenze esterne e senza numeri sul volto."""
+    size = 512
+    pixels = bytearray(bytes(color) * (size * size))
+    def rect(x, y, w, h, rgb):
+        for row in range(max(0, y), min(size, y + h)):
+            start = (row * size + max(0, x)) * 3
+            end = (row * size + min(size, x + w)) * 3
+            pixels[start:end] = bytes(rgb) * ((end - start) // 3)
+    glyphs = {
+        'B': ('11110','10001','10001','11110','10001','10001','11110'),
+        '0': ('01110','10001','10011','10101','11001','10001','01110'),
+        '1': ('00100','01100','00100','00100','00100','00100','01110'),
+        '2': ('01110','10001','00001','00010','00100','01000','11111'),
+        '3': ('11110','00001','00001','01110','00001','00001','11110'),
+        '4': ('00010','00110','01010','10010','11111','00010','00010'),
+        '5': ('11111','10000','10000','11110','00001','00001','11110'),
+        '6': ('01110','10000','10000','11110','10001','10001','01110')}
+    def text(value, y, scale):
+        x = (size - (len(value) * 6 - 1) * scale) // 2
+        for char in value:
+            for row, bits in enumerate(glyphs[char]):
+                for col, bit in enumerate(bits):
+                    if bit == '1': rect(x + col * scale, y + row * scale, scale, scale, (255,255,255))
+            x += 6 * scale
+    def ellipse(cx, cy, rx, ry, rgb):
+        for y in range(max(0, cy - ry), min(size, cy + ry + 1)):
+            half = int(rx * math.sqrt(max(0, 1 - ((y - cy) / ry) ** 2)))
+            rect(cx - half, y, half * 2 + 1, 1, rgb)
+    dark = (38, 43, 63)
+    cream = (220, 217, 207)
+    peach = (153, 132, 123)
+    ellipse(256, 265, 193, 193, tuple(min(255, c + 26) for c in color))
+    if mascot in {'gattino', 'volpetta'}:
+        # Orecchie a punta, disegnate a righe.
+        for y in range(90, 210):
+            width = (y - 90) // 2
+            rect(155 - width, y, width * 2 + 1, 1, cream)
+            rect(357 - width, y, width * 2 + 1, 1, cream)
+    elif mascot in {'orsetto', 'panda', 'koala'}:
+        ear_color = dark if mascot == 'panda' else ((180, 185, 192) if mascot == 'koala' else cream)
+        ellipse(151, 166, 64, 66, ear_color)
+        ellipse(361, 166, 64, 66, ear_color)
+        ellipse(151, 166, 35, 37, peach)
+        ellipse(361, 166, 35, 37, peach)
+    elif mascot == 'coniglietto':
+        ellipse(184, 140, 39, 112, cream)
+        ellipse(328, 140, 39, 112, cream)
+        ellipse(184, 140, 18, 78, peach)
+        ellipse(328, 140, 18, 78, peach)
+    elif mascot == 'cagnolino':
+        ellipse(125, 235, 56, 107, (157, 101, 64))
+        ellipse(387, 235, 56, 107, (157, 101, 64))
+    elif mascot == 'ranocchio':
+        ellipse(182, 177, 59, 65, (111, 139, 94))
+        ellipse(330, 177, 59, 65, (111, 139, 94))
+    elif mascot == 'gufetto':
+        ellipse(169, 195, 79, 82, cream)
+        ellipse(343, 195, 79, 82, cream)
+    face = (179, 117, 61) if mascot == 'volpetta' else ((111, 139, 94) if mascot == 'ranocchio' else ((180, 185, 192) if mascot == 'koala' else cream))
+    if mascot == 'pinguino':
+        ellipse(256, 267, 165, 150, dark)
+    ellipse(256, 270, 148, 132, face)
+    if mascot == 'panda':
+        ellipse(194, 245, 42, 49, dark)
+        ellipse(318, 245, 42, 49, dark)
+    if mascot == 'koala':
+        ellipse(256, 272, 32, 46, (74, 71, 80))
+    if mascot == 'volpetta':
+        ellipse(213, 305, 62, 45, cream)
+        ellipse(299, 305, 62, 45, cream)
+    if mascot == 'gufetto':
+        ellipse(194, 247, 53, 57, (255,255,255))
+        ellipse(318, 247, 53, 57, (255,255,255))
+    ellipse(198, 247, 13, 17, dark)
+    ellipse(314, 247, 13, 17, dark)
+    ellipse(194, 243, 3, 4, (255,255,255))
+    ellipse(310, 243, 3, 4, (255,255,255))
+    rect(178, 219, 39, 5, dark)
+    rect(295, 219, 39, 5, dark)
+    ellipse(256, 286, 17, 12, (229,148,55) if mascot in {'gufetto', 'pinguino'} else dark)
+    rect(253, 297, 6, 18, dark)
+    rect(236, 313, 40, 3, dark)
+    if mascot == 'gattino':
+        rect(112, 276, 46, 4, dark)
+        rect(111, 299, 46, 4, dark)
+        rect(354, 276, 46, 4, dark)
+        rect(355, 299, 46, 4, dark)
+    def chunk(kind, payload):
+        return struct.pack('>I', len(payload)) + kind + payload + struct.pack('>I', zlib.crc32(kind + payload) & 0xffffffff)
+    raw = b''.join(b'\x00' + pixels[row*size*3:(row+1)*size*3] for row in range(size))
+    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB',size,size,8,2,0,0,0)) + chunk(b'IDAT',zlib.compress(raw)) + chunk(b'IEND',b'')
+
+PROFILE_NAME_ROOTS = ("Night", "Moon", "Star", "Dream", "Dawn", "Dusk", "Ash", "Wind", "Frost", "Void", "Rune", "Mist")
+PROFILE_NAME_ENDINGS = ("fall", "borne", "weave", "bound", "song", "shade", "spark", "glow", "stone", "watch")
+
+
+async def used_profile_identifiers():
+    names = {session_button_name(i).casefold() for i in ACCOUNT_IDS if session_button_name(i) != "Nome non impostato"}
+    usernames = {(info.get("username") or "").casefold() for info in session_info.values() if info.get("username")}
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT name,username FROM generated_profile_history")
+        for name, username in await cursor.fetchall():
+            names.add(name.casefold())
+            usernames.add(username.casefold())
+    return names, usernames
+
+
+async def generate_profile_identity(client, owner_id):
+    names, usernames = await used_profile_identifiers()
+    remaining = [first + " " + second for first in PROFILE_NAMES for second in PROFILE_SECOND_WORDS if (first + " " + second).casefold() not in names]
+    for attempt in range(12):
+        if remaining:
+            name = secrets.choice(remaining)
+            remaining.remove(name)
+        else:
+            name = None
+            for _ in range(300):
+                candidate = secrets.choice(PROFILE_NAME_ROOTS) + secrets.choice(PROFILE_NAME_ENDINGS) + " " + secrets.choice(PROFILE_SECOND_WORDS)
+                if candidate.casefold() not in names:
+                    name = candidate
+                    break
+            if name is None:
+                raise ValueError("Nessun nuovo nome disponibile: amplia il generatore")
+        names.add(name.casefold())
+        base = (name.split()[0][:4] + name.split()[1][:4]).lower()
+        # Username classici: lettere ASCII, numeri; minimo 5 caratteri.
+        # Per questa funzione il target scelto e' 6–10 caratteri.
+        for variant in range(3):
+            suffix = "" if variant == 0 and len(base) >= 6 else secrets.choice("abcdefghkmnprstuvz23456789")
+            if variant == 2:
+                suffix += secrets.choice("23456789")
+            username = base + suffix
+            if not 6 <= len(username) <= 10 or username.casefold() in usernames:
+                continue
+            usernames.add(username.casefold())
+            try:
+                available = bool(await asyncio.wait_for(client(CheckUsernameRequest(username)), 12))
+            except Exception as exc:
+                if type(exc).__name__ in {"UsernameOccupiedError", "UsernameInvalidError", "UsernamePurchaseAvailableError"}:
+                    continue
+                raise
+            if not available:
+                continue
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("INSERT INTO generated_profile_history(name,username,owner_id,created_at) VALUES (?,?,?,?)",
+                                     (name.casefold(), username.casefold(), owner_id, now_it().isoformat()))
+                    await db.commit()
+            except aiosqlite.IntegrityError:
+                continue
+            return name, username
+    raise ValueError("Nessuno username breve disponibile nei controlli effettuati. Nessun profilo modificato; riprova piu' tardi")
+
+
+async def recheck_profile_identity(client, pending):
+    for slot in ACCOUNT_IDS:
+        info = session_info[slot]
+        if info.get("user_id") == pending["owner_id"]:
+            continue
+        if session_button_name(slot).casefold() == pending["first_name"].casefold():
+            raise ValueError("Il nome e' ora utilizzato da un'altra sessione: rigenera il profilo")
+        if (info.get("username") or "").casefold() == pending["username"].casefold():
+            raise ValueError("Lo username e' ora utilizzato da un'altra sessione: rigenera il profilo")
+    try:
+        available = bool(await asyncio.wait_for(client(CheckUsernameRequest(pending["username"])), 12))
+    except Exception as exc:
+        if type(exc).__name__ in {"UsernameOccupiedError", "UsernameInvalidError", "UsernamePurchaseAvailableError"}:
+            raise ValueError("Lo username non è più assegnabile gratuitamente: rigenera il profilo. Nessuna modifica eseguita.") from exc
+        raise
+    if not available:
+        raise ValueError("Lo username non e' piu' disponibile: nessuna modifica eseguita. Rigenera il profilo")
+
+
+async def profile_action(update, context):
+    query = update.callback_query
+    data = query.data
+    if data == 'profile_cancel':
+        context.user_data.pop('profile_pending', None)
+        await query.edit_message_text('Profilo annullato.', reply_markup=sessions_keyboard())
+        return
+    if operation_busy() or state['auto_enabled']:
+        await callback_notice(query, 'Disattiva AUTO e attendi la fine delle operazioni prima di modificare i profili.')
+        return
+    if data.startswith('profile_new:') or data.startswith('profile_regen:'):
+        if data.startswith('profile_regen:'):
+            old = context.user_data.get('profile_pending')
+            if not old or old['nonce'] != data.split(':',1)[1]:
+                await callback_notice(query, 'Anteprima scaduta: riapri GENERA PROFILO.')
+                return
+            account_id = old['account_id']
+        else:
+            value = data.split(':',1)[1]
+            account_id = int(value) if value.isdigit() else 0
+        context.user_data.pop('profile_pending', None)
+        if account_id not in ACCOUNT_IDS or not session_info[account_id]['ready']:
+            await callback_notice(query, 'Sessione non disponibile: usa VERIFICA.')
+            return
+        if await get_setting(f'profile_pause_{account_id}', '0') and float(await get_setting(f'profile_pause_{account_id}', '0')) > now_it().timestamp():
+            await callback_notice(query, 'Telegram ha richiesto una pausa per il profilo di questo account. Attendi prima di riprovare.')
+            return
+        client = session_clients[account_id]
+        try:
+            me = await asyncio.wait_for(client.get_me(), 15)
+            if not me or me.id != session_info[account_id]['user_id']:
+                raise ValueError('Identità della sessione cambiata: esegui VERIFICA')
+            role, username = await generate_profile_identity(client, me.id)
+            available = True
+            pending = {'account_id': account_id, 'owner_id': me.id,
+                       'admin_id': update.effective_user.id, 'created_at': now_it().timestamp(),
+                       'nonce': secrets.token_hex(6), 'first_name': role,
+                       'last_name': '', 'bio': secrets.choice(PROFILE_BIOS),
+                       'username': username if available else None,
+                       'color': secrets.choice(PROFILE_COLORS), 'mascot': await choose_profile_mascot(account_id, me.id)}
+            avatar = profile_avatar(account_id, pending['color'], pending['mascot'])
+            caption = (f"🎲 ANTEPRIMA ACCOUNT {account_id} — ID {me.id}\n\n"
+                       f"Nome: {pending['first_name']}\nAvatar: {pending['mascot']}\n"
+                       f"Bio: {pending['bio']}\n"
+                       + (f"Username: @{username} — disponibile al controllo" if available else 'Username proposto non disponibile: quello attuale sarà mantenuto')
+                       + '\n\nProfilo del progetto. Modifiche solo dopo APPLICA; nessun invito.')
+            await query.message.reply_photo(photo=avatar, caption=caption)
+            nonce = pending['nonce']
+            await query.message.reply_text(f'Anteprima pronta per ACCOUNT {account_id}. Premi ✅ APPLICA qui sotto per sostituire nome, bio, foto e lo username disponibile. La vecchia foto resterà nello storico Telegram.',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('🔄 RIGENERA', callback_data=f'profile_regen:{nonce}'), InlineKeyboardButton('✅ APPLICA', callback_data=f'profile_apply:{nonce}')],
+                    [InlineKeyboardButton('❌ ANNULLA', callback_data='profile_cancel')]]))
+            context.user_data['profile_pending'] = pending
+        except Exception as exc:
+            if isinstance(exc, FloodWaitError):
+                await set_setting(f'profile_pause_{account_id}', now_it().timestamp() + exc.seconds)
+            await add_log('👤 ANTEPRIMA PROFILO FALLITA — ' + safe_connection_error(exc), session_id=account_id)
+            await callback_notice(query, 'Anteprima non creata — ' + safe_connection_error(exc))
+        return
+    pending = context.user_data.get('profile_pending')
+    if (not pending or pending['nonce'] != data.split(':',1)[1]
+            or pending['admin_id'] != update.effective_user.id
+            or now_it().timestamp() - pending['created_at'] > 600):
+        await callback_notice(query, 'Anteprima scaduta o già utilizzata: genera un nuovo profilo.')
+        return
+    account_id = pending['account_id']
+    client = session_clients[account_id]
+    context.user_data.pop('profile_pending', None)  # nessuna replica tramite doppio clic
+    lines = [f'👤 AGGIORNAMENTO PROFILO — ACCOUNT {account_id}']
+    try:
+        me = await asyncio.wait_for(client.get_me(), 15)
+        if not session_info[account_id]['ready'] or not me or me.id != pending['owner_id']:
+            raise ValueError('Identità della sessione cambiata: nessuna modifica eseguita')
+        pause_until = float(await get_setting(f'profile_pause_{account_id}', '0'))
+        if pause_until > now_it().timestamp():
+            raise ValueError('Pausa Telegram ancora attiva per questo profilo')
+        await recheck_profile_identity(client, pending)
+        await asyncio.wait_for(client(UpdateProfileRequest(first_name=pending['first_name'], last_name=pending['last_name'], about=pending['bio'])), 20)
+        lines.append('✅ Nome e bio aggiornati')
+        await add_log('👤 PROFILO — nome e bio aggiornati', session_id=account_id)
+        session_info[account_id]['name'] = (pending['first_name'] + ' ' + pending['last_name']).strip()
+        session_info[account_id]['display_name'] = session_info[account_id]['name']
+        if pending['username']:
+            await asyncio.wait_for(client(UpdateUsernameRequest(pending['username'])), 20)
+            session_info[account_id]['username'] = pending['username']
+            lines.append('✅ Username aggiornato: @' + pending['username'])
+            await add_log('👤 PROFILO — username aggiornato', session_id=account_id)
+        else:
+            lines.append('ℹ️ Username attuale mantenuto')
+        photo = io.BytesIO(profile_avatar(account_id, pending['color'], pending['mascot']))
+        photo.name = f'mascotte_account_{account_id}.png'
+        uploaded = await asyncio.wait_for(client.upload_file(photo), 30)
+        await asyncio.wait_for(client(UploadProfilePhotoRequest(file=uploaded)), 20)
+        await set_setting(f"profile_prepared_{pending['owner_id']}", "1")
+        lines.append('✅ Avatar aggiornato')
+        await add_log('👤 PROFILO — avatar aggiornato su conferma amministratore', session_id=account_id)
+    except Exception as exc:
+        if isinstance(exc, FloodWaitError):
+            await set_setting(f'profile_pause_{account_id}', now_it().timestamp() + exc.seconds)
+        lines.append('⚠️ Operazione interrotta — ' + safe_connection_error(exc))
+        lines.append('Le modifiche già riuscite restano applicate. In caso di timeout verifica il profilo su Telegram prima di riprovare.')
+        await add_log('👤 PROFILO INTERROTTO — ' + safe_connection_error(exc), session_id=account_id)
+    await query.edit_message_text('\n'.join(lines), reply_markup=sessions_keyboard())
+
+
+proxy_checks = {}
+ip_checks = {}
+
+
+def proxy_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("🧪 TEST PROXY 1", callback_data="proxy_test:1"),
+         InlineKeyboardButton("🧪 TEST PROXY 2", callback_data="proxy_test:2")],
+        [InlineKeyboardButton("🔎 IP TELEGRAM — SESSIONE ATTIVA", callback_data="proxy_ip")],
+        [InlineKeyboardButton("🔄 AGGIORNA", callback_data="proxy_status")],
+        [InlineKeyboardButton("⬅️ Diagnostica", callback_data="menu_diagnostics")],
+    ])
+
+
+async def proxy_status_text():
+    lines = ["🌐 PROXY / DIAGNOSTICA", ""]
+    for slot in (1, 2):
+        host = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
+        port = os.environ.get(f"PROXY_{slot}_PORT", "50101")
+        accounts = [str(i) for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot]
+        lines.extend([f"PROXY {slot} — SOCKS5 {host or 'non configurato'}:{port}",
+                      "Account configurati: " + (", ".join(accounts) or "nessuno"),
+                      proxy_checks.get(slot, "⚪ Non ancora testato in questo avvio"), ""])
+    account_id = state["active_session"]
+    lines.extend(["Sessione attiva: " + session_label(account_id),
+                  ip_checks.get(account_id, "⚪ IP visto da Telegram non ancora verificato"), "",
+                  "Il test verifica autenticazione SOCKS5 e apertura di una connessione verso Telegram.",
+                  "L'IP è quello riportato da Telegram per l'autorizzazione corrente: può essere aggiornato con ritardo.",
+                  "Un risultato positivo non certifica l'assenza di limitazioni antispam.",
+                  "Questi controlli non inviano inviti e non rimuovono i blocchi locali."])
+    return "\n".join(lines)
+
+
+async def test_proxy_connection(slot):
+    if slot not in (1, 2):
+        raise ValueError("Proxy non valido")
+    sock = None
+    stamp = now_it().strftime("%H:%M:%S")
+    try:
+        from python_socks import ProxyType
+        from python_socks.async_.asyncio import Proxy
+        candidates = [i for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot]
+        if not candidates:
+            raise ValueError("Nessuna sessione configurata per questo proxy")
+        account_id = candidates[0]
+        _, config = proxy_for_account(account_id)
+        client = session_clients.get(account_id)
+        if client is None:
+            raise ValueError("Client della sessione non disponibile")
+        target = client.session.server_address
+        target_port = client.session.port
+        proxy = Proxy(proxy_type=ProxyType.SOCKS5, host=config["addr"], port=config["port"],
+                      username=config["username"], password=config["password"], rdns=True)
+        started = asyncio.get_running_loop().time()
+        sock = await asyncio.wait_for(proxy.connect(dest_host=target, dest_port=target_port, timeout=10), timeout=12)
+        elapsed = int((asyncio.get_running_loop().time() - started) * 1000)
+        result = f"✅ {stamp} — SOCKS5 autenticato; connessione verso Telegram aperta ({elapsed} ms)"
+    except Exception as exc:
+        result = f"❌ {stamp} — TEST FALLITO — {safe_connection_error(exc)}"
+    finally:
+        if sock is not None:
+            sock.close()
+    proxy_checks[slot] = result
+    await add_log(f"🌐 PROXY {slot} — {result}", session_id=0)
+    return result
+
+
+async def check_telegram_ip(account_id):
+    stamp = now_it().strftime("%H:%M:%S")
+    info = session_info[account_id]
+    if not info["ready"]:
+        result = f"⚠️ {stamp} — Sessione non connessa: usa VERIFICA nel menu SESSIONI"
+    else:
+        try:
+            response = await asyncio.wait_for(session_clients[account_id](GetAuthorizationsRequest()), timeout=15)
+            current = next((a for a in response.authorizations if getattr(a, "current", False)), None)
+            if current is None or not getattr(current, "ip", None):
+                raise ValueError("IP dell'autorizzazione corrente non disponibile")
+            slot = info["proxy_slot"]
+            expected = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
+            result = f"🔎 {stamp} — IP riportato da Telegram: {current.ip}"
+            if current.ip == expected:
+                result += f" — coincide con il server proxy {slot}"
+            else:
+                result += " — diverso dal server proxy configurato; può essere un IP di uscita distinto o un dato non ancora aggiornato"
+        except Exception as exc:
+            result = f"❌ {stamp} — VERIFICA IP FALLITA — {safe_connection_error(exc)}"
+    ip_checks[account_id] = result
+    await add_log(result, session_id=account_id)
+    return result
+
+
+async def diagnostic_group(client, group, label):
+    if not group:
+        return [f"📂 {label}: non configurato"]
+    lines = [f"📂 {label}: {str(group.get('name', group['id']))[:80]}"]
+    try:
+        entity = await asyncio.wait_for(client.get_entity(group["input"]), timeout=10)
+        permissions = await asyncio.wait_for(client.get_permissions(entity, "me"), timeout=10)
+        if permissions is None:
+            lines.append("⚠️ Permessi personali non disponibili")
+        elif permissions.has_left or getattr(getattr(getattr(permissions, "participant", None), "banned_rights", None), "view_messages", False):
+            lines.append("❌ Non membro oppure escluso dal gruppo")
+        else:
+            role = "proprietario" if permissions.is_creator else "amministratore" if permissions.is_admin else "membro"
+            lines.append(f"✅ Presenza verificata — ruolo: {role}")
+            if permissions.is_creator or permissions.is_admin:
+                allowed = bool(permissions.is_creator or permissions.invite_users)
+            else:
+                personal = getattr(getattr(permissions, "participant", None), "banned_rights", None)
+                defaults = getattr(entity, "default_banned_rights", None)
+                allowed = not (getattr(personal, "invite_users", False) or getattr(defaults, "invite_users", False))
+            lines.append("Invita utenti (permessi del gruppo): " + ("✅ consentito" if allowed else "❌ non consentito"))
+            if permissions.is_banned:
+                lines.append("⚠️ Account con restrizioni personali nel gruppo")
+            if label == "GRUPPO B" and not allowed:
+                lines.append("Azione: controlla i permessi del gruppo per questo account.")
+        if getattr(entity, "participants_count", None) is not None:
+            lines.append(f"Membri riportati: {entity.participants_count}")
+    except Exception as exc:
+        if type(exc).__name__ == "UserNotParticipantError":
+            lines.append("ℹ️ Account non membro: la lettura dipende dall'accesso consentito da Telegram." if label == "GRUPPO A" else "❌ Account non membro: deve prima entrare nel gruppo.")
+        else:
+            lines.append("⚠️ Accesso/permessi non verificabili — " + safe_connection_error(exc))
+    return lines
+
+
+def classify_spambot_reply(reply):
+    """Riconosce soltanto risposte esplicite; non deduce uno stato da una parola."""
+    text = " ".join(reply.lower().replace("’", "'").split())
+    clear = any(phrase in text for phrase in (
+        "good news, no limits are currently applied to your account",
+        "nessuna limitazione è attualmente applicata al tuo account",
+        "nessun limite è attualmente applicato al tuo account",
+    ))
+    limited = any(phrase in text for phrase in (
+        "your account is now limited", "your account is limited",
+        "your account has been limited", "your account will be automatically released",
+        "while the account is limited, you will not be able to send messages",
+        "il tuo account è attualmente limitato", "il tuo account è stato limitato",
+    ))
+    if clear and not limited:
+        return "NO_LIMITS_REPORTED"
+    if limited and not clear:
+        return "LIMITED"
+    return "UNKNOWN"
+
+
+async def spambot_record(account_id):
+    owner = session_info[account_id]["user_id"]
+    if not owner:
+        return {}
+    try:
+        record = json.loads(await get_setting(f"spambot_check_{owner}", "{}"))
+        return record if isinstance(record, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+async def query_spambot(account_id):
+    """Richiesta esplicita dal pannello; nessun appello, invito o sblocco automatico."""
+    info = session_info[account_id]
+    if not info["ready"] or not info["user_id"]:
+        return
+    record = await spambot_record(account_id)
+    attempted = now_it().timestamp()
+    if attempted - float(record.get("attempted_at", 0)) < 60:
+        return  # Il report mantiene l'ora originale: non presenta una cache come nuova risposta.
+    record = {"status": "UNKNOWN", "attempted_at": attempted,
+              "checked_at": "", "reply": "", "error": "Risposta non ancora ricevuta"}
+    key = f"spambot_check_{info['user_id']}"
+    await set_setting(key, json.dumps(record, ensure_ascii=False))
+    client = session_clients[account_id]
+    try:
+        entity = await asyncio.wait_for(client.get_entity("@SpamBot"), timeout=10)
+        if not getattr(entity, "bot", False) or (getattr(entity, "username", None) or "").lower() != "spambot":
+            raise ValueError("Identità di @SpamBot non verificata")
+        async with client.conversation(entity, timeout=20, total_timeout=25, exclusive=True) as conversation:
+            sent = await conversation.send_message("/start")
+            response = await conversation.get_response(sent)
+        if (getattr(response, "sender_id", None) != entity.id
+                or getattr(response, "out", False)
+                or response.id <= sent.id):
+            raise ValueError("Risposta non valida o non successiva alla richiesta")
+        reply = getattr(response, "message", None) or ""
+        record.update(status=classify_spambot_reply(reply), checked_at=now_it().isoformat(),
+                      reply=reply[:2000], error="")
+        if record["status"] == "LIMITED":
+            for flag in ("telegram_locked", "telegram_restriction_detected"):
+                info[flag] = True
+                await set_setting(f"session_{account_id}_{flag}", "1")
+            if account_id == state["active_session"]:
+                sync_session_state()
+                state["auto_enabled"] = False
+                await set_setting("auto_enabled", "0")
+        await add_log("🤖 SPAMBOT — verifica aggiornata: " + record["status"] +
+                      "; blocco locale mantenuto se già presente", session_id=account_id)
+    except Exception as exc:
+        record["error"] = ("Nessuna risposta entro il tempo previsto" if isinstance(exc, asyncio.TimeoutError)
+                           else safe_connection_error(exc))
+        await add_log("⚠️ SPAMBOT — stato non determinabile: " + record["error"], session_id=account_id)
+    await set_setting(key, json.dumps(record, ensure_ascii=False))
+
+
+async def spambot_report(account_id):
+    record = await spambot_record(account_id)
+    lines = ["", "🤖 SPAMBOT — controllo su richiesta con /start"]
+    if not record:
+        return lines + ["Stato non determinabile: nessun controllo disponibile per questo account."]
+    stamp = datetime.fromtimestamp(record["attempted_at"], ITALY_TZ).strftime("%d/%m/%Y %H:%M:%S")
+    lines.append("Ultima richiesta: " + stamp + " (richieste distanziate di almeno 60 secondi)")
+    labels = {"LIMITED": "🔒 LIMITATO secondo @SpamBot",
+              "NO_LIMITS_REPORTED": "✅ NESSUNA LIMITAZIONE SEGNALATA da @SpamBot",
+              "UNKNOWN": "⚠️ STATO NON DETERMINABILE"}
+    lines.append(labels.get(record.get("status"), labels["UNKNOWN"]))
+    if record.get("checked_at"):
+        lines.append("Risposta ricevuta: " + datetime.fromisoformat(record["checked_at"]).astimezone(ITALY_TZ).strftime("%d/%m/%Y %H:%M:%S"))
+    if record.get("reply"):
+        lines.append("Testo di @SpamBot: " + record["reply"])
+    if record.get("error"):
+        lines.append("Dettaglio: " + record["error"])
+    lines.append("Lo stato di @SpamBot non certifica che gli inviti siano consentiti. Nessun blocco precedente viene rimosso automaticamente.")
+    return lines
+
+
+async def session_diagnostic_text(account_id):
+    info = session_info[account_id]
+    lines = [f"🔎 VERIFICA DETTAGLIATA — ACCOUNT {account_id}",
+             "Controllo: " + now_it().strftime("%d/%m/%Y %H:%M:%S"),
+             "Connessione: " + info["error"],
+             "ID Telegram: " + str(info["user_id"] or "non disponibile"),
+             "Blocco locale antispam: " + ("🔒 ATTIVO" if info["telegram_locked"] else "nessuno registrato"), ""]
+    slot = info["proxy_slot"]
+    if slot:
+        lines.append(f"🌐 Proxy assegnato: {slot} — SOCKS5")
+        await test_proxy_connection(slot)
+        lines.append(proxy_checks[slot])
+    else:
+        lines.append("❌ Proxy non configurato: controlla le variabili Railway.")
+    if info["ready"]:
+        client = session_clients[account_id]
+        try:
+            me = await asyncio.wait_for(client.get_me(), timeout=10)
+            if me is None:
+                raise ValueError("Identita account non disponibile")
+            lines.extend(["", "👤 IDENTITÀ",
+                          "Nome: " + " ".join(x for x in (getattr(me, "first_name", None), getattr(me, "last_name", None)) if x)[:100],
+                          "Username: " + ("@" + me.username if getattr(me, "username", None) else "non impostato"),
+                          "Numero: " + ("+" + me.phone if getattr(me, "phone", None) else "non disponibile"),
+                          "Premium: " + ("sì" if getattr(me, "premium", False) else "no"),
+                          "Account eliminato: " + ("sì" if getattr(me, "deleted", False) else "no"),
+                          "Flag restricted: " + ("sì" if getattr(me, "restricted", False) else "no"),
+                          "Flag scam/fake: " + ("sì" if getattr(me, "scam", False) or getattr(me, "fake", False) else "no")])
+            reasons = getattr(me, "restriction_reason", None) or []
+            for reason in reasons[:2]:
+                lines.append("Restrizione contenuti: " + str(getattr(reason, "text", "non specificata"))[:160])
+            lines.append("I flag dell'identità non certificano l'assenza di limiti sugli inviti.")
+        except Exception as exc:
+            lines.append("⚠️ Lettura identità fallita — " + safe_connection_error(exc))
+        lines.extend(["", "🌐 CONNESSIONE DELLA SESSIONE"])
+        lines.append(await check_telegram_ip(account_id))
+        lines.append("L'IP riportato può aggiornarsi con ritardo o differire dall'IP del server proxy.")
+        suffix = account_suffix(account_id)
+        for name, label in (("DEVICE_MODEL", "Dispositivo configurato"), ("SYSTEM_VERSION", "Sistema"), ("APP_VERSION", "Versione client")):
+            lines.append(label + ": " + os.environ.get(name + suffix, "predefinito Telethon")[:80])
+        for key, label in (("group_a", "GRUPPO A"), ("group_b", "GRUPPO B")):
+            lines.append("")
+            lines.extend(await diagnostic_group(client, state[key], label))
+    lines.extend(await spambot_report(account_id))
+    owner = info["user_id"] or ('slot_' + str(account_id))
+    deadline = float(await get_setting(f"auto_next_invite_{owner}", "0"))
+    remaining = max(0, deadline - now_it().timestamp())
+    lines.extend(["", "⏱ Pausa AUTO residua: " + (f"circa {math.ceil(remaining / 60)} minuti" if remaining else "nessuna")])
+    bound_at = await get_setting(f"session_{account_id}_bound_at", "")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT created_at, message FROM logs WHERE session_id = ? AND created_at >= ? AND "
+            "(message LIKE '%PeerFlood%' OR message LIKE '%FloodWait%' OR message LIKE '%PROBLEMA GRUPPO B%') ORDER BY id DESC LIMIT 1",
+            (account_id, bound_at),
+        )
+        row = await cursor.fetchone()
+    if row:
+        label = "Ultimo errore dall'associazione dell'account" if bound_at else "Storico dello slot — attribuzione all'account attuale non verificata"
+        lines.extend(["", "📋 " + label + ": " + row[0], row[1][:450]])
+    elif bound_at:
+        lines.extend(["", "📋 Nessun errore rilevante registrato dall'associazione dell'account attuale."])
+    lines.extend(["", "⚠️ Nessun test d'invito eseguito. Telegram non fornisce qui una certificazione preventiva dell'assenza di limiti antispam.",
+                  "PeerFlood indica una limitazione sugli inviti, non necessariamente un ban completo. Non rimuovere il blocco per riprovare."])
+    return "\n".join(lines)
+
+
+def diagnostic_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("⬅️ Scheda sessione", callback_data="sf:card")],
+        [InlineKeyboardButton("👥 Gestione sessioni", callback_data="sessions")],
+    ])
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_message:
+        await update.effective_message.reply_text(f"Il tuo ID Telegram è: {update.effective_user.id}")
+
+
+# =========================================================
+# SICUREZZA BOT
+# =========================================================
+
+def is_admin(update):
+
+    user = update.effective_user
+
+    return (
+        user is not None
+        and user.id in ADMIN_USER_IDS
+    )
+
+
+async def deny_access(update):
+
+    if update.callback_query:
+
+        await update.callback_query.answer(
+            "⛔ Accesso non autorizzato al pannello. Usa /myid per conoscere il tuo ID.",
+            show_alert=True,
+        )
+
+    elif update.effective_message:
+
+        await update.effective_message.reply_text(
+            "⛔ Accesso non autorizzato al pannello. Usa /myid per conoscere il tuo ID."
+        )
+
+
+# =========================================================
+# GRUPPI
+# =========================================================
+
+def parse_join_reference(value):
+    value = value.strip()
+    private = re.fullmatch(r"(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_-]+)(?:\?[^\s]*)?/?", value)
+    if private:
+        return {"private": True, "value": private.group(1), "display": value}
+    public = re.fullmatch(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,})(?:/)?", value)
+    username = public.group(1) if public else value.lstrip("@")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", username):
+        raise ValueError("Inserisci @username o un link t.me valido del gruppo, non il solo ID.")
+    return {"private": False, "value": "@" + username, "display": value}
+
+
+async def resolve_group(value):
+
+    value = value.strip()
+
+    if "t.me/" in value:
+
+        value = value.split(
+            "t.me/",
+            1,
+        )[1]
+
+        value = value.split(
+            "?",
+            1,
+        )[0]
+
+        value = value.strip("/")
+
+        if value.startswith("+"):
+
+            raise ValueError(
+                "Per gruppi privati usa l'ID."
+            )
+
+        value = (
+            "@"
+            + value.lstrip("@")
+        )
+
+    if value.lstrip("-").isdigit():
+
+        value = int(value)
+
+    entity = await user_client.get_entity(
+        value
+    )
+
+    if not isinstance(
+        entity,
+        (Channel, Chat),
+    ):
+
+        raise ValueError(
+            "Non è un gruppo Telegram."
+        )
+
+    if (
+        isinstance(entity, Channel)
+        and not entity.megagroup
+    ):
+
+        raise ValueError(
+            "È un canale, non un gruppo."
+        )
+
+    return {
+        "id": entity.id,
+        "name": getattr(
+            entity,
+            "title",
+            "Gruppo",
+        ),
+        "input": value,
+        "username": getattr(entity, "username", None),
+    }
+
+
+# =========================================================
+# VERIFICA MEMBRO IN B
+# =========================================================
+
+async def verify_in_destination(
+    destination,
+    user,
+):
+
+    try:
+
+        response = await user_client(GetParticipantRequest(destination, user))
+        participant = getattr(response, "participant", None)
+        if participant is None:
+            return False, "InvalidParticipantResponse", "Risposta senza partecipante"
+        rights = getattr(participant, "banned_rights", None)
+        if (type(participant).__name__ == "ChannelParticipantLeft" or getattr(participant, "left", False)
+                or getattr(rights, "view_messages", False)):
+            return False, "UserNotParticipantError", "Partecipante uscito o escluso secondo Telegram"
+        return True, None, None
+
+    except Exception as e:
+        if isinstance(e, FloodWaitError):
+            await record_auto_deadline(e.seconds)
+        return (
+            False,
+            type(e).__name__,
+            str(e)[:220],
+        )
+
+
+def diagnostic_chat_id(destination):
+    try:
+        return utils.get_peer_id(destination)
+    except (TypeError, ValueError):
+        value = int(state["group_b"]["id"])
+        return value if value < 0 else -1000000000000 - value
+
+
+async def bot_membership_check(chat_id, user_id):
+    if welcome_bot is None:
+        return "unknown", "Bot non inizializzato", 0
+    try:
+        member = await asyncio.wait_for(welcome_bot.get_chat_member(chat_id, user_id), timeout=8)
+        status = member.status
+        if status in ("member", "administrator", "creator") or (status == "restricted" and member.is_member):
+            return "present", str(status), 0
+        if status in ("left", "kicked") or (status == "restricted" and not member.is_member):
+            return "absent", str(status), 0
+        return "unknown", "Stato Bot API non riconosciuto: " + str(status), 0
+    except RetryAfter as exc:
+        seconds = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else exc.retry_after
+        return "pause", "RetryAfter", int(seconds)
+    except Exception as exc:
+        message = str(exc).lower()
+        if "user_not_participant" in message or "user not participant" in message:
+            return "absent", safe_connection_error(exc), 0
+        return "unknown", safe_connection_error(exc), 0
+
+
+async def observe_invite_membership(destination, user, mode, started_at):
+    chat_id = diagnostic_chat_id(destination)
+    ever_present = False
+    final = "unknown"
+    for offset in (10, 20):
+        await asyncio.sleep(10)
+        telethon_result, bot_result = await asyncio.gather(
+            asyncio.wait_for(verify_in_destination(destination, user), timeout=8),
+            bot_membership_check(chat_id, user.id), return_exceptions=True)
+        if isinstance(telethon_result, BaseException):
+            present, error, detail = False, type(telethon_result).__name__, str(telethon_result)
+        else:
+            present, error, detail = telethon_result
+        if isinstance(bot_result, BaseException):
+            bot_status, bot_detail, pause = "unknown", type(bot_result).__name__, 0
+        else:
+            bot_status, bot_detail, pause = bot_result
+        telethon_status = "present" if present else ("absent" if error == "UserNotParticipantError" else "unknown")
+        await add_log(f"🔬 {mode} — ID {user.id} — gruppo B {chat_id} — controllo +{offset}s: sessione={telethon_status}; bot={bot_status} ({bot_detail[:100]})")
+        if error in ("PeerFloodError", "FloodWaitError") or bot_status == "pause":
+            if pause:
+                await record_auto_deadline(pause)
+            pause_detail = f"Bot API richiede una pausa di {pause} secondi" if bot_status == "pause" else detail
+            return await report_verification_problem(str(user.id), mode, "FloodWaitError" if bot_status == "pause" else error, pause_detail)
+        if error in DESTINATION_ERRORS:
+            return await report_verification_problem(str(user.id), mode, error, detail)
+        ever_present = ever_present or present or bot_status == "present"
+        if telethon_status == "present" and bot_status != "absent":
+            final = "confirmed"
+        elif telethon_status == "absent" and bot_status == "absent":
+            final = "absent"
+        else:
+            final = "unknown"
+        if final != "unknown":
+            break  # Il secondo controllo serve soltanto per un esito incerto.
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT event, actor_id, event_date FROM membership_events WHERE chat_id=? AND user_id=? AND observed_at>=? ORDER BY id DESC LIMIT 3", (chat_id, user.id, started_at))
+        events = await cursor.fetchall()
+    for event, actor, date in reversed(events):
+        await add_log(f"🧩 {mode} — ID {user.id} — gruppo {chat_id} — evento {event}; autore ID {actor or 'non disponibile'}; data Telegram {date or 'non disponibile'}")
+    if final == "confirmed":
+        await increment_stat("migrated")
+        await save_processed(user, "CONFIRMED")
+        await add_log(f"✅ {mode} — ID {user.id} — gruppo {chat_id} — PRESENZA CONFERMATA al controllo +{offset}s")
+        await welcome_confirmed_invite(destination, user)
+        return "confirmed", str(user.id)
+    await increment_stat("unconfirmed")
+    if final == "absent":
+        explanation, evidence = await recent_departure_evidence(session_clients[current_session_id()], destination, user.id, started_at)
+        await add_log("🔎 Azioni recenti — " + explanation)
+        for item in evidence:
+            await add_log("🧩 " + item)
+        left_event = any(row[0] == "LEFT" for row in events)
+        status = "LEFT_AFTER_JOIN" if ever_present or left_event else "NOT_ADDED"
+        await save_processed(user, status)
+        await add_log(f"⚠️ {mode} — ID {user.id} — gruppo {chat_id} — " +
+                      ("USCITA/RIMOZIONE OSSERVATA" if left_event else "PRESENZA RILEVATA POI ASSENZA" if ever_present else "ASSENZA RILEVATA") +
+                      ("; causa documentata nelle Azioni recenti" if evidence else "; causa sconosciuta") +
+                      "; nessun reinvito durante la diagnosi", "WARNING")
+        return "unconfirmed", str(user.id)
+    # Discordanza o dati insufficienti non autorizzano un nuovo invito.
+    await save_processed(user, "VERIFY_PENDING")
+    return await report_verification_problem(str(user.id), mode, "MembershipUncertain", "Sessione e bot discordanti o stato non verificabile dopo due controlli con attese di 10 secondi; nessun reinvito")
+
+
+# =========================================================
+# TIMER INTERROMPIBILE
+# =========================================================
+
+async def interruptible_wait(
+    minutes,
+):
+
+    total_seconds = (
+        minutes * 60
+    )
+
+    for _ in range(
+        total_seconds
+    ):
+
+        if (
+            not state["running"]
+            or state["stop_requested"]
+            or state["telegram_locked"]
+        ):
+
+            return False
+
+        await asyncio.sleep(1)
+
+    return True
+
+
+# =========================================================
+# ESTRAZIONE MEMBRI A
+# =========================================================
+
+async def remember_privacy_rejection(user_id, reason):
+    owner = session_info[current_session_id()]["user_id"]
+    if not owner or not state["group_b"]:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO privacy_rejections VALUES (?, ?, ?, ?, ?)",
+                         (owner, user_id, state["group_b"]["id"], reason, now_it().isoformat()))
+        await db.commit()
+
+
+async def known_privacy_rejections():
+    owner = session_info[current_session_id()]["user_id"]
+    if not owner or not state["group_b"]:
+        return set()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT target_user_id FROM privacy_rejections WHERE account_user_id = ? AND destination_id = ?",
+                                  (owner, state["group_b"]["id"]))
+        return {row[0] for row in await cursor.fetchall()}
+
+
+async def clean_member_rows(rows):
+    """Rimuove solo presenze e rifiuti noti. Nessun invito di prova o invio esterno."""
+    diag = {"already_b": 0, "privacy_known": 0, "optout": 0, "unknown": 0, "checked": 0, "note": ""}
+    if not state["group_b"]:
+        diag["unknown"] = len(rows)
+        diag["note"] = "Gruppo B non configurato: pulizia non eseguita."
+        return rows, diag
+    destination = None
+    wait_key = "member_check_wait_" + str(session_info[current_session_id()]["user_id"])
+    wait = float(await get_setting(wait_key, "0")) - now_it().timestamp()
+    if wait > 0:
+        diag["note"] = f"Verifiche presenza sospese: pausa Telegram residua {math.ceil(wait)} secondi."
+    else:
+        try:
+            destination = await asyncio.wait_for(user_client.get_entity(state["group_b"]["input"]), timeout=10)
+        except Exception as exc:
+            diag["note"] = "Gruppo B non verificabile — " + safe_connection_error(exc)
+    known = await known_privacy_rejections()
+    present, unknown = set(), set()
+    deadline = asyncio.get_running_loop().time() + 30
+    for row in rows:
+        user_id, username = row[1], row[2]
+        if destination is None or asyncio.get_running_loop().time() >= deadline:
+            unknown.add(user_id)
+            if destination is not None and not diag["note"]:
+                diag["note"] = "Verifica presenza parziale: tempo massimo raggiunto. Usa PULISCI LISTA per aggiornarla."
+            continue
+        try:
+            timeout = max(0.01, min(5, deadline - asyncio.get_running_loop().time()))
+            entity = await asyncio.wait_for(user_client.get_input_entity(user_id), timeout=timeout)
+            if getattr(entity, "user_id", None) != user_id:
+                raise ValueError("Identità destinatario non verificata")
+            timeout = max(0.01, min(5, deadline - asyncio.get_running_loop().time()))
+            perm = await asyncio.wait_for(user_client.get_permissions(destination, entity), timeout=timeout)
+            if perm is None:
+                unknown.add(user_id)
+            elif not perm.has_left and not getattr(getattr(getattr(perm, "participant", None), "banned_rights", None), "view_messages", False):
+                present.add(user_id)
+            diag["checked"] += 1
+        except FloodWaitError as exc:
+            await set_setting(wait_key, str(now_it().timestamp() + exc.seconds))
+            diag["note"] = f"Telegram richiede {exc.seconds} secondi di pausa: verifiche interrotte."
+            unknown.add(user_id)
+            destination = None
+        except PeerFloodError:
+            for flag in ("telegram_locked", "telegram_restriction_detected"):
+                await set_setting(flag, "1")
+            sync_session_state()
+            diag["note"] = "PeerFlood durante la verifica: blocco locale attivato e verifiche interrotte."
+            unknown.add(user_id)
+            destination = None
+        except Exception as exc:
+            if type(exc).__name__ == "UserNotParticipantError":
+                diag["checked"] += 1
+            else:
+                unknown.add(user_id)
+                if type(exc).__name__ in DESTINATION_ERRORS:
+                    diag["note"] = "Verifiche interrotte — " + safe_connection_error(exc)
+                    destination = None
+    # Rispetta le rinunce anche se il dato sulla presenza non è disponibile.
+    kept = []
+    for row in rows:
+        user_id = row[1]
+        if user_id in present:
+            diag["already_b"] += 1
+        elif await invitation_opted_out(user_id):
+            diag["optout"] += 1
+        elif user_id in known:
+            diag["privacy_known"] += 1
+        else:
+            kept.append(row)
+            if user_id in unknown:
+                diag["unknown"] += 1
+    await add_log(f"🧹 PULIZIA LISTA — già B: {diag['already_b']} | privacy nota per questa sessione: {diag['privacy_known']} | rinunce: {diag['optout']} | presenza incerta conservata: {diag['unknown']}")
+    return kept, diag
+
+
+def cleanup_report(diag):
+    return (f"🧹 Già nel gruppo B esclusi: {diag['already_b']}\n"
+            f"🛡 Rifiuti privacy noti esclusi: {diag['privacy_known']}\n"
+            f"🚪 Rinunce all'invito escluse: {diag['optout']}\n"
+            f"❓ Presenza non verificabile, mantenuti: {diag['unknown']}\n"
+            + (diag["note"] + "\n" if diag["note"] else "")
+            + "La privacy degli altri utenti non è verificata. Nessun invito di prova.\n")
+
+
+MEMBER_FILTER_DEFAULTS = {"username": True, "complete_name": False, "photo": False,
+                          "no_admin": True, "seen_days": 0, "mode": "members",
+                          "message_days": 7, "message_limit": 1000}
+
+
+async def get_member_filters():
+    try:
+        saved = json.loads(await get_setting("member_filters", "{}"))
+        if not isinstance(saved, dict):
+            saved = {}
+    except (TypeError, ValueError):
+        saved = {}
+    config = dict(MEMBER_FILTER_DEFAULTS)
+    for key in ("username", "complete_name", "photo", "no_admin"):
+        if isinstance(saved.get(key), bool):
+            config[key] = saved[key]
+    for key, options in (("seen_days", (0, 1, 7, 30)), ("message_days", (1, 7, 30)), ("message_limit", (500, 1000, 5000)), ("mode", ("members", "authors"))):
+        if saved.get(key) in options:
+            config[key] = saved[key]
+    return config
+
+
+def member_filter_reason(user, config, admin_ids, timestamp):
+    if config["no_admin"] and user.id in admin_ids:
+        return "admins"
+    if config["username"] and not (getattr(user, "username", None) or "").strip():
+        return "username"
+    if config["complete_name"] and not all((getattr(user, field, None) or "").strip() for field in ("first_name", "last_name")):
+        return "name"
+    if config["photo"] and not getattr(getattr(user, "photo", None), "photo_id", None):
+        return "photo"
+    if config["seen_days"]:
+        status = getattr(user, "status", None)
+        if isinstance(status, UserStatusOnline):
+            return None
+        if not isinstance(status, UserStatusOffline) or not getattr(status, "was_online", None):
+            return "status_unknown"
+        age = timestamp - status.was_online.timestamp()
+        if age < 0 or age > config["seen_days"] * 86400:
+            return "old_status"
+    return None
+
+
+async def member_filters_text():
+    config = await get_member_filters()
+    return ("⚙️ FILTRI MEMBRI GRUPPO A\n\n"
+            "I pulsanti configurano la prossima estrazione. La lista salvata cambia solo dopo ESTRAI/AGGIORNA.\n\n"
+            + ("Fonte: lista membri visibile alla sessione." if config["mode"] == "members" else
+               f"Fonte: autori dei messaggi negli ultimi {config['message_days']} giorni, massimo {config['message_limit']} messaggi esaminati.")
+            + "\n\nNessun obbligo locale di iscrizione o ruolo amministratore: vengono letti i dati accessibili alla sessione secondo i permessi Telegram. Bot, account eliminati e duplicati sono esclusi. "
+            "Le menzioni e i messaggi di servizio non vengono usati per selezionare utenti. "
+            "Ultimo accesso nascosto/approssimativo: escluso se il filtro accesso è attivo. "
+            "La lista non registra consenso a inviti o messaggi. Paese e nazionalità non sono dedotti dal profilo.")
+
+
+async def member_filters_keyboard():
+    config = await get_member_filters()
+    rows = [[InlineKeyboardButton(("✅ " if config[key] else "❌ ") + label, callback_data="member_filter:" + key)]
+            for key, label in (("username", "SOLO USERNAME"), ("complete_name", "NOME E COGNOME"), ("photo", "FOTO PROFILO"), ("no_admin", "ESCLUDI AMMINISTRATORI"))]
+    rows.extend([
+        [InlineKeyboardButton("ULTIMO ACCESSO: " + (f"{config['seen_days']} GIORNI" if config["seen_days"] else "NESSUN FILTRO"), callback_data="member_filter:seen_days")],
+        [InlineKeyboardButton("FONTE: " + ("LISTA MEMBRI" if config["mode"] == "members" else "AUTORI MESSAGGI"), callback_data="member_filter:mode")],
+        [InlineKeyboardButton(f"MESSAGGI: {config['message_days']} GIORNI", callback_data="member_filter:message_days"), InlineKeyboardButton(f"LIMITE: {config['message_limit']}", callback_data="member_filter:message_limit")],
+        [InlineKeyboardButton("🔄 ESTRAI/AGGIORNA", callback_data="extract_members")],
+        [InlineKeyboardButton("👥 LISTA SALVATA", callback_data="members_show")],
+    ])
+    return panel_markup(rows)
+
+
+async def extract_members_a():
+    if not state["group_a"]:
+        raise ValueError("Gruppo A non impostato")
+    if operation_busy() or state["auto_enabled"]:
+        raise ValueError("Disattiva AUTO e attendi la fine delle operazioni prima di estrarre.")
+    source = await user_client.get_entity(state["group_a"]["input"])
+    config = await get_member_filters()
+    me = await user_client.get_me()
+    stamp = now_it()
+    diag = {key: 0 for key in ("telegram_count", "received", "bots", "deleted", "duplicates", "saved", "filtered", "status_unknown", "messages", "not_member")}
+    diag["mode"] = config["mode"]
+    try:
+        participants = await user_client.get_participants(source, limit=1)
+        diag["telegram_count"] = participants.total or 0
+    except Exception:
+        pass
+    admin_ids = set()
+    if config["no_admin"]:
+        if isinstance(source, Channel):
+            async for user in user_client.iter_participants(source, filter=ChannelParticipantsAdmins()):
+                admin_ids.add(user.id)
+        else:
+            async for user in user_client.iter_participants(source):
+                perm = await user_client.get_permissions(source, user)
+                if perm.is_admin or perm.is_creator:
+                    admin_ids.add(user.id)
+    async def candidates():
+        if config["mode"] == "members":
+            async for user in user_client.iter_participants(source, aggressive=False):
+                yield user
+        else:
+            cutoff = stamp - timedelta(days=config["message_days"])
+            async for message in user_client.iter_messages(source, limit=config["message_limit"]):
+                diag["messages"] += 1
+                if message.date < cutoff:
+                    break
+                if getattr(message, "action", None) or getattr(message, "sender_id", None) is None:
+                    continue
+                user = await message.get_sender()
+                if isinstance(user, User):
+                    yield user
+    rows, seen_ids = [], set()
+    async for user in candidates():
+        diag["received"] += 1
+        if user.id == me.id:
+            continue
+        if getattr(user, "bot", False):
+            diag["bots"] += 1
+            continue
+        if getattr(user, "deleted", False):
+            diag["deleted"] += 1
+            continue
+        if user.id in seen_ids:
+            diag["duplicates"] += 1
+            continue
+        seen_ids.add(user.id)
+        reason = member_filter_reason(user, config, admin_ids, stamp.timestamp())
+        if reason:
+            diag["filtered"] += 1
+            if reason == "status_unknown":
+                diag["status_unknown"] += 1
+            continue
+        if config["mode"] == "authors":
+            try:
+                perm = await user_client.get_permissions(source, user)
+                banned = getattr(getattr(perm, "participant", None), "banned_rights", None)
+                if perm is None or perm.has_left or getattr(banned, "view_messages", False):
+                    diag["not_member"] += 1
+                    continue
+            except Exception as exc:
+                if type(exc).__name__ == "UserNotParticipantError":
+                    diag["not_member"] += 1
+                    continue
+                raise
+        display_name = " ".join(value for value in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if value)
+        rows.append((state["group_a"]["id"], user.id, getattr(user, "username", None), display_name, stamp.isoformat()))
+    rows, diag["cleanup"] = await clean_member_rows(rows)
+    # Non sostituisce la lista precedente in caso di errore o timeout della lettura.
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM extracted_members WHERE source_id = ?", (state["group_a"]["id"],))
+        if rows:
+            await db.executemany("INSERT OR REPLACE INTO extracted_members (source_id, user_id, username, display_name, extracted_at) VALUES (?, ?, ?, ?, ?)", rows)
+        await db.commit()
+    diag["saved"] = len(rows)
+    state["extract_diag"] = diag
+    await add_log(f"👥 ESTRAZIONE — fonte: {config['mode']} | ricevuti: {diag['received']} | esclusi filtri: {diag['filtered']} | salvati: {diag['saved']} — consenso non dedotto dalla lista")
+    return diag
+
+
+async def extracted_count():
+
+    if not state["group_a"]:
+        return 0
+
+    async with aiosqlite.connect(
+        DB_PATH
+    ) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM extracted_members
+            WHERE source_id = ?
+            """,
+            (
+                state["group_a"]["id"],
+            ),
+        )
+
+        row = await cursor.fetchone()
+
+    return row[0]
+
+
+async def get_members_page(page):
+
+    offset = (
+        page * PAGE_SIZE
+    )
+
+    async with aiosqlite.connect(
+        DB_PATH
+    ) as db:
+
+        cursor = await db.execute(
+            """
+            SELECT
+                user_id,
+                username,
+                display_name
+            FROM extracted_members
+            WHERE source_id = ?
+            ORDER BY
+                CASE
+                    WHEN username IS NULL
+                    THEN 1
+                    ELSE 0
+                END,
+                username COLLATE NOCASE,
+                display_name COLLATE NOCASE
+            LIMIT ? OFFSET ?
+            """,
+            (
+                state["group_a"]["id"],
+                PAGE_SIZE,
+                offset,
+            ),
+        )
+
+        rows = await cursor.fetchall()
+
+    return rows
+
+
+async def members_page_text(page):
+
+    total = await extracted_count()
+
+    if total == 0:
+
+        return (
+            "👥 MEMBRI GRUPPO A\n\n"
+            "Nessun membro estratto.\n\n"
+            "Premi 🔄 ESTRAI/AGGIORNA."
+        )
+
+    pages = max(
+        1,
+        math.ceil(
+            total / PAGE_SIZE
+        ),
+    )
+
+    page = max(
+        0,
+        min(
+            page,
+            pages - 1,
+        ),
+    )
+
+    state["member_page"] = page
+
+    rows = await get_members_page(
+        page
+    )
+
+    lines = []
+
+    start_number = (
+        page * PAGE_SIZE
+        + 1
+    )
+
+    for i, row in enumerate(
+        rows,
+        start=start_number,
+    ):
+
+        (
+            user_id,
+            username,
+            name,
+        ) = row
+
+        if username:
+
+            label = (
+                f"@{username}"
+            )
+
+        elif name:
+
+            label = name
+
+        else:
+
+            label = (
+                "Senza username"
+            )
+
+        lines.append(
+            f"{i}. "
+            f"{label} — "
+            f"{user_id}"
+        )
+
+    return (
+        "👥 MEMBRI GRUPPO A\n\n"
+        f"Totale: {total}\n"
+        f"Pagina: "
+        f"{page + 1}/{pages}\n\n"
+        + "\n".join(lines)
+    )
+
+
+async def members_keyboard():
+    total = await extracted_count() if state.get("group_a") else 0
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    current = max(0, min(state["member_page"], pages - 1))
+    state["member_page"] = current
+    previous_page = max(1, current)
+    next_page = min(pages, current + 2)
+    return panel_markup([
+        [InlineKeyboardButton(f"◀️ {previous_page}", callback_data="members_prev" if current > 0 else "noop"),
+         InlineKeyboardButton(f"{next_page} ▶️", callback_data="members_next" if current + 1 < pages else "noop")],
+        [InlineKeyboardButton("⚙️ Filtri e fonte", callback_data="member_filters")],
+        [InlineKeyboardButton("🧹 Pulisci lista per gruppo B", callback_data="clean_members")],
+        [InlineKeyboardButton("🔄 Estrai / aggiorna", callback_data="extract_members")],
+        [InlineKeyboardButton("📄 Esporta lista TXT", callback_data="members_export")],
+        [InlineKeyboardButton("➕ Invita per ID", callback_data="manual_invite")],
+        [InlineKeyboardButton("⬅️ Indietro", callback_data="menu_groups")],
+    ])
+
+
+# =========================================================
+# RUBRICA TELEGRAM
+# =========================================================
+
+async def get_contact_filters():
+    try:
+        saved = json.loads(await get_setting(f"contact_filters_{current_session_id()}", "{}"))
+    except (TypeError, ValueError):
+        saved = {}
+    config = {"username": True, "complete_name": False, "photo": False, "seen_days": 0}
+    if isinstance(saved, dict):
+        for key in ("username", "complete_name", "photo"):
+            if isinstance(saved.get(key), bool):
+                config[key] = saved[key]
+        if saved.get("seen_days") in (0, 1, 7, 30):
+            config["seen_days"] = saved["seen_days"]
+    return config
+
+
+async def contact_filters_screen():
+    config = await get_contact_filters()
+    rows = [[InlineKeyboardButton(("✅ " if config[key] else "❌ ") + label,
+                                 callback_data="contact_filter:" + key)]
+            for key, label in (("username", "SOLO CON USERNAME"),
+                               ("complete_name", "NOME E COGNOME"), ("photo", "FOTO PROFILO"))]
+    rows.append([InlineKeyboardButton("ULTIMO ACCESSO: " + (f"{config['seen_days']} GIORNI" if config['seen_days'] else "NESSUN FILTRO"), callback_data="contact_filter:seen_days")])
+    rows.append([InlineKeyboardButton("⬅️ RUBRICA", callback_data="contacts")])
+    text = (f"⚙️ FILTRI RUBRICA\n\n{session_label()}\n\n"
+            "I filtri sono separati per account. Dopo una modifica premi ESTRAI/AGGIORNA. "
+            "La lista visualizzata ed esportata contiene i risultati dell'ultima estrazione.\n\n"
+            "Bot, account eliminati e duplicati sono sempre esclusi. "
+            "Il filtro ultimo accesso esclude anche gli stati nascosti o approssimativi.")
+    return text, panel_markup(rows)
+
+
+async def extract_contacts():
+    """Legge e salva la rubrica Telegram della sessione attiva."""
+    account_id = current_session_id()
+    if account_id not in session_clients or not session_info[account_id]["ready"]:
+        raise RuntimeError(f"ACCOUNT {account_id}: sessione non disponibile")
+    client = session_clients[account_id]
+    me = await asyncio.wait_for(client.get_me(), timeout=15)
+    if me is None:
+        raise RuntimeError(f"ACCOUNT {account_id}: identità Telegram non disponibile")
+    result = await asyncio.wait_for(client(GetContactsRequest(hash=0)), timeout=30)
+    # Una risposta inattesa non deve cancellare la rubrica già salvata.
+    if not hasattr(result, "users"):
+        raise RuntimeError(f"Risposta rubrica inattesa: {type(result).__name__}")
+    contacts = list(result.users or [])
+    diag = {
+        "telegram_received": len(contacts), "self": 0, "bots": 0,
+        "deleted": 0, "duplicates": 0, "invalid": 0, "saved": 0,
+        "method": "GetContactsRequest",
+    }
+    config = await get_contact_filters()
+    diag["filtered"] = 0
+    rows = []
+    seen = set()
+    stamp = now_it().isoformat()
+    for user in contacts:
+        if not isinstance(user, User):
+            diag["invalid"] += 1
+            continue
+        if user.id == me.id:
+            diag["self"] += 1
+            continue
+        if getattr(user, "bot", False):
+            diag["bots"] += 1
+            continue
+        if getattr(user, "deleted", False):
+            diag["deleted"] += 1
+            continue
+        if user.id in seen:
+            diag["duplicates"] += 1
+            continue
+        seen.add(user.id)
+        reason = member_filter_reason(user, {**config, "no_admin": False}, set(), now_it().timestamp())
+        if reason:
+            diag["filtered"] += 1
+            continue
+        username = getattr(user, "username", None)
+        display_name = " ".join(
+            value for value in (getattr(user, "first_name", None),
+                                getattr(user, "last_name", None)) if value
+        ).strip()
+        rows.append((account_id, user.id, username, display_name,
+                     getattr(user, "phone", None), stamp))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM session_contacts WHERE session_id = ?", (account_id,))
+        if rows:
+            await db.executemany("""
+                INSERT OR REPLACE INTO session_contacts
+                (session_id, user_id, username, display_name, phone, extracted_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, rows)
+        await db.commit()
+    diag["saved"] = len(rows)
+    await add_log(
+        "📒 RUBRICA — "
+        f"metodo: {diag['method']} | ricevuti da Telegram: {diag['telegram_received']} | "
+        f"salvati: {diag['saved']} | account stesso: {diag['self']} | bot: {diag['bots']} | "
+        f"eliminati: {diag['deleted']} | duplicati: {diag['duplicates']} | "
+        f"non validi: {diag['invalid']} | esclusi filtri: {diag['filtered']}", session_id=account_id,
+    )
+    return diag
+
+
+async def contacts_count():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM session_contacts WHERE session_id = ?", (current_session_id(),))
+        row = await cur.fetchone()
+    return int(row[0] if row else 0)
+
+
+async def get_contacts_page(page):
+    offset = page * PAGE_SIZE
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT user_id, username, display_name
+            FROM session_contacts
+            WHERE session_id = ?
+            ORDER BY CASE WHEN display_name IS NULL OR display_name = '' THEN 1 ELSE 0 END,
+                     display_name COLLATE NOCASE,
+                     username COLLATE NOCASE
+            LIMIT ? OFFSET ?
+        """, (current_session_id(), PAGE_SIZE, offset))
+        return await cur.fetchall()
+
+
+async def contacts_page_text(page):
+    account_id = current_session_id()
+    header = f"📒 RUBRICA TELEGRAM\n\n👤 {session_label(account_id)}\n\n"
+    total = await contacts_count()
+    if total == 0:
+        return header + "Nessun contatto estratto.\n\nPremi 🔄 ESTRAI/AGGIORNA."
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    state["contact_page"] = page
+    rows = await get_contacts_page(page)
+    lines = []
+    start = page * PAGE_SIZE + 1
+    for i, (user_id, username, name) in enumerate(rows, start=start):
+        label = name or (f"@{username}" if username else "Senza nome")
+        if username and name:
+            label += f" (@{username})"
+        lines.append(f"{i}. {label} — {user_id}")
+    return header + f"Totale: {total}\nPagina: {page + 1}/{pages}\n\n" + "\n".join(lines)
+
+
+def contacts_keyboard():
+    return panel_markup([
+        [
+            InlineKeyboardButton("◀️", callback_data="contacts_prev"),
+            InlineKeyboardButton("🔄 ESTRAI/AGGIORNA", callback_data="extract_contacts"),
+            InlineKeyboardButton("▶️", callback_data="contacts_next"),
+        ],
+        [InlineKeyboardButton("⚙️ FILTRI RUBRICA", callback_data="contact_filters")],
+        [InlineKeyboardButton("⏱ Pausa inviti rubrica", callback_data="set_invite_value:contact_interval_minutes")],
+        [InlineKeyboardButton("📄 ESPORTA LISTA TXT", callback_data="contacts_export")],
+        [InlineKeyboardButton("➕ AGGIUNGI CONTATTI", callback_data="contacts_add")],
+        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
+    ])
+
+
+
+
+# =========================================================
+# INTERFACCIA
+# =========================================================
+
+def group_label(group):
+
+    if not group:
+
+        return "Non impostato"
+
+    name = group["name"]
+
+    if len(name) > 24:
+
+        return (
+            name[:21]
+            + "..."
+        )
+
+    return name
+
+
+def main_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("👥 Gestione sessioni", callback_data="sessions")],
+        [InlineKeyboardButton("👥 Gruppi e membri", callback_data="menu_groups")],
+        [InlineKeyboardButton("📒 Rubrica", callback_data="contacts")],
+        [InlineKeyboardButton("📤 Inviti", callback_data="menu_invites")],
+        [InlineKeyboardButton("⚙️ Diagnostica", callback_data="menu_diagnostics")],
+    ])
+
+
+def groups_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("📥 Configura gruppo a", callback_data="set_a"),
+         InlineKeyboardButton("📤 Configura gruppo b", callback_data="set_b")],
+        [InlineKeyboardButton("👥 Membri gruppo a", callback_data="members")],
+        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
+    ])
+
+
+def invites_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("👤 Invito manuale", callback_data="manual_invite")],
+        [InlineKeyboardButton("🤖 Automatico", callback_data="auto_menu")],
+        [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
+    ])
+
+
+def automatic_keyboard():
+    rows = []
+    if state["running"] or state["auto_enabled"]:
+        if not state["running"]:
+            rows.append([InlineKeyboardButton("▶️ Avvia ora", callback_data="start_now")])
+        rows.append([InlineKeyboardButton("🛑 Ferma automatico", callback_data="auto_stop")])
+    else:
+        rows.append([InlineKeyboardButton("▶️ Avvia automatico", callback_data="start_run")])
+    rows.extend([
+        [InlineKeyboardButton("🕐 Orario di partenza", callback_data="set_start_time")],
+        [InlineKeyboardButton("🎯 Persone al giorno", callback_data="set_invite_value:daily_target")],
+        [InlineKeyboardButton("⏱ Pausa tra tentativi", callback_data="set_invite_value:interval_minutes")],
+        [InlineKeyboardButton("⬅️ Inviti", callback_data="menu_invites")],
+    ])
+    return panel_markup(rows)
+
+
+def invite_settings_keyboard():
+    # Compatibilità con i vecchi callback: le impostazioni ora sono nel pannello AUTO.
+    return automatic_keyboard()
+
+
+INVITE_VALUE_RULES = {
+    "daily_target": (1, 50, "PERSONE AL GIORNO", "persone"),
+    "interval_minutes": (15, 480, "PAUSA TRA TENTATIVI", "minuti"),
+    "contact_interval_minutes": (1, 120, "PAUSA RUBRICA", "minuti"),
+}
+
+
+async def invites_text(settings=False):
+    if settings:
+        return await automatic_text()
+    status = await selected_account_status(state["active_session"])
+    return ("📤 INVITI\n\n" + f"📥 Destinazione: {group_label(state['group_b'])}\n\n"
+            + status + "\n\nScegli Invito manuale oppure Automatico.")
+
+
+async def automatic_text():
+    status = "▶️ In esecuzione" if state["running"] else ("🕐 Programmato" if state["auto_enabled"] else "⏸ Disattivato")
+    return ("🤖 AUTOMATICO\n\n" + await selected_account_status(state["active_session"])
+            + f"\n\nStato AUTO: {status}"
+            + f"\n📥 Gruppo A: {group_label(state['group_a'])}"
+            + f"\n📤 Gruppo B: {group_label(state['group_b'])}"
+            + f"\n🕐 Orario di partenza: {state['start_time']}"
+            + f"\n🎯 Persone al giorno: {state['daily_target']}"
+            + f"\n⏱ Pausa tra tentativi: {state['interval_minutes']} minuti (massimo 480 = 8 ore)")
+
+
+def diagnostics_menu_keyboard():
+    rows = [
+        [InlineKeyboardButton("📋 Log", callback_data="logs"),
+         InlineKeyboardButton("📊 Statistiche", callback_data="statistics")],
+        [InlineKeyboardButton("🌐 Proxy / diagnostica", callback_data="proxy_status")],
+        [InlineKeyboardButton("🔎 Verifica sessione attiva", callback_data=f"check_session:{current_session_id()}")],
+    ]
+    if state["telegram_locked"]:
+        rows.append([InlineKeyboardButton("🔓 Riabilita inviti", callback_data="unlock_confirm")])
+    rows.append([InlineKeyboardButton("⬅️ Menu principale", callback_data="home")])
+    return panel_markup(rows)
+
+
+async def section_text(section):
+    if section == "menu_invites":
+        return await invites_text()
+    titles = {"menu_groups": "👥 GRUPPI E MEMBRI", "menu_invites": "📤 INVITI", "menu_diagnostics": "⚙️ DIAGNOSTICA"}
+    return await home_text() + "\n\n" + titles[section]
+
+
+async def selected_account_status(account_id, record=None):
+    info = session_info[account_id]
+    record = record if record is not None else await registry_for(account_id)
+    lines = ["👤 Sessione selezionata: " + session_button_name(account_id)]
+    blocked = info["telegram_locked"] or info["telegram_restriction_detected"] or record.get("halted_reason")
+    if not info["ready"]:
+        lines.extend(["🔴 Questo account non è connesso", "Dettaglio: " + info["error"][:180]])
+    elif blocked:
+        code = recorded_error_type(info, record)
+        lines.append("🔴 Inviti sospesi per questo account")
+        lines.append("Errore: " + code if code != "Motivo non registrato" else "Motivo del blocco non registrato")
+    elif await session_status_color(account_id, record) == "🟡":
+        lines.append("🟡 " + await session_status_label(account_id, record))
+    else:
+        lines.append("🟢 Inviti abilitati localmente per questo account")
+    if not info["ready"] or blocked:
+        lines.append("🔎 Apri Gestione sessioni → Diagnostica per i dettagli")
+    return "\n".join(lines)
+
+
+async def home_text():
+    account_id = state["active_session"]
+    counts = {"🟢": 0, "🟡": 0, "🔴": 0}
+    active_record = None
+    for slot in ACCOUNT_IDS:
+        record = await registry_for(slot)
+        counts[await session_status_color(slot, record)] += 1
+        if slot == account_id:
+            active_record = record
+    if state["running"]:
+        automatic = "▶️ Automatico in esecuzione"
+    elif state["auto_enabled"]:
+        automatic = f"🕐 Automatico programmato: {state['start_time']}"
+    else:
+        automatic = "⏸ Automatico disattivato"
+    return (
+        "👥 BESTPRICE MEMBER MANAGER V4.9.9.20\n\n"
+        + await selected_account_status(account_id, active_record)
+        + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
+        + f"🟢 Abilitate: {counts['🟢']}\n"
+        + f"🟡 In attesa/verifica: {counts['🟡']}\n"
+        + f"🔴 Non operative: {counts['🔴']}\n\n"
+        + f"📥 Gruppo A: {group_label(state['group_a'])}\n"
+        + f"📤 Gruppo B: {group_label(state['group_b'])}\n\n"
+        + automatic
+    )
+
+
+DESTINATION_ERRORS = {
+    "ChatWriteForbiddenError", "ChatAdminRequiredError", "ChannelPrivateError",
+    "ChannelInvalidError", "ChatInvalidError", "UserBannedInChannelError",
+    "UsersTooMuchError",
+}
+STOP_INVITE_RESULTS = {"session_not_enabled", "peer_flood", "flood_wait", "destination_error", "verification_error", "cooldown_stopped"}
+
+
+# =========================================================
+# GESTIONE SESSIONI V4.9 — stato persistente e diagnosi
+# =========================================================
+
+attempt_context = ContextVar("invitation_attempt", default=None)
+INITIAL_WAIT_SECONDS = 48 * 60 * 60
+
+
+async def init_session_features():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS generated_profile_history (
+                name TEXT PRIMARY KEY COLLATE NOCASE, username TEXT UNIQUE COLLATE NOCASE NOT NULL,
+                owner_id INTEGER NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_registry (
+                owner_id INTEGER PRIMARY KEY, inserted_at TEXT,
+                approved INTEGER NOT NULL DEFAULT 0, halted_reason TEXT NOT NULL DEFAULT '',
+                last_check TEXT, last_error TEXT NOT NULL DEFAULT '',
+                diagnosis TEXT NOT NULL DEFAULT '{}', legacy_session INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS message_deliveries (
+                batch_id TEXT NOT NULL, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL,
+                kind TEXT NOT NULL, status TEXT NOT NULL, message_id INTEGER,
+                updated_at TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(batch_id, sender_id, recipient_id)
+            );
+            CREATE TABLE IF NOT EXISTS link_permissions (
+                user_id INTEGER PRIMARY KEY, via TEXT NOT NULL,
+                consent_at TEXT NOT NULL, opted_out INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS link_invites_sent (
+                user_id INTEGER NOT NULL, destination_id INTEGER NOT NULL,
+                sent_at TEXT NOT NULL, status TEXT NOT NULL,
+                PRIMARY KEY(user_id, destination_id)
+            );
+        """)
+        cursor = await db.execute("PRAGMA table_info(session_registry)")
+        if "legacy_session" not in {row[1] for row in await cursor.fetchall()}:
+            await db.execute("ALTER TABLE session_registry ADD COLUMN legacy_session INTEGER NOT NULL DEFAULT 0")
+        cursor = await db.execute("SELECT value FROM settings WHERE key='legacy_sessions_wait_exemption'")
+        if not await cursor.fetchone():
+            await db.execute("UPDATE session_registry SET legacy_session=1,approved=CASE WHEN halted_reason='' THEN 1 ELSE approved END WHERE inserted_at IS NULL")
+            # La versione precedente permetteva di iniziare da ora l'attesa
+            # di una sessione storica: non farla ripartire nemmeno in quel caso.
+            cursor = await db.execute("SELECT DISTINCT session_id FROM logs WHERE message LIKE '%Attesa iniziale avviata manualmente; data persistente%'")
+            for row in await cursor.fetchall():
+                owner_cursor = await db.execute("SELECT value FROM settings WHERE key=?", (f"session_{row[0]}_owner",))
+                owner = await owner_cursor.fetchone()
+                if owner:
+                    await db.execute("UPDATE session_registry SET legacy_session=1,approved=CASE WHEN halted_reason='' THEN 1 ELSE approved END WHERE owner_id=?", (owner[0],))
+            await db.execute("INSERT INTO settings VALUES ('legacy_sessions_wait_exemption','1')")
+        cursor = await db.execute("SELECT value FROM settings WHERE key='session_features_migrated'")
+        if not await cursor.fetchone():
+            slots = {i for i in ACCOUNT_IDS if i in session_clients or os.environ.get(f"TELEGRAM_SESSION{account_suffix(i)}", "").strip()}
+            if os.path.isfile(ADDED_SESSIONS_PATH):
+                with open(ADDED_SESSIONS_PATH) as stream:
+                    slots.update(int(i) for i in json.load(stream))
+            for slot in slots:
+                cursor = await db.execute("SELECT value FROM settings WHERE key=?", (f"session_{slot}_owner",))
+                row = await cursor.fetchone()
+                if row and str(row[0]).isdigit():
+                    await db.execute("INSERT OR IGNORE INTO session_registry(owner_id,legacy_session,approved) VALUES (?,1,1)", (int(row[0]),))
+                else:
+                    await db.execute("INSERT OR IGNORE INTO settings VALUES (?, '1')", (f"legacy_unknown_slot_{slot}",))
+            await db.execute("INSERT INTO settings VALUES ('session_features_migrated','1')")
+        await db.commit()
+
+
+async def register_session_age(account_id, owner_id, previous_owner=None, newly_added=False):
+    legacy = await get_setting(f"legacy_unknown_slot_{account_id}", "0") == "1"
+    unknown = not newly_added and (previous_owner == str(owner_id) or (legacy and previous_owner is None))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO session_registry(owner_id,inserted_at,legacy_session,approved) VALUES (?,?,?,?)",
+                         (owner_id, None if unknown else now_it().isoformat(), int(unknown), int(unknown)))
+        await db.execute("DELETE FROM settings WHERE key=?", (f"legacy_unknown_slot_{account_id}",))
+        await db.commit()
+
+
+async def registry_for(account_id):
+    owner = session_info[account_id].get("user_id")
+    if not owner:
+        return {}
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM session_registry WHERE owner_id=?", (owner,))
+        row = await cursor.fetchone()
+    return dict(row) if row else {}
+
+
+def wait_remaining(record):
+    if record.get("legacy_session"):
+        return 0
+    if not record.get("inserted_at"):
+        return None
+    stamp = datetime.fromisoformat(record["inserted_at"])
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=ITALY_TZ)
+    return max(0, INITIAL_WAIT_SECONDS - (now_it() - stamp).total_seconds())
+
+
+async def invitation_gate(account_id):
+    info = session_info[account_id]
+    record = await registry_for(account_id)
+    if not info["ready"]:
+        return "Sessione disconnessa: verifica la connessione."
+    if info["telegram_locked"] or info["telegram_restriction_detected"]:
+        return "Blocco locale Telegram attivo: controlla la diagnosi e @SpamBot."
+    if record.get("halted_reason"):
+        return "Inviti sospesi: " + recorded_error_type(info, record) + " — " + record["halted_reason"][:180]
+    remaining = wait_remaining(record)
+    if remaining is None:
+        return "Data d'inserimento sconosciuta: imposta l'inizio dell'attesa dal pannello."
+    if remaining:
+        return f"Attesa iniziale: restano circa {math.ceil(remaining / 3600)} ore."
+    if not record.get("approved"):
+        return "Attesa completata: verifica il gruppo B e abilita manualmente la sessione."
+    return None
+
+
+async def session_status_label(account_id, record=None):
+    info = session_info[account_id]
+    record = record if record is not None else await registry_for(account_id)
+    if not info["ready"]:
+        return "Disconnessa — " + info.get("error", "connessione non verificata")[:160]
+    if info["telegram_locked"] or info["telegram_restriction_detected"] or record.get("halted_reason"):
+        return recorded_error_type(info, record) + " — inviti sospesi localmente"
+    remaining = wait_remaining(record)
+    if remaining is None:
+        return "Da verificare — data sconosciuta"
+    if remaining:
+        return f"In attesa iniziale — {math.ceil(remaining / 3600)} ore residue"
+    if record.get("legacy_session") and record.get("approved"):
+        return "Sessione esistente — nessuna nuova attesa"
+    return "Abilitata manualmente" if record.get("approved") else "Attesa completata — da abilitare manualmente"
+
+
+async def halt_session(account_id, reason):
+    owner = session_info[account_id].get("user_id")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE session_registry SET approved=0,halted_reason=?,last_error=? WHERE owner_id=?",
+                         (reason[:400], now_it().isoformat() + " — " + reason[:400], owner))
+        await db.commit()
+    if account_id == state["active_session"]:
+        state["auto_enabled"] = False
+        state["running"] = False
+        await set_setting("auto_enabled", "0")
+
+
+async def diagnose_destination(account_id):
+    info = session_info[account_id]
+    check_wait = float(await get_setting(f"session_check_wait_{info.get('user_id')}", "0"))
+    result = {"checked_at": now_it().isoformat(), "group_id": (state["group_b"] or {}).get("id"),
+              "identity": "unknown", "access": "unknown", "membership": "unknown",
+              "invite_allowed": None, "restrictions": "unknown", "evidence": [], "summary": "Causa non determinata"}
+    client = session_clients.get(account_id)
+    try:
+        if check_wait > now_it().timestamp():
+            raise ValueError(f"Pausa Telegram attiva: attendi {math.ceil(check_wait - now_it().timestamp())} secondi")
+        if not info["ready"] or client is None:
+            raise ValueError("Sessione non connessa")
+        me = await asyncio.wait_for(client.get_me(), timeout=10)
+        if me is None or me.id != info["user_id"]:
+            raise ValueError("Identità diversa da quella registrata: riconnetti la sessione")
+        result["identity"] = "confirmed"
+        if not state["group_b"]:
+            raise ValueError("Gruppo B non configurato")
+        entity = await asyncio.wait_for(client.get_entity(state["group_b"]["input"]), timeout=10)
+        if not _same_telegram_chat_id(entity.id, result["group_id"]):
+            raise ValueError("Lo username ora identifica un gruppo diverso dal gruppo B")
+        result["access"] = "confirmed"
+        permission = await asyncio.wait_for(client.get_permissions(entity, "me"), timeout=10)
+        if permission is None:
+            raise ValueError("Permessi personali non disponibili")
+        participant = getattr(permission, "participant", None)
+        rights = getattr(participant, "banned_rights", None)
+        if getattr(rights, "view_messages", False):
+            result.update(membership="banned", restrictions="confirmed", invite_allowed=False,
+                          summary="Esclusione dell'account dal gruppo B confermata")
+        elif getattr(permission, "has_left", False) or type(participant).__name__ == "ChannelParticipantLeft":
+            result.update(membership="absent", invite_allowed=False, summary="Account non presente nel gruppo B")
+        else:
+            result["membership"] = "present"
+            result["role"] = "proprietario" if permission.is_creator else "amministratore" if permission.is_admin else "membro"
+            if permission.is_creator:
+                allowed = True
+            elif permission.is_admin:
+                allowed = bool(permission.invite_users)
+            else:
+                defaults = getattr(entity, "default_banned_rights", None)
+                allowed = not (getattr(rights, "invite_users", False) or getattr(defaults, "invite_users", False))
+            result["invite_allowed"] = allowed
+            result["restrictions"] = "confirmed" if getattr(permission, "is_banned", False) else "none_reported"
+            result["summary"] = "Permesso d'invito assente" if not allowed else "Permessi compatibili; eventuali rifiuti Telegram restano da spiegare"
+    except Exception as exc:
+        if type(exc).__name__ == "UserNotParticipantError":
+            result.update(membership="absent", invite_allowed=False, summary="Account non presente nel gruppo B")
+        if isinstance(exc, FloodWaitError):
+            await set_setting(f"session_check_wait_{info.get('user_id')}", now_it().timestamp() + exc.seconds)
+        result["evidence"].append(safe_connection_error(exc))
+    try:
+        target = json.loads(await get_setting(f"last_invite_target_{info.get('user_id')}", "{}"))
+        if target and result["access"] == "confirmed":
+            reference = "@" + target["username"] if target.get("username") else target["id"]
+            user = await asyncio.wait_for(client.get_entity(reference), timeout=8)
+            if user.id != target["id"]:
+                raise ValueError("Identità dell'ultimo destinatario cambiata")
+            member = await asyncio.wait_for(client(GetParticipantRequest(entity, user)), timeout=8)
+            participant = getattr(member, "participant", None)
+            rights = getattr(participant, "banned_rights", None)
+            state_label = "bannato" if getattr(rights, "view_messages", False) else "assente" if getattr(participant, "left", False) or type(participant).__name__ == "ChannelParticipantLeft" else "presente" if participant else "non verificabile"
+            result["target"] = f"ID {user.id}: {state_label}"
+    except Exception as exc:
+        result["target"] = "Ultimo destinatario: assente" if type(exc).__name__ == "UserNotParticipantError" else "Ultimo destinatario non verificabile — " + safe_connection_error(exc)
+    spam = await spambot_record(account_id)
+    result["spambot"] = spam.get("status", "UNKNOWN")
+    result["spambot_checked_at"] = spam.get("checked_at")
+    if spam.get("status") == "LIMITED":
+        result["evidence"].append("Limitazione segnalata nell'ultima risposta di @SpamBot; controlla la data.")
+    owner = info.get("user_id")
+    if owner:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE session_registry SET last_check=?,diagnosis=? WHERE owner_id=?",
+                             (result["checked_at"], json.dumps(result, ensure_ascii=False), owner))
+            await db.commit()
+    return result
+
+
+def format_destination_diagnosis(account_id, result):
+    labels = {"confirmed": "confermato", "present": "presente", "absent": "assente",
+              "banned": "escluso", "unknown": "non verificabile", "none_reported": "nessuna rilevata"}
+    allowed = result.get("invite_allowed")
+    lines = ["🔎 DIAGNOSTICA GRUPPO B", session_label(account_id),
+             "Controllo: " + result["checked_at"],
+             "Identità: " + labels.get(result["identity"], result["identity"]),
+             "Accesso: " + labels.get(result["access"], result["access"]),
+             "Presenza: " + labels.get(result["membership"], result["membership"]),
+             "Permesso d'invito: " + ("consentito" if allowed is True else "non consentito" if allowed is False else "non verificabile"),
+             "Restrizioni personali: " + labels.get(result["restrictions"], result["restrictions"]),
+             "SpamBot (ultima verifica): " + result.get("spambot", "UNKNOWN"),
+             "Data risposta SpamBot: " + (result.get("spambot_checked_at") or "non disponibile"),
+             "Ultimo destinatario: " + result.get("target", "nessun controllo disponibile"),
+             "", "📌 " + result["summary"], *result["evidence"],
+             "Nessun invito o messaggio ai membri eseguito. Nessuno sblocco automatico."]
+    return "\n".join(lines)
+
+
+async def recent_departure_evidence(client, destination, user_id, started_at):
+    """Legge eventi successivi al tentativo; non deduce una causa dalla sola assenza."""
+    start = datetime.fromisoformat(started_at)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=ITALY_TZ)
+    evidence = []
+    try:
+        permissions = await asyncio.wait_for(client.get_permissions(destination, "me"), timeout=8)
+        if not permissions or not (permissions.is_admin or permissions.is_creator):
+            return "Azioni recenti non accessibili: serve un account amministratore", []
+        async def collect():
+            # Il limite evita scansioni indefinite. Non si usa admins=[user_id],
+            # che filtrerebbe l'autore anziché il membro coinvolto.
+            async for event in client.iter_admin_log(destination, limit=100, leave=True, ban=True):
+                if event.date < start:
+                    break
+                action = event.action
+                kind = type(action).__name__
+                actor = getattr(event, "user_id", None)
+                if kind == "ChannelAdminLogEventActionParticipantLeave" and actor == user_id:
+                    evidence.append(f"Uscita registrata da Telegram — ID {user_id} — {event.date.isoformat()}")
+                elif kind == "ChannelAdminLogEventActionParticipantToggleBan":
+                    before, after = getattr(action, "prev_participant", None), getattr(action, "new_participant", None)
+                    target = getattr(after, "user_id", None) or getattr(before, "user_id", None)
+                    peer = getattr(after, "peer", None) or getattr(before, "peer", None)
+                    target = target or getattr(peer, "user_id", None)
+                    before_rights = getattr(before, "banned_rights", None)
+                    after_rights = getattr(after, "banned_rights", None)
+                    if target == user_id and getattr(after_rights, "view_messages", False) and not getattr(before_rights, "view_messages", False):
+                        evidence.append(f"Rimozione/esclusione registrata — ID {user_id} — autore ID {actor} — {event.date.isoformat()}")
+        await asyncio.wait_for(collect(), timeout=12)
+        return ("Evento di uscita/rimozione trovato" if evidence else "Nessun evento pertinente nei 100 eventi recenti esaminati; causa sconosciuta"), evidence
+    except Exception as exc:
+        return "Azioni recenti non verificabili — " + safe_connection_error(exc), []
+
+
+def tracked_invitation(func):
+    @wraps(func)
+    async def wrapped(destination, user, mode):
+        token = attempt_context.set("INV-" + secrets.token_hex(4).upper())
+        try:
+            owner = session_info[current_session_id()].get("user_id")
+            await set_setting(f"last_invite_target_{owner}", json.dumps({"id": user.id, "username": getattr(user, "username", None)}))
+            gate = await invitation_gate(current_session_id())
+            if gate:
+                await add_log("🛑 Invito non eseguito — " + gate, "WARNING")
+                return "session_not_enabled", str(user.id)
+            outcome = await func(destination, user, mode)
+            if outcome[0] in {"peer_flood", "flood_wait", "destination_error", "verification_error", "error"}:
+                account_id = current_session_id()
+                if outcome[0] != "error":
+                    record = await registry_for(account_id)
+                    reason = record.get("last_error") or f"{outcome[0]} — destinatario {user.id}; consultare il tentativo"
+                    await halt_session(account_id, reason)
+                report = await diagnose_destination(account_id)
+                await add_log("🔎 Diagnosi dopo errore — " + report["summary"] +
+                              "; dettagli disponibili in Diagnostica gruppo B")
+            return outcome
+        finally:
+            attempt_context.reset(token)
+    return wrapped
+
+
+async def reply_long(message, text, markup=None, edit=False):
+    chunks = []
+    while text:
+        if len(text) <= 3500:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n", 0, 3500)
+        cut = cut if cut > 0 else 3500
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    chunks = chunks or ["Nessun risultato"]
+    for index, chunk in enumerate(chunks):
+        keyboard = markup if index == len(chunks) - 1 else None
+        if edit and index == 0:
+            await message.edit_text(chunk, reply_markup=keyboard, parse_mode=None)
+        else:
+            await message.reply_text(chunk, reply_markup=keyboard, parse_mode=None)
+
+
+INBOX_PAGE_SIZE = 10
+INBOX_DIALOG_LIMIT = 100
+INBOX_CACHE_SECONDS = 10 * 60
+
+
+def inbox_message_preview(message, limit=160):
+    text = (getattr(message, "message", None) or "").strip()
+    kind = ""
+    if getattr(message, "photo", None):
+        kind = "📷 Foto"
+    elif getattr(message, "voice", None):
+        kind = "🎤 Messaggio vocale"
+    elif getattr(message, "video", None):
+        kind = "🎬 Video"
+    elif getattr(message, "audio", None):
+        kind = "🎵 Audio"
+    elif getattr(message, "sticker", None):
+        kind = "🎨 Sticker"
+    elif getattr(message, "document", None):
+        kind = "📎 Documento"
+    elif getattr(message, "media", None):
+        kind = "📎 Contenuto multimediale"
+    elif getattr(message, "action", None):
+        kind = "ℹ️ Evento della chat"
+    value = (kind + (" — " if kind and text else "") + text) or "Messaggio senza testo"
+    return value if len(value) <= limit else value[:limit] + "… [testo abbreviato]"
+
+
+def inbox_message_date(message):
+    stamp = getattr(message, "date", None)
+    if stamp is None:
+        return "data non disponibile"
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=ZoneInfo("UTC"))
+    return stamp.astimezone(ITALY_TZ).strftime("%d/%m %H:%M")
+
+
+async def inbox_action(update, context, data):
+    if not data.startswith("inbox:"):
+        return False
+    query = update.callback_query
+    if not is_admin(update) or update.effective_chat.type != "private":
+        await callback_notice(query, "Apri Messaggi ricevuti nella tua chat privata con il bot.")
+        return True
+    try:
+        parts = data.split(":")
+        action = parts[1]
+        if action == "list":
+            slot, page = int(parts[2]), max(0, int(parts[3]))
+            owner = session_info.get(slot, {}).get("user_id")
+            if slot != state["active_session"] or not owner or not session_info[slot]["ready"]:
+                raise ValueError("Sessione cambiata o disconnessa: riapri Gestisci account.")
+            client = session_clients[slot]
+            await query.edit_message_text("📨 Caricamento chat…\n" + session_label(slot))
+            dialogs = list(await asyncio.wait_for(client.get_dialogs(limit=INBOX_DIALOG_LIMIT), timeout=30))
+            # Ordine cronologico, anche per le chat fissate in alto nell'app.
+            dialogs.sort(key=lambda d: getattr(getattr(d, "message", None), "date", None).timestamp()
+                         if getattr(getattr(d, "message", None), "date", None) else 0, reverse=True)
+            # Gli avvisi di accesso dell'account Telegram non sono una casella messaggi ordinaria.
+            dialogs = [d for d in dialogs if getattr(d.entity, "id", None) != 777000]
+            total = len(dialogs)
+            page = min(page, max(0, (total - 1) // INBOX_PAGE_SIZE))
+            shown = dialogs[page * INBOX_PAGE_SIZE:(page + 1) * INBOX_PAGE_SIZE]
+            cache = context.user_data.setdefault("inbox_chats", {})
+            now = time.time()
+            for key in list(cache):
+                if now - cache[key]["created_at"] > INBOX_CACHE_SECONDS:
+                    del cache[key]
+            lines = ["📨 MESSAGGI RICEVUTI", session_label(slot),
+                     f"Pagina {page + 1} — ultime {total} chat disponibili (massimo {INBOX_DIALOG_LIMIT}).", ""]
+            rows = []
+            for dialog in shown:
+                title = str(dialog.name or "Chat senza nome")[:70]
+                entity = dialog.entity
+                username = getattr(entity, "username", None)
+                recent = await asyncio.wait_for(client.get_messages(dialog.input_entity, limit=20), timeout=15)
+                received = next((m for m in recent if not getattr(m, "out", False) and not getattr(m, "action", None)), None)
+                unread = int(getattr(dialog, "unread_count", 0) or 0)
+                lines.extend([title + (" · @" + username if username else ""), f"Non letti: {unread}",
+                              (inbox_message_date(received) + " — " + inbox_message_preview(received))
+                              if received else "Nessun messaggio ricevuto negli ultimi 20.", ""])
+                token = secrets.token_hex(6)
+                cache[token] = {"slot": slot, "owner": owner, "peer": dialog.input_entity,
+                                "title": title, "page": page, "created_at": now}
+                rows.append([InlineKeyboardButton(f"{'📩' if unread else '💬'} {title[:40]}", callback_data=f"inbox:chat:{token}:0")])
+            if not shown:
+                lines.append("Nessuna conversazione disponibile.")
+            nav = []
+            if page:
+                nav.append(InlineKeyboardButton("⬅️ Precedenti", callback_data=f"inbox:list:{slot}:{page-1}"))
+            if (page + 1) * INBOX_PAGE_SIZE < total:
+                nav.append(InlineKeyboardButton("Successive ➡️", callback_data=f"inbox:list:{slot}:{page+1}"))
+            if nav:
+                rows.append(nav)
+            rows.extend([[InlineKeyboardButton("🔄 Aggiorna", callback_data=f"inbox:list:{slot}:{page}")],
+                         [InlineKeyboardButton("⬅️ Gestisci account", callback_data="sf:manage")]])
+            await reply_long(query.message, "\n".join(lines), panel_markup(rows), edit=True)
+        elif action == "chat":
+            token, offset = parts[2], max(0, int(parts[3]))
+            entry = context.user_data.get("inbox_chats", {}).get(token)
+            if not entry or time.time() - entry["created_at"] > INBOX_CACHE_SECONDS:
+                raise ValueError("Elenco scaduto: riapri Messaggi ricevuti.")
+            slot = entry["slot"]
+            if slot != state["active_session"] or session_info.get(slot, {}).get("user_id") != entry["owner"] or not session_info[slot]["ready"]:
+                raise ValueError("Account cambiato o disconnesso: riapri Messaggi ricevuti.")
+            await query.edit_message_text("📨 Lettura della conversazione…\n" + session_label(slot))
+            messages = list(await asyncio.wait_for(session_clients[slot].get_messages(entry["peer"], limit=20, offset_id=offset), timeout=20))
+            lines = ["📨 " + entry["title"], session_label(slot), "Ultimi 20 messaggi" if not offset else "Messaggi precedenti", ""]
+            for message in reversed(messages):
+                direction = "📤 Inviato" if getattr(message, "out", False) else "📥 Ricevuto"
+                sender = getattr(message, "sender_id", None)
+                lines.extend([direction + " · " + inbox_message_date(message) + (f" · ID {sender}" if sender else ""),
+                              inbox_message_preview(message, 1200), ""])
+            if not messages:
+                lines.append("Nessun messaggio disponibile.")
+            lines.append("Consultazione senza risposte e senza segnare i messaggi come letti.")
+            rows = [[InlineKeyboardButton("🔄 Ultimi messaggi", callback_data=f"inbox:chat:{token}:0")]]
+            if len(messages) == 20:
+                rows.append([InlineKeyboardButton("⬅️ 20 precedenti", callback_data=f"inbox:chat:{token}:{min(m.id for m in messages)}")])
+            rows.extend([[InlineKeyboardButton("⬅️ Altre chat", callback_data=f"inbox:list:{slot}:{entry['page']}")],
+                         [InlineKeyboardButton("⬅️ Gestisci account", callback_data="sf:manage")]])
+            await reply_long(query.message, "\n".join(lines), panel_markup(rows), edit=True)
+        else:
+            raise ValueError("Pulsante messaggi non valido.")
+    except FloodWaitError as exc:
+        await callback_notice(query, f"Telegram richiede una pausa di {exc.seconds} secondi prima di leggere nuovamente.")
+    except Exception as exc:
+        await callback_notice(query, "Lettura non completata — " + safe_connection_error(exc))
+    return True
+
+
+async def session_features_action(update, context, data):
+    """Comandi amministrativi richiamati dentro serialized_control."""
+    if not data.startswith("sf:"):
+        return False
+    query = update.callback_query
+    if update.effective_chat.type != "private":
+        await callback_notice(query, "Usa il pannello nella chat privata con il bot.")
+        return True
+    action = data[3:]
+    account_id = state["active_session"]
+    if action == "list":
+        await query.edit_message_text("📋 SELEZIONA SESSIONE\nSessione selezionata: " + session_button_name(account_id) + "\n\n🟢 Abilitata localmente · 🟡 Attesa o verifica necessaria · 🔴 Disconnessa o inviti sospesi\nPremi un nome per aprire la scheda. Il cambio disattiva AUTO.", reply_markup=await session_list_keyboard())
+        return True
+    if action == "card":
+        await reply_long(query.message, await session_card_text(account_id), await session_card_keyboard(account_id), edit=True)
+        return True
+    if action == "manage":
+        await query.edit_message_text("⚙️ GESTISCI ACCOUNT\n" + session_label(account_id), reply_markup=await account_management_keyboard(account_id))
+        return True
+    if operation_busy() or state["auto_enabled"]:
+        await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni.")
+        return True
+    state["waiting_for"] = None
+    if action == "all":
+        lines = ["🔎 VERIFICA TUTTE LE SESSIONI — nessun ingresso o messaggio"]
+        for slot in tuple(ACCOUNT_IDS):
+            await query.edit_message_text("\n".join(lines)[-3200:] + f"\n⏳ Verifica ACCOUNT {slot}…")
+            wait = float(await get_setting(f"session_check_wait_{session_info[slot].get('user_id')}", "0"))
+            if wait > now_it().timestamp():
+                lines.append(f"ACCOUNT {slot}: pausa Telegram attiva; controllo saltato")
+                continue
+            await connect_session(slot)
+            result = await diagnose_destination(slot)
+            lines.extend([session_label(slot), "Stato: " + await session_status_label(slot),
+                          "Gruppo B: " + result["membership"], "Esito: " + result["summary"], ""])
+            await add_log("🔎 Verifica generale — " + result["summary"], session_id=slot)
+        await reply_long(query.message, "\n".join(lines), sessions_keyboard(), edit=True)
+    elif action == "diagnose":
+        await query.edit_message_text("🔎 Controllo gruppo B in corso…")
+        result = await diagnose_destination(account_id)
+        await reply_long(query.message, format_destination_diagnosis(account_id, result), await session_card_keyboard(account_id), edit=True)
+    elif action == "age":
+        record = await registry_for(account_id)
+        if not record:
+            await callback_notice(query, "Verifica prima la connessione della sessione.")
+        elif record.get("inserted_at"):
+            await callback_notice(query, "La data è già registrata e viene conservata ai riavvii.")
+        else:
+            await query.edit_message_text("⏳ DATA D'INSERIMENTO SCONOSCIUTA\n" + session_label(account_id) +
+                "\nPuoi iniziare l'attesa di 48 ore da adesso, senza inventare una data precedente.",
+                reply_markup=panel_markup([[InlineKeyboardButton("⏳ Inizia attesa da ora", callback_data=f"sf:age_now:{account_id}")],
+                                          [InlineKeyboardButton("⬅️ Sessioni", callback_data="sessions")]]))
+    elif action.startswith("age_now:"):
+        slot = int(action.split(":")[1])
+        if slot != account_id:
+            await callback_notice(query, "Sessione cambiata: riapri il pannello.")
+            return True
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE session_registry SET inserted_at=?,approved=0 WHERE owner_id=? AND inserted_at IS NULL",
+                             (now_it().isoformat(), session_info[slot]["user_id"]))
+            await db.commit()
+        await add_log("⏳ Attesa iniziale avviata manualmente; data persistente")
+        await reply_long(query.message, await sessions_text(), sessions_keyboard(), edit=True)
+    elif action == "enable":
+        record = await registry_for(account_id)
+        remaining = wait_remaining(record)
+        if remaining is None or remaining > 0:
+            await callback_notice(query, "Imposta la data se sconosciuta e attendi il completamento delle 48 ore.")
+            return True
+        if session_info[account_id]["telegram_locked"] or session_info[account_id]["telegram_restriction_detected"]:
+            await callback_notice(query, "Blocco Telegram locale ancora attivo: verifica prima la limitazione.")
+            return True
+        result = await diagnose_destination(account_id)
+        if result["identity"] != "confirmed" or result["membership"] != "present" or result["invite_allowed"] is not True:
+            await reply_long(query.message, format_destination_diagnosis(account_id, result), await session_card_keyboard(account_id), edit=True)
+            return True
+        nonce = secrets.token_hex(8)
+        context.user_data["enable_session_pending"] = {"slot": account_id, "owner": session_info[account_id]["user_id"],
+            "nonce": nonce, "group": dict(state["group_b"]), "created": time.monotonic()}
+        await query.edit_message_text("✅ ABILITAZIONE MANUALE\n" + session_label(account_id) +
+            "\nAttesa completata e permessi verificati. Questo non certifica l'assenza di limiti Telegram. "
+            "Conferma soltanto dopo aver verificato l'eventuale errore precedente. AUTO resterà disattivato.",
+            reply_markup=panel_markup([[InlineKeyboardButton("✅ Abilita", callback_data="sf:enable_confirm:" + nonce)],
+                                      [InlineKeyboardButton("❌ Annulla", callback_data="sessions")]]))
+    elif action.startswith("enable_confirm:"):
+        pending = context.user_data.pop("enable_session_pending", None)
+        if not pending or pending["nonce"] != action.split(":")[1] or pending["slot"] != account_id or pending["owner"] != session_info[account_id]["user_id"] or pending["group"] != state["group_b"] or time.monotonic() - pending["created"] > 300:
+            await callback_notice(query, "Conferma scaduta: ripeti la verifica.")
+            return True
+        record = await registry_for(account_id)
+        if wait_remaining(record) != 0 or session_info[account_id]["telegram_locked"] or session_info[account_id]["telegram_restriction_detected"]:
+            await callback_notice(query, "Sessione non abilitabile: controlla lo stato.")
+            return True
+        result = await diagnose_destination(account_id)
+        if result["identity"] != "confirmed" or result["membership"] != "present" or result["invite_allowed"] is not True:
+            await reply_long(query.message, format_destination_diagnosis(account_id, result), await session_card_keyboard(account_id), edit=True)
+            return True
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE session_registry SET approved=1,halted_reason='' WHERE owner_id=?", (pending["owner"],))
+            await db.commit()
+        await add_log("✅ Sessione abilitata manualmente; AUTO resta disattivato")
+        await reply_long(query.message, await sessions_text(), sessions_keyboard(), edit=True)
+    return True
+
+
+# =========================================================
+# INGRESSO MANUALE NEL GRUPPO B
+# =========================================================
+
+async def inspect_destination_link(client, reference, group):
+    if reference["private"]:
+        invite = await asyncio.wait_for(client(CheckChatInviteRequest(reference["value"])), timeout=12)
+        entity = getattr(invite, "chat", None)
+        title = getattr(entity or invite, "title", "")
+        if entity is not None and not _same_telegram_chat_id(entity.id, group["id"]):
+            raise ValueError("Il link appartiene a un gruppo diverso dal gruppo B")
+        if entity is None and title != group["name"]:
+            raise ValueError("Il nome nel link non corrisponde al gruppo B")
+        if getattr(invite, "broadcast", False) or getattr(entity, "broadcast", False):
+            raise ValueError("Il link appartiene a un canale, non a un gruppo")
+        return entity, title, entity is not None
+    entity = await asyncio.wait_for(client.get_entity(reference["value"]), timeout=12)
+    if not isinstance(entity, (Channel, Chat)) or not _same_telegram_chat_id(entity.id, group["id"]):
+        raise ValueError("Lo username non identifica il gruppo B configurato")
+    if isinstance(entity, Channel) and not entity.megagroup:
+        raise ValueError("È un canale, non un gruppo")
+    return entity, entity.title, True
+
+
+async def join_destination_once(account_id, reference, group):
+    client = session_clients[account_id]
+    owner = session_info[account_id]["user_id"]
+    if not session_info[account_id]["ready"]:
+        return "❌ Sessione non disponibile"
+    if float(await get_setting(f"join_b_wait_{owner}", "0")) > now_it().timestamp():
+        return "⏳ Pausa Telegram ancora attiva"
+    try:
+        entity, _, _ = await inspect_destination_link(client, reference, group)
+        if entity is not None:
+            try:
+                permissions = await asyncio.wait_for(client.get_permissions(entity, "me"), timeout=10)
+                rights = getattr(getattr(permissions, "participant", None), "banned_rights", None)
+                if getattr(rights, "view_messages", False):
+                    return "❌ Account escluso dal gruppo B; nessun ingresso tentato"
+                if permissions and not permissions.has_left:
+                    return "✅ Già presente nel gruppo B"
+            except Exception as exc:
+                if type(exc).__name__ != "UserNotParticipantError":
+                    raise
+        request = ImportChatInviteRequest(reference["value"]) if reference["private"] else JoinChannelRequest(entity)
+        response = await asyncio.wait_for(client(request), timeout=20)
+        if entity is None:
+            entity = next((chat for chat in getattr(response, "chats", []) if _same_telegram_chat_id(chat.id, group["id"])), None)
+        if entity is None:
+            return "⚠️ Risposta ricevuta; gruppo non identificato. Nessun nuovo tentativo automatico"
+        permissions = await asyncio.wait_for(client.get_permissions(entity, "me"), timeout=10)
+        return "✅ Ingresso riuscito e presenza verificata" if permissions and not permissions.has_left else "⚠️ Presenza non confermata"
+    except FloodWaitError as exc:
+        await set_setting(f"join_b_wait_{owner}", now_it().timestamp() + exc.seconds)
+        return f"⏳ FloodWaitError: attendi {exc.seconds} secondi; nessun nuovo tentativo"
+    except Exception as exc:
+        if type(exc).__name__ == "InviteRequestSentError":
+            return "📨 Richiesta di accesso in attesa di approvazione"
+        if isinstance(exc, UserAlreadyParticipantError):
+            return "✅ Telegram segnala account già presente"
+        if isinstance(exc, PeerFloodError):
+            await halt_session(account_id, "PeerFloodError durante ingresso nel gruppo B")
+        return "❌ " + safe_connection_error(exc)
+
+
+async def configured_public_group_reference(account_id, group):
+    """Recupera l'indirizzo pubblico del gruppo già configurato, senza ingresso."""
+    username = group.get("username")
+    if username:
+        return {"private": False, "value": "@" + username.lstrip("@")}
+    saved_input = str(group.get("input") or "").strip()
+    if saved_input and not saved_input.lstrip("-").isdigit():
+        reference = parse_join_reference(saved_input)
+        if not reference["private"]:
+            return reference
+    if welcome_bot is not None:
+        try:
+            group_id = int(group["id"])
+            chat_id = group_id if group_id < 0 else -1000000000000 - group_id
+            chat = await asyncio.wait_for(welcome_bot.get_chat(chat_id), timeout=8)
+            if _same_telegram_chat_id(chat.id, group["id"]) and getattr(chat, "username", None):
+                return {"private": False, "value": "@" + chat.username}
+        except Exception:
+            pass
+    # Un account già presente può conoscere lo username; gli access_hash
+    # delle altre sessioni non vengono riutilizzati.
+    slots = [account_id] + [i for i in ACCOUNT_IDS if i != account_id]
+    for slot in slots:
+        if not session_info[slot]["ready"]:
+            continue
+        try:
+            entity = await asyncio.wait_for(session_clients[slot].get_entity(int(group["id"])), timeout=5)
+            if _same_telegram_chat_id(entity.id, group["id"]) and getattr(entity, "username", None):
+                return {"private": False, "value": "@" + entity.username}
+        except FloodWaitError:
+            raise
+        except Exception:
+            continue
+    return None
+
+
+async def join_b_action(update, context, data):
+    if not data.startswith("jb:"):
+        return False
+    query = update.callback_query
+    if update.effective_chat.type != "private":
+        await callback_notice(query, "Usa la chat privata con il bot.")
+        return True
+    if operation_busy() or state["auto_enabled"] or not state["group_b"]:
+        await callback_notice(query, "Disattiva AUTO, attendi la fine delle operazioni e configura il gruppo B.")
+        return True
+    if data == "jb:setup":
+        slot = state["active_session"]
+        if not session_info[slot]["ready"]:
+            await callback_notice(query, "Verifica prima la connessione dell'account.")
+            return True
+        context.user_data.pop("join_b_draft", None)
+        context.user_data.pop("feature_input", None)
+        group = dict(state["group_b"])
+        await query.edit_message_text("🚪 Verifica del gruppo B configurato…\n" + session_label(slot))
+        try:
+            reference = await configured_public_group_reference(slot, group)
+            if reference is not None:
+                await query.edit_message_text("🚪 Ingresso nel gruppo B…\n" + session_label(slot))
+                outcome = await join_destination_once(slot, reference, group)
+                await add_log("🚪 Ingresso account nel gruppo B — " + outcome, session_id=slot)
+                result = await diagnose_destination(slot)
+                await reply_long(query.message, outcome + "\n\n" + format_destination_diagnosis(slot, result),
+                                 await session_card_keyboard(slot), edit=True)
+                return True
+        except Exception as exc:
+            await callback_notice(query, "Ingresso non completato — " + safe_connection_error(exc))
+            return True
+        context.user_data["join_b_draft"] = {"slot": slot, "owner": session_info[slot]["user_id"], "group": group}
+        context.user_data["feature_input"] = "join_b_link"
+        await query.edit_message_text("🚪 ENTRA NEL GRUPPO B\n" + session_label(slot) +
+            "\nNon riesco a recuperare l'indirizzo pubblico del gruppo configurato. Inserisci il suo @username; se è privato, usa il link d'invito.",
+            reply_markup=panel_markup([[InlineKeyboardButton("❌ Annulla", callback_data="sessions")]]))
+    elif data.startswith("jb:confirm:"):
+        pending = context.user_data.pop("join_b_draft", None)
+        context.user_data.pop("feature_input", None)
+        if not pending or pending.get("nonce") != data.split(":")[2] or pending["slot"] != state["active_session"] or pending["owner"] != session_info[pending["slot"]]["user_id"] or pending["group"] != state["group_b"] or time.monotonic() - pending.get("created", 0) > 300:
+            await callback_notice(query, "Conferma scaduta: riapri l'ingresso nel gruppo B.")
+            return True
+        await query.edit_message_text("🚪 Ingresso in corso…", reply_markup=None)
+        outcome = await join_destination_once(pending["slot"], pending["reference"], pending["group"])
+        await add_log("🚪 Ingresso account nel gruppo B — " + outcome, session_id=pending["slot"])
+        result = await diagnose_destination(pending["slot"])
+        await reply_long(query.message, outcome + "\n\n" + format_destination_diagnosis(pending["slot"], result), sessions_keyboard(), edit=True)
+    return True
+
+
+# =========================================================
+# TEST MANUALI E INVITI CON LINK — anteprima e invio unico
+# =========================================================
+
+def invalidate_message_preview(draft):
+    draft.pop("nonce", None)
+    draft.pop("preview_at", None)
+
+
+async def link_recipient_allowed(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT via FROM link_permissions WHERE user_id=? AND opted_out=0", (user_id,))
+        row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def link_permissions_list():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id,via FROM link_permissions WHERE opted_out=0 ORDER BY consent_at DESC LIMIT 20")
+        return await cursor.fetchall()
+
+
+def message_test_keyboard(draft):
+    if draft["kind"] == "test" and not draft.get("nonce"):
+        draft["nonce"] = secrets.token_hex(8)
+        draft["preview_at"] = time.monotonic()
+    rows = []
+    if draft["kind"] == "test":
+        for slot in ACCOUNT_IDS:
+            info = session_info[slot]
+            owner = info.get("user_id")
+            if slot == draft["sender_slot"] or not owner:
+                continue
+            selected = any(item["id"] == owner for item in draft["recipients"])
+            rows.append([TelegramInlineKeyboardButton(f"{draft.get('session_colors', {}).get(slot, '🟡')} {session_button_name(slot)}", callback_data=f"msg:pick:{slot}")])
+        rows.append([InlineKeyboardButton("✅ Seleziona tutte", callback_data="msg:all"),
+                     InlineKeyboardButton("❌ Deseleziona tutte", callback_data="msg:none")])
+    else:
+        for item in draft.get("eligible", []):
+            selected = any(row["id"] == item["id"] for row in draft["recipients"])
+            rows.append([InlineKeyboardButton(f"{'✅' if selected else '☐'} ID {item['id']} ({item['via']})", callback_data=f"msg:linkpick:{item['id']}")])
+    rows.extend([
+        [InlineKeyboardButton("✍️ Inserisci username / ID", callback_data="msg:manual")],
+        [InlineKeyboardButton("✏️ Modifica testo", callback_data="msg:text")],
+        [InlineKeyboardButton("📤 Invia test", callback_data="msg:send:" + draft["nonce"]) if draft["kind"] == "test"
+         else InlineKeyboardButton("👁 Anteprima", callback_data="msg:preview")],
+        [InlineKeyboardButton("❌ Annulla", callback_data="sessions" if draft["kind"] == "test" else "link:menu")],
+    ])
+    return panel_markup(rows)
+
+
+def message_draft_text(draft):
+    sender = session_label(draft["sender_slot"]) if draft.get("sender_slot") else "Bot Telegram"
+    names = ", ".join(item["label"] for item in draft["recipients"]) or "nessuno"
+    return ("🧪 TEST MESSAGGIO" if draft["kind"] == "test" else "📩 INVITO CON LINK") + \
+        f"\nMittente: {sender}\nDestinatari: {names}\n\nTesto:\n{draft['text']}\n\n" + \
+        ("" if draft["kind"] == "test"
+         else "Destinatari con consenso registrato. Un invito per persona e gruppo, senza reinvio automatico.")
+
+
+async def resolve_message_recipient(client, value):
+    value = value.strip()
+    if value.isdigit():
+        target = int(value)
+    elif re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,}", value):
+        target = value
+    else:
+        raise ValueError("Usa uno @username o un ID utente positivo, uno per riga")
+    entity = await asyncio.wait_for(client.get_entity(target), timeout=10)
+    if not isinstance(entity, User) or getattr(entity, "bot", False) or getattr(entity, "deleted", False):
+        raise ValueError("È necessario un account utente attivo")
+    return {"id": entity.id, "username": getattr(entity, "username", None),
+            "label": "@" + entity.username if getattr(entity, "username", None) else f"ID {entity.id}"}
+
+
+async def reserve_delivery(batch_id, sender_id, recipient_id, kind, destination_id=None):
+    # La prenotazione precede l'invio. Un esito incerto non viene ritentato.
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        if kind == "link":
+            cursor = await db.execute("INSERT OR IGNORE INTO link_invites_sent VALUES (?,?,?, 'PENDING')",
+                                      (recipient_id, destination_id, now_it().isoformat()))
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+        cursor = await db.execute("INSERT OR IGNORE INTO message_deliveries VALUES (?,?,?,?, 'PENDING',NULL,?, '')",
+                                  (batch_id, sender_id, recipient_id, kind, now_it().isoformat()))
+        if cursor.rowcount != 1:
+            await db.rollback()
+            return False
+        await db.commit()
+        return True
+
+
+async def finish_delivery(batch_id, sender_id, recipient_id, status, detail, message_id=None, destination_id=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE message_deliveries SET status=?,detail=?,message_id=?,updated_at=? WHERE batch_id=? AND sender_id=? AND recipient_id=?",
+                         (status, detail[:500], message_id, now_it().isoformat(), batch_id, sender_id, recipient_id))
+        if destination_id is not None:
+            await db.execute("UPDATE link_invites_sent SET status=? WHERE user_id=? AND destination_id=?", (status, recipient_id, destination_id))
+        await db.commit()
+
+
+async def receipt_baseline(sender_id, recipient_id):
+    slot = next((i for i in ACCOUNT_IDS if session_info[i].get("user_id") == recipient_id and session_info[i]["ready"]), None)
+    if slot is None:
+        return None
+    try:
+        messages = await asyncio.wait_for(session_clients[slot].get_messages(sender_id, limit=1), timeout=8)
+        return max((message.id for message in messages), default=0)
+    except Exception:
+        return None
+
+
+async def verify_test_receipt(sender_id, recipient_id, text, sent_at, baseline=None):
+    slot = next((i for i in ACCOUNT_IDS if session_info[i].get("user_id") == recipient_id and session_info[i]["ready"]), None)
+    if slot is None:
+        return "Ricezione da controllare sul destinatario non collegato"
+    client = session_clients[slot]
+    if baseline is None:
+        return "⚠️ Ricezione non verificabile: stato precedente della chat non disponibile"
+    try:
+        # Confronta mittente, testo e orario; gli ID dei messaggi privati
+        # sono locali a ciascun account e non possono essere confrontati.
+        for pause in (0, 2):
+            if pause:
+                await asyncio.sleep(pause)
+            messages = await asyncio.wait_for(client.get_messages(sender_id, limit=10), timeout=8)
+            for message in messages:
+                if message.sender_id == sender_id and not message.out and message.raw_text == text and message.date >= sent_at and message.id > baseline:
+                    return "✅ Ricezione verificata"
+        return "⚠️ Ricezione non verificata"
+    except Exception as exc:
+        return "⚠️ Ricezione non verificabile — " + safe_connection_error(exc)
+
+
+async def execute_message_batch(draft, bot):
+    sender_slot = draft.get("sender_slot")
+    sender_id = draft["sender_id"]
+    client = session_clients.get(sender_slot) if sender_slot else None
+    destination = draft.get("group", {}).get("id") if draft["kind"] == "link" else None
+    batch = draft["nonce"]
+    lines = ["📬 ESITI — " + batch]
+    if sender_slot:
+        if sender_slot not in session_info or not session_info[sender_slot]["ready"] or session_info[sender_slot]["user_id"] != sender_id:
+            return "❌ Identità mittente cambiata: prepara di nuovo il messaggio"
+        record = await registry_for(sender_slot)
+        if session_info[sender_slot]["telegram_locked"] or record.get("halted_reason"):
+            return "🛑 Sessione fermata: verifica la diagnosi prima di inviare messaggi"
+        if float(await get_setting(f"message_wait_{sender_id}", "0")) > now_it().timestamp():
+            return "⏳ Attesa Telegram ancora attiva per questo mittente"
+        me = await asyncio.wait_for(client.get_me(), timeout=10)
+        if not me or me.id != sender_id:
+            return "❌ Identità mittente non confermata"
+    if not sender_slot and float(await get_setting("bot_message_wait", "0")) > now_it().timestamp():
+        return "⏳ Pausa Telegram ancora attiva per il bot"
+    for index, recipient in enumerate(draft["recipients"]):
+        uid = recipient["id"]
+        label = recipient["label"]
+        if uid == sender_id:
+            lines.append(f"↪️ {label}: mittente escluso")
+            continue
+        via = await link_recipient_allowed(uid) if draft["kind"] == "link" else None
+        if draft["kind"] == "link":
+            if not via or await invitation_opted_out(uid, diagnostic_chat_id_from_group(draft["group"])):
+                lines.append(f"🚫 {label}: consenso assente o inviti rifiutati")
+                continue
+            if not sender_slot and via != "bot":
+                lines.append(f"↪️ {label}: questo utente non ha autorizzato il bot; scegli la sessione")
+                continue
+        if not await reserve_delivery(batch, sender_id, uid, draft["kind"], destination):
+            lines.append(f"↪️ {label}: invio già registrato, duplicato evitato")
+            continue
+        try:
+            baseline = await receipt_baseline(sender_id, uid) if client else None
+            sent_at = now_it().replace(microsecond=0)
+            if client:
+                target = await resolve_message_recipient(client, "@" + recipient["username"] if recipient.get("username") else str(uid))
+                if target["id"] != uid:
+                    raise ValueError("Identità destinatario cambiata: nessun messaggio inviato")
+                sent = await asyncio.wait_for(client.send_message(uid, draft["text"], parse_mode=None, link_preview=False), timeout=20)
+                message_id = sent.id
+            else:
+                sent = await bot.send_message(uid, draft["text"], disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Non ricevere altri inviti", callback_data="link_optout")]]))
+                message_id = sent.message_id
+            # Persistenza dell'invio prima di verificare la ricezione.
+            await finish_delivery(batch, sender_id, uid, "SENT", "Invio riuscito", message_id, destination)
+            receipt = await verify_test_receipt(sender_id, uid, draft["text"], sent_at, baseline) if client else "Invio Bot API riuscito; ricezione non verificata"
+            lines.append(f"✅ {label}: invio riuscito — {receipt}")
+            await add_log(f"📩 {draft['kind']} — batch {batch} — ID {uid}: invio riuscito; {receipt}", session_id=sender_slot or 0)
+        except Exception as exc:
+            uncertain = isinstance(exc, (TimeoutError, ConnectionError, OSError))
+            status = "UNKNOWN" if uncertain else "FAILED"
+            detail = safe_connection_error(exc)
+            await finish_delivery(batch, sender_id, uid, status, detail, destination_id=destination)
+            lines.append(f"⚠️ {label}: {'esito incerto; nessun reinvio' if uncertain else 'invio fallito'} — {detail}")
+            await add_log(f"❌ {draft['kind']} — batch {batch} — ID {uid} — {detail}", "ERROR", session_id=sender_slot or 0)
+            stop = uncertain or isinstance(exc, (FloodWaitError, PeerFloodError, RetryAfter)) or type(exc).__name__ in {"UserBannedInChannelError", "AuthKeyUnregisteredError", "SessionRevokedError"}
+            if isinstance(exc, FloodWaitError):
+                await set_setting(f"message_wait_{sender_id}", now_it().timestamp() + exc.seconds)
+            if isinstance(exc, RetryAfter):
+                seconds = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else exc.retry_after
+                await set_setting("bot_message_wait", now_it().timestamp() + seconds)
+            if sender_slot and stop:
+                await halt_session(sender_slot, "Invio messaggio: " + detail)
+                if isinstance(exc, PeerFloodError):
+                    for flag in ("telegram_locked", "telegram_restriction_detected"):
+                        session_info[sender_slot][flag] = True
+                        await set_setting(f"session_{sender_slot}_{flag}", "1")
+                    if sender_slot == state["active_session"]:
+                        sync_session_state()
+            if stop:
+                lines.append(f"🛑 Operazione interrotta; {len(draft['recipients']) - index - 1} destinatari non tentati")
+                break
+    return "\n".join(lines)
+
+
+def diagnostic_chat_id_from_group(group):
+    value = int(group["id"])
+    return value if value < 0 else -1000000000000 - value
+
+
+async def message_feature_action(update, context, data):
+    if not data.startswith("msg:"):
+        return False
+    query = update.callback_query
+    if update.effective_chat.type != "private" or operation_busy() or state["auto_enabled"]:
+        await callback_notice(query, "Usa la chat privata, disattiva AUTO e attendi la fine delle operazioni.")
+        return True
+    action = data[4:]
+    if action == "setup":
+        rows = [[TelegramInlineKeyboardButton(f"{await session_status_color(i)} {session_button_name(i)}", callback_data=f"msg:sender:{i}")] for i in ACCOUNT_IDS if session_info[i]["ready"]]
+        rows.append([InlineKeyboardButton("📋 Esiti dei test", callback_data="msg:results")])
+        rows.append([InlineKeyboardButton("⬅️ Sessioni", callback_data="sessions")])
+        context.user_data.pop("message_draft", None)
+        await query.edit_message_text("🧪 TEST MESSAGGIO\nScegli la sessione mittente.", reply_markup=panel_markup(rows))
+        return True
+    if action == "results":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT updated_at,recipient_id,status,detail FROM message_deliveries WHERE kind='test' ORDER BY updated_at DESC LIMIT 20")
+            rows = await cursor.fetchall()
+        await reply_long(query.message, "📋 ESITI DEI TEST\n" + "\n".join(f"{stamp} | ID {uid} | {status}\n{detail}" for stamp,uid,status,detail in rows), sessions_keyboard(), edit=True)
+        return True
+    if action.startswith("sender:"):
+        slot = int(action.split(":")[1])
+        if slot not in session_info or not session_info[slot]["ready"]:
+            await callback_notice(query, "Sessione non disponibile")
+            return True
+        context.user_data["message_draft"] = {"kind": "test", "sender_slot": slot,
+            "sender_id": session_info[slot]["user_id"], "recipients": [], "text": "ciao",
+            "session_colors": {i: await session_status_color(i) for i in ACCOUNT_IDS}}
+    draft = context.user_data.get("message_draft")
+    if not draft:
+        await callback_notice(query, "Preparazione scaduta: riapri Test messaggio o Invito con link.")
+        return True
+    if draft.get("sender_slot") and (draft["sender_slot"] not in session_info or session_info[draft["sender_slot"]]["user_id"] != draft["sender_id"]):
+        context.user_data.pop("message_draft", None)
+        await callback_notice(query, "Il mittente è cambiato: prepara di nuovo il test.")
+        return True
+    if action.startswith("pick:") and draft["kind"] == "test":
+        slot = int(action.split(":")[1])
+        info = session_info.get(slot, {})
+        uid = info.get("user_id")
+        if uid and uid != draft["sender_id"]:
+            existing = next((item for item in draft["recipients"] if item["id"] == uid), None)
+            if existing:
+                draft["recipients"].remove(existing)
+            else:
+                draft["recipients"].append({"id": uid, "username": info.get("username"), "label": session_label(slot)})
+    elif action.startswith("linkpick:") and draft["kind"] == "link":
+        uid = int(action.split(":")[1])
+        item = next((item for item in draft.get("eligible", []) if item["id"] == uid), None)
+        if item:
+            existing = next((row for row in draft["recipients"] if row["id"] == uid), None)
+            if existing:
+                draft["recipients"].remove(existing)
+            else:
+                draft["recipients"].append({"id": uid, "username": None, "label": f"ID {uid}"})
+    elif action == "all" and draft["kind"] == "test":
+        draft["recipients"] = [{"id": session_info[i]["user_id"], "username": session_info[i].get("username"), "label": session_label(i)}
+            for i in ACCOUNT_IDS if session_info[i]["user_id"] and session_info[i]["user_id"] != draft["sender_id"]]
+    elif action == "none":
+        draft["recipients"] = []
+    elif action in {"manual", "text"}:
+        invalidate_message_preview(draft)
+        context.user_data["feature_input"] = "message_manual" if action == "manual" else "message_text"
+        await query.edit_message_text("✍️ Inserisci i tuoi destinatari: @username o ID, uno per riga (massimo 20)." if action == "manual"
+            else "✏️ Scrivi il testo del messaggio (massimo 1000 caratteri).",
+            reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Destinatari", callback_data="msg:back")]]))
+        return True
+    elif action == "preview":
+        if draft["kind"] == "test":
+            await callback_notice(query, "Usa Invia test dalla schermata dei destinatari.")
+            return True
+        if not draft["recipients"]:
+            await callback_notice(query, "Seleziona almeno un destinatario.")
+            return True
+        if len(draft["recipients"]) > 20:
+            await callback_notice(query, "Massimo 20 destinatari per operazione manuale.")
+            return True
+        draft["nonce"] = secrets.token_hex(8)
+        draft["preview_at"] = time.monotonic()
+        extra = "\nInvio soltanto ai destinatari con consenso registrato."
+        await reply_long(query.message, "👁 ANTEPRIMA\n" + message_draft_text(draft) + extra,
+            panel_markup([[InlineKeyboardButton("📤 Invia test" if draft["kind"] == "test" else "📩 Invia invito", callback_data="msg:send:" + draft["nonce"])],
+                          [InlineKeyboardButton("⬅️ Modifica", callback_data="msg:back")]]), edit=True)
+        return True
+    elif action.startswith("send:"):
+        if not draft["recipients"]:
+            await callback_notice(query, "Seleziona almeno un destinatario.")
+            return True
+        if len(draft["recipients"]) > 20:
+            await callback_notice(query, "Massimo 20 destinatari per operazione manuale.")
+            return True
+        if draft.get("nonce") != action.split(":")[1] or time.monotonic() - draft.get("preview_at", 0) > 300:
+            await callback_notice(query, "Invio scaduto: riapri i destinatari." if draft["kind"] == "test" else "Anteprima scaduta: preparala di nuovo.")
+            return True
+        if draft["kind"] == "link" and draft.get("group") != state["group_b"]:
+            await callback_notice(query, "Gruppo B cambiato: prepara di nuovo l'invito.")
+            return True
+        # Consuma la conferma prima di inviare: protegge anche dal doppio clic.
+        context.user_data.pop("message_draft", None)
+        context.user_data.pop("feature_input", None)
+        await query.edit_message_text("📤 Invio in corso…", reply_markup=None)
+        result = await execute_message_batch(draft, context.bot)
+        await reply_long(query.message, result, sessions_keyboard() if draft["kind"] == "test" else link_invite_keyboard(), edit=True)
+        return True
+    invalidate_message_preview(draft)
+    context.user_data.pop("feature_input", None)
+    await reply_long(query.message, message_draft_text(draft), message_test_keyboard(draft), edit=True)
+    return True
+
+
+def link_invite_keyboard():
+    return panel_markup([
+        [InlineKeyboardButton("✏️ Modifica testo", callback_data="link:text"), InlineKeyboardButton("🔗 Imposta link", callback_data="link:url")],
+        [InlineKeyboardButton("🤖 Prepara invio dal bot", callback_data="link:prepare:bot")],
+        [InlineKeyboardButton("👤 Prepara dalla sessione attiva", callback_data="link:prepare:session")],
+        [InlineKeyboardButton("✅ Registra consenso contatto", callback_data="link:consent")],
+        [InlineKeyboardButton("🚫 Escludi destinatario", callback_data="link:exclude")],
+        [InlineKeyboardButton("📋 Esiti invii", callback_data="link:results")],
+        [InlineKeyboardButton("⬅️ Inviti", callback_data="menu_invites")],
+    ])
+
+
+async def link_invite_action(update, context, data):
+    if not data.startswith("link:"):
+        return False
+    query = update.callback_query
+    if update.effective_chat.type != "private" or operation_busy() or state["auto_enabled"]:
+        await callback_notice(query, "Usa la chat privata, disattiva AUTO e attendi la fine delle operazioni.")
+        return True
+    action = data[5:]
+    if action == "menu":
+        context.user_data.pop("message_draft", None)
+        context.user_data.pop("feature_input", None)
+        text = await get_setting("link_invite_text", "Ciao! Se ti interessa, puoi entrare nel nostro gruppo: {link}")
+        url = await get_setting("link_invite_url", "non configurato")
+        await query.edit_message_text("📩 INVITO CON LINK\n\nTesto: " + text + "\nLink: " + url +
+            "\n\nGli utenti del bot possono scegliere /start → Ricevi inviti e revocare con /stopinviti. "
+            "Per i contatti registra soltanto un consenso già ricevuto.", reply_markup=link_invite_keyboard())
+    elif action in {"text", "url", "consent", "exclude"}:
+        context.user_data["feature_input"] = "link_" + action
+        prompts = {"text": "Scrivi il testo dell'invito (massimo 1000 caratteri). Usa {link} per inserire il link.",
+                   "url": "Incolla il link t.me del gruppo B. Verrà verificato prima dell'invio.",
+                   "consent": "Inserisci lo @username o ID del contatto che ha già accettato di ricevere l'invito. Il consenso verrà confermato nel passaggio successivo.",
+                   "exclude": "Inserisci lo @username o ID da escludere dagli inviti con link."}
+        await query.edit_message_text(prompts[action], reply_markup=panel_markup([[InlineKeyboardButton("❌ Annulla", callback_data="link:menu")]]))
+    elif action.startswith("consent_confirm:"):
+        pending = context.user_data.pop("link_consent_pending", None)
+        if not pending or pending["nonce"] != action.split(":")[1] or time.monotonic() - pending["created"] > 300:
+            await callback_notice(query, "Conferma scaduta.")
+            return True
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT INTO link_permissions VALUES (?, 'contact', ?,0) ON CONFLICT(user_id) DO UPDATE SET consent_at=excluded.consent_at,opted_out=0",
+                             (pending["recipient"]["id"], now_it().isoformat()))
+            await db.commit()
+        await add_log(f"✅ Consenso contatto registrato manualmente — ID {pending['recipient']['id']}")
+        await query.edit_message_text("✅ Consenso registrato.", reply_markup=link_invite_keyboard())
+    elif action.startswith("prepare:"):
+        if not state["group_b"]:
+            await callback_notice(query, "Configura prima il gruppo B.")
+            return True
+        if action.split(":")[1] == "session":
+            slot = state["active_session"]
+            if not session_info[slot]["ready"]:
+                await callback_notice(query, "Sessione non disponibile.")
+                return True
+            sender_id = session_info[slot]["user_id"]
+        else:
+            slot = None
+            sender_id = 0
+        if not slot and float(await get_setting("bot_message_wait", "0")) > now_it().timestamp():
+            await callback_notice(query, "Pausa Bot API ancora attiva.")
+            return True
+        url = await get_setting("link_invite_url", "")
+        if not url:
+            await callback_notice(query, "Imposta prima il link del gruppo B.")
+            return True
+        ready = slot or next((i for i in ACCOUNT_IDS if session_info[i]["ready"]), None)
+        if ready is None:
+            await callback_notice(query, "Serve una sessione connessa per verificare il link.")
+            return True
+        try:
+            _, _, known = await inspect_destination_link(session_clients[ready], parse_join_reference(url), state["group_b"])
+        except Exception as exc:
+            await callback_notice(query, "Link non verificato: " + safe_connection_error(exc))
+            return True
+        template = await get_setting("link_invite_text", "Ciao! Se ti interessa, puoi entrare nel nostro gruppo: {link}")
+        text = template.replace("{link}", url)
+        if url not in text:
+            text += "\n" + url
+        eligible = [{"id": uid, "via": via} for uid, via in await link_permissions_list() if slot or via == "bot"]
+        draft = {"kind": "link", "sender_slot": slot, "sender_id": sender_id, "recipients": [],
+                 "text": text, "group": dict(state["group_b"]), "eligible": eligible}
+        context.user_data["message_draft"] = draft
+        warning = "\nIl link privato espone solo il nome: conferma che appartenga al gruppo B.\n" if not known else "\n"
+        await reply_long(query.message, message_draft_text(draft) + warning, message_test_keyboard(draft), edit=True)
+    elif action == "results":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT updated_at,kind,recipient_id,status,detail FROM message_deliveries ORDER BY updated_at DESC LIMIT 20")
+            rows = await cursor.fetchall()
+        await reply_long(query.message, "📋 ULTIMI INVII\n" + "\n".join(f"{stamp} | {kind} | ID {uid} | {status}\n{detail}" for stamp,kind,uid,status,detail in rows), link_invite_keyboard(), edit=True)
+    return True
+
+
+async def feature_text_input(update, context):
+    target = context.user_data.get("feature_input")
+    if not target:
+        return False
+    if operation_busy() or state["auto_enabled"]:
+        await update.message.reply_text("Disattiva AUTO e attendi la fine delle operazioni.")
+        return True
+    value = update.message.text.strip()
+    try:
+        if target == "join_b_link":
+            pending = context.user_data.get("join_b_draft")
+            if not pending or pending["slot"] != state["active_session"] or pending["group"] != state["group_b"]:
+                raise ValueError("Sessione o gruppo cambiati: riapri Entra nel gruppo B")
+            reference = parse_join_reference(value)
+            _, title, known = await inspect_destination_link(session_clients[pending["slot"]], reference, pending["group"])
+            pending.update(reference=reference, nonce=secrets.token_hex(8), created=time.monotonic())
+            context.user_data.pop("feature_input", None)
+            await update.message.reply_text("🚪 CONFERMA INGRESSO\n" + session_label(pending["slot"]) + "\nGruppo: " + title +
+                ("\nIdentità verificata." if known else "\nIl link espone solo il nome: conferma che sia il gruppo B corretto."),
+                reply_markup=panel_markup([[InlineKeyboardButton("🚪 Conferma ingresso", callback_data="jb:confirm:" + pending["nonce"])],
+                                          [InlineKeyboardButton("❌ Annulla", callback_data="sessions")]]))
+        elif target in {"message_manual", "message_text"}:
+            draft = context.user_data.get("message_draft")
+            if not draft:
+                raise ValueError("Preparazione scaduta")
+            if target == "message_text":
+                if not value or len(value) > 1000:
+                    raise ValueError("Scrivi da 1 a 1000 caratteri")
+                if draft["kind"] == "link":
+                    url = await get_setting("link_invite_url", "")
+                    value = value.replace("{link}", url)
+                    if url not in value:
+                        value += "\n" + url
+                draft["text"] = value
+            else:
+                values = [line.strip() for line in value.splitlines() if line.strip()]
+                if len(values) > 20:
+                    raise ValueError("Massimo 20 destinatari")
+                slot = draft.get("sender_slot") or next((i for i in ACCOUNT_IDS if session_info[i]["ready"]), None)
+                if slot is None:
+                    raise ValueError("Serve una sessione connessa per risolvere username e ID")
+                additions = []
+                for item in values:
+                    recipient = await resolve_message_recipient(session_clients[slot], item)
+                    if recipient["id"] == draft["sender_id"]:
+                        continue
+                    if draft["kind"] == "link":
+                        via = await link_recipient_allowed(recipient["id"])
+                        if not via or (not draft.get("sender_slot") and via != "bot"):
+                            raise ValueError("Consenso o avvio del bot mancante per " + recipient["label"])
+                    additions.append(recipient)
+                combined = {item["id"]: item for item in draft["recipients"] + additions}
+                if len(combined) > 20:
+                    raise ValueError("Massimo 20 destinatari complessivi")
+                draft["recipients"] = list(combined.values())
+            invalidate_message_preview(draft)
+            context.user_data.pop("feature_input", None)
+            await reply_long(update.message, message_draft_text(draft), message_test_keyboard(draft))
+        elif target == "link_text":
+            if not value or len(value) > 1000:
+                raise ValueError("Scrivi da 1 a 1000 caratteri")
+            await set_setting("link_invite_text", value)
+            context.user_data.pop("feature_input", None)
+            await update.message.reply_text("✅ Testo salvato.", reply_markup=link_invite_keyboard())
+        elif target == "link_url":
+            reference = parse_join_reference(value)
+            if not state["group_b"]:
+                raise ValueError("Configura prima il gruppo B")
+            slot = next((i for i in ACCOUNT_IDS if session_info[i]["ready"]), None)
+            if slot is None:
+                raise ValueError("Serve una sessione connessa")
+            _, _, known = await inspect_destination_link(session_clients[slot], reference, state["group_b"])
+            url = "https://t.me/+" + reference["value"] if reference["private"] else "https://t.me/" + reference["value"].lstrip("@")
+            await set_setting("link_invite_url", url)
+            context.user_data.pop("feature_input", None)
+            await update.message.reply_text("✅ Link salvato." + ("" if known else " Il link privato espone solo il nome: verifica che sia il gruppo B corretto."), reply_markup=link_invite_keyboard())
+        elif target in {"link_consent", "link_exclude"}:
+            slot = state["active_session"]
+            recipient = await resolve_message_recipient(session_clients[slot], value)
+            context.user_data.pop("feature_input", None)
+            if target == "link_consent":
+                nonce = secrets.token_hex(8)
+                context.user_data["link_consent_pending"] = {"recipient": recipient, "nonce": nonce, "created": time.monotonic()}
+                await update.message.reply_text("✅ REGISTRA CONSENSO\n" + recipient["label"] +
+                    "\nConfermi che questa persona ha già accettato di ricevere l'invito?",
+                    reply_markup=panel_markup([[InlineKeyboardButton("✅ Consenso già ricevuto", callback_data="link:consent_confirm:" + nonce)],
+                                              [InlineKeyboardButton("❌ Annulla", callback_data="link:menu")]]))
+            else:
+                await save_link_optout(recipient["id"])
+                await update.message.reply_text("🚫 Destinatario escluso dagli inviti con link.", reply_markup=link_invite_keyboard())
+        else:
+            context.user_data.pop("feature_input", None)
+    except Exception as exc:
+        await update.message.reply_text("❌ " + safe_connection_error(exc))
+    return True
+
+
+async def save_link_optout(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO link_permissions VALUES (?, 'revoked', ?,1) ON CONFLICT(user_id) DO UPDATE SET opted_out=1",
+                         (user_id, now_it().isoformat()))
+        await db.commit()
+
+
+async def public_invite_start(update, context):
+    if update.effective_chat.type != "private":
+        return
+    await update.message.reply_text("Puoi scegliere se ricevere un invito con link al nostro gruppo. Puoi revocare in qualsiasi momento con /stopinviti.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📩 Ricevi inviti", callback_data="link_optin")],
+                                          [InlineKeyboardButton("🚫 Non ricevere inviti", callback_data="link_optout")]]))
+
+
+async def public_link_preference(update, context):
+    query = update.callback_query
+    await query.answer()
+    if update.effective_chat.type != "private":
+        return
+    uid = update.effective_user.id
+    if query.data == "link_optout":
+        await save_link_optout(uid)
+        text = "🚫 Preferenza salvata: non riceverai altri inviti con link."
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT INTO link_permissions VALUES (?, 'bot', ?,0) ON CONFLICT(user_id) DO UPDATE SET via='bot',consent_at=excluded.consent_at,opted_out=0",
+                             (uid, now_it().isoformat()))
+            await db.commit()
+        text = "✅ Preferenza salvata: puoi ricevere l'invito al gruppo. Revoca con /stopinviti."
+    await query.edit_message_text(text)
+
+
+async def stop_link_invites(update, context):
+    if update.effective_chat.type == "private":
+        await save_link_optout(update.effective_user.id)
+        await update.message.reply_text("🚫 Non riceverai altri inviti con link.")
+
+
+async def stop_invites_for_destination(display, mode, error_name, message):
+    state["running"] = False
+    state["auto_enabled"] = False
+    await set_setting("auto_enabled", "0")
+    await increment_stat("errors")
+    await add_log(
+        f"🛑 {mode} — {display} — INVITO RIFIUTATO — causa da verificare — "
+        f"{error_name}: {message[:220]} — ciclo e programmazione AUTO fermati. "
+        "Diagnosi della sessione richiesta; nessun nuovo tentativo automatico. "
+        "Restrizione Telegram distinta dal blocco locale del programma.", "ERROR",
+    )
+    return ("destination_error", display)
+
+
+async def report_verification_problem(display, mode, error_name, message):
+    if error_name == "PeerFloodError":
+        state["running"] = False
+        state["auto_enabled"] = False
+        state["telegram_locked"] = True
+        state["telegram_restriction_detected"] = True
+        await set_setting("auto_enabled", "0")
+        await set_setting("telegram_locked", "1")
+        await set_setting("telegram_restriction_detected", "1")
+        await add_log(
+            f"🛑 {mode} — {display} — LIMITAZIONE DURANTE LA VERIFICA — "
+            f"{error_name}: {(message or '')[:220]} — ciclo fermato e blocco locale attivato", "WARNING",
+        )
+        return ("peer_flood", display)
+    if error_name == "FloodWaitError":
+        state["running"] = False
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+        await add_log(
+            f"⏳ {mode} — {display} — ATTESA TELEGRAM DURANTE LA VERIFICA — "
+            f"{error_name}: {(message or '')[:220]} — ciclo fermato; rispetta l'attesa richiesta", "WARNING",
+        )
+        return ("flood_wait", display)
+    if error_name in DESTINATION_ERRORS:
+        return await stop_invites_for_destination(display, mode, error_name, message or "")
+    state["running"] = False
+    state["auto_enabled"] = False
+    await set_setting("auto_enabled", "0")
+    await increment_stat("errors")
+    await add_log(
+        f"⚠️ {mode} — {display} — PRESENZA NON VERIFICABILE — "
+        f"{error_name or 'ErroreSconosciuto'}: {(message or '')[:220]} — "
+        "ciclo e programmazione AUTO fermati; nessun nuovo invito. "
+        "L'esito resta da verificare.", "WARNING",
+    )
+    return ("verification_error", display)
+
+
+def missing_invitee_detail(item):
+    """Legge solo i campi documentati, senza esporre l'intera risposta."""
+    premium_invite = getattr(item, "premium_would_allow_invite", None)
+    premium_pm = getattr(item, "premium_required_for_pm", None)
+    if premium_invite:
+        reason = "Telegram indica che l'account invitante necessita di Premium per questo invito"
+    elif premium_pm:
+        reason = "Telegram indica privacy del destinatario e requisito Premium per un messaggio privato"
+    elif hasattr(item, "premium_would_allow_invite") and hasattr(item, "premium_required_for_pm"):
+        reason = "Telegram indica che le impostazioni privacy impediscono l'aggiunta diretta"
+    else:
+        reason = "Telegram segnala il destinatario come non invitato; causa non specificata"
+    return (f"{reason}; premium_would_allow_invite={premium_invite}; "
+            f"premium_required_for_pm={premium_pm}")
+
+
+def auto_deadline_key():
+    owner = session_info[current_session_id()].get("user_id")
+    return f"auto_next_invite_{owner or ('slot_' + str(current_session_id()))}"
+
+
+async def record_auto_deadline(seconds):
+    key = auto_deadline_key()
+    existing = float(await get_setting(key, "0"))
+    deadline = max(existing, now_it().timestamp() + seconds)
+    await set_setting(key, str(deadline))
+
+
+async def wait_auto_deadline():
+    deadline = float(await get_setting(auto_deadline_key(), "0"))
+    remaining = max(0, deadline - now_it().timestamp())
+    if not remaining:
+        return True
+    minutes = math.ceil(remaining / 60)
+    await add_log(f"⏱ AUTO — pausa precedente ancora attiva: attesa fino a {minutes} minuti prima di un nuovo invito")
+    return await interruptible_wait(minutes)
+
+
+@tracked_invitation
+async def invite_one(destination, user, mode):
+    if await invitation_opted_out(user.id):
+        await add_log(f"🚪 {mode} — ID {user.id} — uscita richiesta dall'utente: invito escluso")
+        return ("privacy", str(user.id))
+    if user.id in await known_privacy_rejections():
+        await add_log(f"🛡 {mode} — ID {user.id} — rifiuto privacy già registrato per questo account e gruppo; nessun nuovo invito")
+        return ("privacy", str(user.id))
+    display = f"@{user.username}" if getattr(user, "username", None) else f"ID {user.id}"
+    previous_status = await processed_status(user.id)
+    pending = previous_status in {"UNCONFIRMED", "VERIFY_PENDING"}
+    recovery = pending or previous_status == "NOT_ADDED"
+    await add_log(
+        f"🔍 {mode} — {display} — "
+        + ("Recupero esito precedente: verifica presenza prima di un eventuale unico nuovo tentativo" if recovery
+           else "Controllo presenza nel gruppo B prima dell'invito")
+    )
+    confirmed, error_name, error_message = await verify_in_destination(destination, user)
+    if confirmed:
+        if pending:
+            await increment_stat("migrated")
+            await save_processed(user, "CONFIRMED")
+            await add_log(f"✅ {mode} — {display} — PRESENZA CONFERMATA dopo esito precedente incerto")
+            await welcome_confirmed_invite(destination, user)
+            return ("confirmed", display)
+        await increment_stat("already")
+        await save_processed(user, "ALREADY")
+        await add_log(f"↪️ {mode} — {display} — GIÀ PRESENTE nel gruppo B; nessun invito")
+        return ("already", display)
+    if error_name != "UserNotParticipantError":
+        return await report_verification_problem(display, mode, error_name, error_message)
+    if previous_status in {"PRIVACY", "INVITE_REJECTED"}:
+        await add_log(f"🔒 {mode} — {display} — precedente rifiuto privacy/invito: nessun nuovo tentativo", "WARNING")
+        return ("unconfirmed", display)
+    if recovery and await recovery_used(user.id):
+        await save_processed(user, "NOT_ADDED")
+        await add_log(f"↪️ {mode} — {display} — recupero già usato; nessun nuovo invito")
+        return ("unconfirmed", display)
+    if "AUTO" in mode and not await wait_auto_deadline():
+        return ("cooldown_stopped", display)
+    if recovery:
+        # L'assenza è certa (UserNotParticipantError), non un errore tecnico.
+        if not await reserve_recovery(user.id):
+            await save_processed(user, "NOT_ADDED")
+            await add_log(
+                f"↪️ {mode} — {display} — assenza verificata; unico tentativo di recupero già usato. "
+                "Nessun nuovo invito e nessuna attesa di invio", "WARNING",
+            )
+            return ("unconfirmed", display)
+        await add_log(
+            f"🔄 {mode} — {display} — ASSENZA VERIFICATA — nuovo tentativo di recupero 1/1 con questa sessione"
+        )
+
+
+    if "AUTO" in mode:
+        await record_auto_deadline(max(15, state["interval_minutes"]) * 60)
+    await increment_stat("attempts")
+    started_at = now_it().isoformat()
+    await add_log(f"{mode} — Tentativo: {display} — ID {user.id} — gruppo B {diagnostic_chat_id(destination)}")
+    try:
+        response = await user_client(InviteToChannelRequest(destination, [user]))
+        # Persistenza immediata: una verifica inconcludente non deve causare reinviti.
+        await save_processed(user, "VERIFY_PENDING")
+        missing = getattr(response, "missing_invitees", None)
+        matched = [item for item in (missing or []) if getattr(item, "user_id", None) == user.id]
+        await add_log(
+            f"📨 {mode} — {display} — RISPOSTA TELEGRAM: {type(response).__name__}; "
+            + (f"missing_invitees={len(missing)}" if missing is not None
+               else "missing_invitees non disponibile in questa risposta")
+            + f" — ID {user.id}; gruppo B {diagnostic_chat_id(destination)} — risposta ricevuta; aggiunta non ancora confermata"
+        )
+        if matched:
+            for item in matched:
+                if (hasattr(item, "premium_would_allow_invite") and hasattr(item, "premium_required_for_pm")
+                        and not getattr(item, "premium_would_allow_invite", False)):
+                    await remember_privacy_rejection(user.id, "missing_invitees: privacy")
+            detail = " | ".join(missing_invitee_detail(item) for item in matched)
+            await increment_stat("unconfirmed")
+            await save_processed(user, "INVITE_REJECTED")
+            await add_log(
+                f"🚫 {mode} — {display} (ID {user.id}) — NON INVITATO — "
+                f"missing_invitees: {detail}", "WARNING",
+            )
+            return ("unconfirmed", display)
+
+        await add_log(f"🔍 {mode} — ID {user.id} — gruppo {diagnostic_chat_id(destination)} — controllo presenza dopo 10 secondi; secondo controllo dopo altri 10 solo se incerto; nessun nuovo invito")
+        return await observe_invite_membership(destination, user, mode, started_at)
+
+    except UserAlreadyParticipantError:
+
+        await increment_stat(
+            "already"
+        )
+
+        await save_processed(
+            user,
+            "ALREADY",
+        )
+
+        await add_log(
+            f"↪️ {mode} — "
+            f"Già presente: "
+            f"{display}"
+        )
+
+        return (
+            "already",
+            display,
+        )
+
+    except UserPrivacyRestrictedError as e:
+
+        await increment_stat("privacy")
+        await save_processed(user, "PRIVACY")
+        await remember_privacy_rejection(user.id, type(e).__name__)
+
+        await add_log(
+            f"🔒 {mode} — {display} — PRIVACY UTENTE — "
+            "le impostazioni privacy non consentono l'aggiunta — "
+            f"{type(e).__name__}: {str(e)[:220]}",
+            "WARNING",
+        )
+
+        return ("privacy", display)
+
+    except UserNotMutualContactError as e:
+
+        await increment_stat("privacy")
+        await save_processed(user, "PRIVACY")
+        await remember_privacy_rejection(user.id, type(e).__name__)
+
+        await add_log(
+            f"🔒 {mode} — {display} — PRIVACY/CONTATTO — "
+            "Telegram richiede che l'utente sia un contatto reciproco — "
+            f"{type(e).__name__}: {str(e)[:220]}",
+            "WARNING",
+        )
+
+        return ("privacy", display)
+
+    except FloodWaitError as e:
+
+        state["running"] = False
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+        await record_auto_deadline(e.seconds)
+
+        await add_log(
+            f"⏳ {mode} — {display} — PAUSA RICHIESTA DA TELEGRAM — "
+            f"attesa richiesta: {e.seconds}s. Ciclo fermato; "
+            "nessun blocco locale PeerFlood impostato — "
+            f"{type(e).__name__}: {str(e)[:220]}",
+            "WARNING",
+        )
+
+        return ("flood_wait", display)
+
+    except PeerFloodError as e:
+
+        state["running"] = False
+        state["telegram_locked"] = True
+        state["telegram_restriction_detected"] = True
+        state["auto_enabled"] = False
+
+        await set_setting("telegram_locked", "1")
+        await set_setting("telegram_restriction_detected", "1")
+        await set_setting("auto_enabled", "0")
+
+        await add_log(
+            f"🛑 {mode} — {display} (ID {user.id}) — LIMITAZIONE INVITI TELEGRAM — "
+            f"{type(e).__name__}: {str(e)[:220]} — "
+            "automatico fermato e blocco locale di sicurezza attivato. "
+            "Questo errore non dimostra un problema del solo destinatario; "
+            "può riguardare gli inviti anche se @SpamBot non segnala limitazioni.",
+            "WARNING",
+        )
+
+        return ("peer_flood", display)
+
+    except Exception as e:
+
+        error_name = type(e).__name__
+
+        if isinstance(e, (TimeoutError, ConnectionError, OSError)):
+            # La richiesta potrebbe essere arrivata a Telegram prima della caduta
+            # di connessione: il tentativo seguente dovrà soltanto verificarla.
+            await save_processed(user, "VERIFY_PENDING")
+            return await report_verification_problem(display, mode, error_name, str(e))
+
+        if error_name in DESTINATION_ERRORS:
+            return await stop_invites_for_destination(display, mode, error_name, str(e))
+
+        # Solo errori riferiti esplicitamente al destinatario vengono salvati
+        # come processati. Errori generici o del gruppo restano riprovabili.
+        recipient_errors = {
+            "UserIdInvalidError": "ID utente non valido",
+            "InputUserDeactivatedError": "account eliminato",
+            "UserDeactivatedError": "account disattivato",
+            "UserDeactivatedBanError": "account disattivato da Telegram",
+            "UserBlockedError": "utente bloccato",
+            "UserKickedError": "utente espulso dal gruppo",
+            "UserChannelsTooMuchError": "utente già in troppi gruppi/canali",
+        }
+
+        if error_name in recipient_errors:
+            await increment_stat("errors")
+            await save_processed(
+                user,
+                "CHANNEL_LIMIT" if error_name == "UserChannelsTooMuchError"
+                else "RECIPIENT_ERROR",
+            )
+            await add_log(
+                f"↪️ {mode} — {display} (ID {user.id}) — DESTINATARIO SALTATO — "
+                f"{recipient_errors[error_name]} — "
+                f"{error_name}: {str(e)[:220]}",
+                "WARNING",
+            )
+            return ("error", display)
+
+        await increment_stat("errors")
+
+        await add_log(
+            f"❌ {mode} — {display} — ERRORE TELEGRAM — "
+            f"{error_name}: {str(e)[:160]}",
+            "ERROR",
+        )
+
+        return (
+            "error",
+            display,
+        )
+
+
+# =========================================================
+# SCHEDULER GIORNALIERO
+# =========================================================
+
+async def daily_scheduler(application):
+    global worker_task
+    while True:
+        try:
+            if not control_lock.locked():
+                async with control_lock:
+                    if (state["auto_enabled"] and not operation_busy()
+                            and not state["telegram_locked"]
+                            and not await invitation_gate(state["active_session"])
+                            and session_info[state["active_session"]]["ready"]
+                            and state["group_a"] and state["group_b"]):
+                        now = now_it()
+                        today = now.date().isoformat()
+                        stats = await get_today_stats()
+                        if (now.strftime("%H:%M") >= state["start_time"]
+                                and state["last_autostart_day"] != today
+                                and stats["migrated"] < state["daily_target"]):
+                            state["last_autostart_day"] = today
+                            await set_setting("last_autostart_day", today)
+                            state["running"] = True
+                            state["stop_requested"] = False
+                            await add_log(f"⏰ Partenza automatica programmata delle {state['start_time']}")
+                            worker_task = asyncio.create_task(migration_worker(application))
+            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.exception("Errore daily_scheduler")
+            await add_log(f"❌ Scheduler — {type(exc).__name__}: {str(exc)[:180]}", "ERROR")
+            await asyncio.sleep(30)
+
+
+# =========================================================
+# WORKER AUTOMATICO
+# =========================================================
+
+@pinned_session
+async def migration_worker(
+    application,
+):
+
+    global worker_task
+    gate = await invitation_gate(current_session_id())
+    if gate:
+        state["running"] = False
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+        await add_log("🛑 AUTO non avviato — " + gate, "WARNING")
+        return
+
+    async with worker_lock:
+
+        if (
+            not state["running"]
+            or state["telegram_locked"]
+        ):
+            return
+
+        state["stop_requested"] = False
+
+        attempts_cycle = 0
+
+        await add_log(
+            "▶️ Ciclo AUTO avviato"
+        )
+
+        try:
+
+            source = (
+                await user_client.get_entity(
+                    state["group_a"]["input"]
+                )
+            )
+
+            destination = (
+                await user_client.get_entity(
+                    state["group_b"]["input"]
+                )
+            )
+
+            me = await user_client.get_me()
+
+            async for user in (
+                user_client.iter_participants(
+                    source
+                )
+            ):
+
+                if (
+                    not state["running"]
+                    or state["stop_requested"]
+                    or state["telegram_locked"]
+                ):
+                    break
+
+                stats = (
+                    await get_today_stats()
+                )
+
+                if (
+                    stats["migrated"]
+                    >= state["daily_target"]
+                ):
+
+                    await add_log(
+                        "🎯 Obiettivo "
+                        "giornaliero raggiunto"
+                    )
+
+                    break
+
+                if (
+                    attempts_cycle
+                    >= state["max_attempts"]
+                ):
+
+                    await add_log(
+                        "🛑 MAX tentativi "
+                        "raggiunto"
+                    )
+
+                    break
+
+                if user.id == me.id:
+                    continue
+
+                if getattr(
+                    user,
+                    "bot",
+                    False,
+                ):
+                    continue
+
+                if getattr(
+                    user,
+                    "deleted",
+                    False,
+                ):
+                    continue
+
+                if await was_processed(
+                    user.id
+                ):
+                    continue
+
+                attempts_before = stats["attempts"]
+
+                result, display = (
+                    await invite_one(
+                        destination,
+                        user,
+                        "🤖 AUTO",
+                    )
+                )
+
+                if result in STOP_INVITE_RESULTS:
+                    break
+
+                stats = await get_today_stats()
+                sent_attempt = stats["attempts"] > attempts_before
+                status = await processed_status(user.id)
+                definite_skip = result in {"privacy", "already"} or status in {
+                    "PRIVACY", "INVITE_REJECTED", "ALREADY", "RECIPIENT_ERROR", "CHANNEL_LIMIT"
+                }
+                if sent_attempt and not definite_skip:
+                    attempts_cycle += 1
+
+                if (
+                    stats["migrated"]
+                    >= state["daily_target"]
+                ):
+
+                    await add_log(
+                        "🎯 Obiettivo "
+                        "giornaliero raggiunto"
+                    )
+
+                    break
+
+                if attempts_cycle >= state["max_attempts"]:
+                    await add_log("🛑 MAX tentativi raggiunto")
+                    break
+                if not sent_attempt:
+                    await add_log(
+                        f"↪️ 🤖 AUTO — {display} — solo controllo, nessun invito inviato; passo al prossimo utente"
+                    )
+                    continue
+
+                if state["running"]:
+
+                    await add_log(
+                        "⏱ Richiesta d'invito effettuata: prossimo tentativo "
+                        f"tra "
+                        f"{state['interval_minutes']} "
+                        "minuti"
+                    )
+
+                    completed = (
+                        await interruptible_wait(
+                            state[
+                                "interval_minutes"
+                            ]
+                        )
+                    )
+
+                    if not completed:
+                        break
+
+        except Exception as e:
+
+            await add_log(
+                f"❌ Errore AUTO: "
+                f"{type(e).__name__}",
+                "ERROR",
+            )
+
+            logger.exception(
+                "Errore migration_worker"
+            )
+
+        finally:
+
+            # Solo il task proprietario può liberare lo stato globale.
+            # Evita che un vecchio task azzeri il riferimento di un ciclo più recente.
+            current_task = asyncio.current_task()
+            if worker_task is current_task:
+                state["running"] = False
+                worker_task = None
+
+            await add_log(
+                "🏁 Ciclo AUTO terminato"
+            )
+
+
+# =========================================================
+# INVITI MANUALI
+# =========================================================
+
+async def resolve_manual_user(user_id=None, username=None):
+    """Risolvi un utente usando prima username/DB, poi il Gruppo A."""
+
+    candidates = []
+
+    if username:
+        clean_username = username.strip().lstrip("@")
+        if clean_username:
+            candidates.append("@" + clean_username)
+
+    # Se abbiamo un ID, recupera l'eventuale username già estratto.
+    if user_id is not None and state["group_a"]:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """
+                SELECT username
+                FROM extracted_members
+                WHERE source_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (state["group_a"]["id"], int(user_id)),
+            )
+            row = await cursor.fetchone()
+
+        if row and row[0]:
+            candidate = "@" + row[0].lstrip("@")
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    # Username è il metodo più affidabile quando disponibile.
+    for candidate in candidates:
+        try:
+            return await user_client.get_entity(candidate)
+        except Exception:
+            pass
+
+    # Prova l'ID dalla cache/sessione Telethon.
+    if user_id is not None:
+        try:
+            return await user_client.get_entity(int(user_id))
+        except Exception:
+            pass
+
+    # Se l'ID arriva dalla rubrica estratta, recupera l'eventuale username
+    # salvato. Questo rende affidabile l'incolla delle pagine RUBRICA anche
+    # dopo un riavvio del bot, senza dipendere solo dalla cache Telethon.
+    if user_id is not None:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT username FROM session_contacts WHERE session_id = ? AND user_id = ? LIMIT 1",
+                    (current_session_id(), int(user_id)),
+                )
+                row = await cursor.fetchone()
+            if row and row[0]:
+                try:
+                    return await user_client.get_entity("@" + row[0].lstrip("@"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Ultimo fallback: cerca l'ID nella lista del Gruppo A accessibile
+    # alla sessione. Questo evita di dipendere dalla cache dopo un restart.
+    if user_id is not None and state["group_a"]:
+        try:
+            source = await user_client.get_entity(state["group_a"]["input"])
+            async for participant in user_client.iter_participants(source):
+                if participant.id == int(user_id):
+                    return participant
+        except Exception:
+            pass
+
+    return None
+
+
+async def run_manual_invites():
+
+    refs = list(state.get("manual_refs") or [])
+
+    # Compatibilità con eventuali liste preparate dalla versione precedente.
+    if not refs:
+        refs = [
+            {"id": user_id, "username": None, "label": None}
+            for user_id in state["manual_ids"]
+        ]
+
+    if not refs:
+        return []
+
+    destination = await user_client.get_entity(
+        state["group_b"]["input"]
+    )
+
+    results = []
+
+    for ref in refs:
+
+        if state["telegram_locked"]:
+            break
+
+        user_id = ref.get("id")
+        username = ref.get("username")
+        shown = (
+            "@" + username.lstrip("@")
+            if username
+            else (f"ID {user_id}" if user_id is not None else "utente")
+        )
+
+        user = await resolve_manual_user(
+            user_id=user_id,
+            username=username,
+        )
+
+        if user is None:
+            await add_log(
+                f"❌ 👤 MANUALE — {shown} non risolvibile",
+                "ERROR",
+            )
+            results.append(f"❌ {shown} — non trovato")
+            continue
+
+        result, display = await invite_one(
+            destination,
+            user,
+            "👤 MANUALE",
+        )
+
+        labels = {
+            "confirmed": "✅",
+            "already": "↪️",
+            "privacy": "🛡",
+            "unconfirmed": "⚠️",
+            "peer_flood": "🔒",
+            "flood_wait": "⏳",
+            "error": "❌",
+            "destination_error": "🛑",
+            "verification_error": "⚠️",
+        }
+
+        results.append(
+            f"{labels.get(result, '❓')} {display}"
+        )
+
+        if result in STOP_INVITE_RESULTS:
+            break
+
+    state["manual_ids"] = []
+    state["manual_refs"] = []
+
+    return results
+
+
+@pinned_session
+async def run_contact_queue(bot, chat_id, refs):
+    """Aggiunge il blocco Rubrica in background rispettando il timing dedicato."""
+    try:
+        destination = await user_client.get_entity(state["group_b"]["input"])
+        total = len(refs)
+        interrupted = False
+        for index, ref in enumerate(refs, start=1):
+            if state["telegram_locked"]:
+                await add_log("🛑 📒 RUBRICA — coda fermata: inviti sospesi")
+                break
+            user = await resolve_manual_user(user_id=ref.get("id"), username=ref.get("username"))
+            shown = ("@" + ref["username"].lstrip("@")) if ref.get("username") else f"ID {ref.get('id')}"
+            if user is None:
+                await add_log(f"❌ 📒 RUBRICA — {shown} non risolvibile", "ERROR")
+            else:
+                result, display = await invite_one(destination, user, "📒 RUBRICA")
+                if result in STOP_INVITE_RESULTS:
+                    interrupted = True
+                    break
+            if index < total and not state["telegram_locked"]:
+                minutes = state["contact_interval_minutes"]
+                await add_log(f"⏱ 📒 RUBRICA — prossimo contatto tra {minutes} minuti")
+                await asyncio.sleep(minutes * 60)
+        if state["telegram_locked"]:
+            await bot.send_message(chat_id, "🔒 Coda Rubrica interrotta per una limitazione Telegram. Controlla il LOG.")
+        elif interrupted:
+            await bot.send_message(chat_id, "🛑 Coda Rubrica interrotta. Controlla il LOG per il motivo; i contatti successivi non sono stati tentati.")
+        else:
+            await bot.send_message(chat_id, "✅ Coda Rubrica completata. Controlla il LOG per il dettaglio.")
+    except Exception as e:
+        await add_log(f"❌ 📒 RUBRICA — errore coda: {type(e).__name__}: {e}", "ERROR")
+        try:
+            await bot.send_message(chat_id, f"❌ Errore nella coda Rubrica: {type(e).__name__}")
+        except Exception:
+            pass
+    finally:
+        state["contact_queue_running"] = False
+        state["manual_ids"] = []
+        state["manual_refs"] = []
+
+
+# =========================================================
+# /START
+# =========================================================
+
+@serialized_control
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(update):
+        await public_invite_start(update, context)
+        return
+
+    sent = await update.message.reply_text(
+        await home_text(),
+        reply_markup=main_keyboard(),
+    )
+    for chat_id, message_id in context.user_data.get("admin_panel_messages", []):
+        if chat_id == sent.chat.id:
+            await delete_admin_panel_message(context.bot, chat_id, message_id)
+    context.user_data["admin_panel_messages"] = [(sent.chat.id, sent.message_id)]
+
+
+# =========================================================
+# CALLBACK BUTTONS
+# =========================================================
+
+async def callback_notice(query, text, show_alert=False):
+    """L'ack iniziale chiude lo spinner; gli avvisi successivi restano in chat."""
+    rows = []
+    if state["running"] or (worker_task is not None and not worker_task.done()):
+        rows.append([InlineKeyboardButton("🛑 FERMA AUTO", callback_data="stop")])
+    rows.append([InlineKeyboardButton("⬅️ Menu principale", callback_data="home")])
+    await query.message.reply_text(text, reply_markup=panel_markup(rows))
+    await add_log(f"ℹ️ Pannello — {text}", "WARNING")
+
+
+@serialized_control
+async def buttons(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    global worker_task, contact_task
+
+    if not is_admin(update):
+
+        await deny_access(update)
+        return
+
+    query = update.callback_query
+
+    await query.answer()
+
+    data = query.data
+    if await scheduled_message_action(update, context, data):
+        return
+    if data in {"home", "sessions"} or data.startswith("prep:"):
+        context.user_data.pop("scheduled_input", None)
+    if await prepare_action(update, context, data):
+        return
+    if data.startswith("logs_export:"):
+        if update.effective_chat.type != "private":
+            await callback_notice(query, "Esporta dalla chat privata con il bot.")
+            return
+        selected = data.split(":", 1)[1]
+        if selected not in {"all", *(str(i) for i in ACCOUNT_IDS)}:
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            if selected == "all":
+                cur = await db.execute("SELECT created_at,level,message FROM logs ORDER BY id")
+            else:
+                cur = await db.execute("SELECT created_at,level,message FROM logs WHERE session_id=? ORDER BY id", (int(selected),))
+            records = await cur.fetchall()
+        content = "\n".join(f"{stamp} | {level} | {message}" for stamp, level, message in records)
+        document = io.BytesIO((content or "Nessun evento.").encode("utf-8"))
+        document.name = f"log_completo_{selected}_{now_it().strftime('%Y%m%d_%H%M%S')}.txt"
+        await query.message.reply_document(document=document, caption="Log completo: testi originali e dettagli tecnici.")
+        return
+    if data == "refresh_sessions":
+        if operation_busy():
+            await callback_notice(query, "Ferma le operazioni in corso prima di aggiornare le sessioni.")
+            return
+        await query.edit_message_text("🔄 Verifica delle sessioni in corso… AUTO verrà disattivato.")
+        report = await refresh_sessions()
+        await reply_long(query.message, report, await session_list_keyboard(), edit=True)
+        return
+    if data in {"home", "sessions", "menu_invites", "menu_groups", "menu_diagnostics", "auto_menu"}:
+        for key in ("feature_input", "message_draft", "join_b_draft", "enable_session_pending", "link_consent_pending"):
+            context.user_data.pop(key, None)
+        state["waiting_for"] = None
+    if data.startswith(("sf:", "jb:", "msg:", "link:", "inbox:")):
+        state["waiting_for"] = None
+    if await inbox_action(update, context, data):
+        return
+    if await session_features_action(update, context, data):
+        return
+    if await join_b_action(update, context, data):
+        return
+    if await message_feature_action(update, context, data):
+        return
+    if await link_invite_action(update, context, data):
+        return
+    if data in {"confirm_run", "start_now", "manual_confirm", "contacts_confirm", "start_run"}:
+        gate = await invitation_gate(current_session_id())
+        if gate:
+            await callback_notice(query, "🛑 " + gate)
+            return
+    if data in {"auto_menu", "invite_settings", "auto_status_menu"}:
+        state["waiting_for"] = None
+        await query.edit_message_text(await automatic_text(), reply_markup=automatic_keyboard())
+        return
+    stopped_from_automatic = data == "auto_stop"
+    if stopped_from_automatic:
+        data = "stop"
+    if data.startswith("set_invite_value:"):
+        key = data.split(":", 1)[1]
+        if key not in INVITE_VALUE_RULES:
+            return
+        if operation_busy():
+            await callback_notice(query, "Attendi la fine delle operazioni o premi Ferma inviti prima di cambiare le impostazioni.")
+            return
+        minimum, maximum, title, unit = INVITE_VALUE_RULES[key]
+        state["waiting_for"] = "invite_value:" + key
+        await query.edit_message_text(
+            f"⚙️ {title}\n\nValore attuale: {state[key]} {unit}.\n"
+            f"Scrivi un numero intero da {minimum} a {maximum}.",
+            reply_markup=panel_markup([[InlineKeyboardButton("❌ Annulla", callback_data="contacts" if key == "contact_interval_minutes" else "auto_menu")]]),
+        )
+        return
+    if data.startswith("delete_session:"):
+        if update.effective_chat.type != "private":
+            await callback_notice(query, "Usa la chat privata con il bot.")
+            return
+        if operation_busy() or state["auto_enabled"]:
+            await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni prima di eliminare una sessione.")
+            return
+        try:
+            account_id = int(data.split(":", 1)[1])
+            if account_id not in ACCOUNT_IDS:
+                raise ValueError("Sessione non disponibile.")
+            if len(ACCOUNT_IDS) <= 1:
+                raise ValueError("Mantieni almeno una sessione: aggiungine un'altra prima di eliminare questa.")
+        except ValueError as exc:
+            await callback_notice(query, str(exc))
+            return
+        nonce = secrets.token_hex(8)
+        context.user_data["delete_session_pending"] = {
+            "account_id": account_id, "user_id": session_info[account_id]["user_id"],
+            "nonce": nonce, "created_at": time.monotonic(),
+        }
+        await query.edit_message_text(
+            f"🗑 ELIMINA SESSIONE\n\n{session_label(account_id)}\n\n"
+            "La sessione verrà rimossa dal bot e non ricomparirà ai riavvii. "
+            "L'account Telegram non verrà eliminato. "
+            "Se è la sessione attiva, verrà selezionato un altro account.\n\nConfermi?",
+            reply_markup=panel_markup([
+                [InlineKeyboardButton("🗑 Conferma", callback_data=f"delete_session_confirm:{nonce}"),
+                 InlineKeyboardButton("❌ Annulla", callback_data="delete_session_cancel")],
+            ]),
+        )
+        return
+    if data == "delete_session_cancel":
+        context.user_data.pop("delete_session_pending", None)
+        await reply_long(query.message, await sessions_text(), sessions_keyboard(), edit=True)
+        return
+    if data.startswith("delete_session_confirm:"):
+        pending = context.user_data.pop("delete_session_pending", None)
+        if (not pending or data.split(":", 1)[1] != pending["nonce"]
+                or time.monotonic() - pending["created_at"] > 300
+                or pending["account_id"] not in session_info
+                or session_info[pending["account_id"]]["user_id"] != pending["user_id"]):
+            await callback_notice(query, "Conferma scaduta: riapri Account e profili.")
+            return
+        try:
+            await remove_session_from_bot(pending["account_id"])
+        except Exception as exc:
+            await callback_notice(query, str(exc) if isinstance(exc, ValueError) else "Rimozione non completata. Controlla le sessioni e riprova.")
+            return
+        context.user_data.pop("profile_pending", None)
+        await reply_long(query.message, await sessions_text(), sessions_keyboard(), edit=True)
+        return
+    if data in {"home", "sessions"}:
+        context.user_data.pop("delete_session_pending", None)
+    if data in {"menu_groups", "menu_invites", "menu_diagnostics"}:
+        state["waiting_for"] = None
+        context.user_data["menu_section"] = data
+        keyboard = {"menu_groups": groups_keyboard, "menu_invites": invites_keyboard,
+                    "menu_diagnostics": diagnostics_menu_keyboard}[data]
+        await query.edit_message_text(await section_text(data), reply_markup=keyboard())
+        return
+    if data in {"home", "sessions", "contacts", "members"}:
+        context.user_data["menu_section"] = data
+    if data == "add_session":
+        if update.effective_chat.type != "private":
+            await callback_notice(query, "Apri il pannello nella chat privata con il bot.")
+            return
+        if operation_busy() or state["auto_enabled"]:
+            await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni.")
+            return
+        if login_server is None:
+            await callback_notice(query, "Per aggiungere sessioni attiva un dominio pubblico HTTPS nelle impostazioni Networking di Railway e riavvia il servizio.")
+            return
+        if len(ACCOUNT_IDS) >= MAX_ACCOUNTS:
+            await callback_notice(query, "Sono già configurate 12 sessioni.")
+            return
+        state["waiting_for"] = "add_session_phone"
+        context.user_data["adding_session_phone"] = True
+        await query.edit_message_text(
+            "➕ AGGIUNGI SESSIONE\n\nInserisci il numero del tuo account con prefisso internazionale, ad esempio +393331234567.\n\n"
+            "Per codice e password aprirai una pagina riservata: non inviarli in chat. "
+            "La sessione autorizza l'accesso all'account e viene salvata sul volume del tuo servizio.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ANNULLA", callback_data="cancel_add_session")]]),
+        )
+        return
+    if data in ("cancel_add_session", "home"):
+        context.user_data.pop("adding_session_phone", None)
+        for token, item in list(pending_session_logins.items()):
+            if item["admin_id"] == query.from_user.id:
+                await discard_pending_login(token)
+        if data == "cancel_add_session":
+            state["waiting_for"] = None
+            await query.edit_message_text(await home_text(), reply_markup=main_keyboard())
+            return
+    if data == "contact_filters" or data.startswith("contact_filter:"):
+        if data.startswith("contact_filter:"):
+            key = data.split(":", 1)[1]
+            config = await get_contact_filters()
+            if key in ("username", "complete_name", "photo"):
+                config[key] = not config[key]
+            elif key == "seen_days":
+                options = (0, 1, 7, 30)
+                config[key] = options[(options.index(config[key]) + 1) % len(options)]
+            else:
+                return
+            await set_setting(f"contact_filters_{current_session_id()}", json.dumps(config))
+        text, markup = await contact_filters_screen()
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+    if data == "members_export":
+        if update.effective_chat.type != "private":
+            await callback_notice(query, "Esporta dalla chat privata con il bot.")
+            return
+        await export_members(query.message)
+        return
+    if data == "contacts_export":
+        if update.effective_chat.type != "private":
+            await callback_notice(query, "Esporta dalla chat privata con il bot.")
+            return
+        await export_contacts(query.message)
+        return
+    if data.startswith(("profile_new:", "profile_regen:", "profile_apply:")) or data == "profile_cancel":
+        await profile_action(update, context)
+        return
+    if data == "home":
+        context.user_data.pop("profile_pending", None)
+
+    if data == "clean_members":
+        if operation_busy() or state["auto_enabled"]:
+            await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni.", show_alert=True)
+            return
+        if not state["group_a"] or not state["group_b"]:
+            await callback_notice(query, "Configura prima i gruppi A e B.", show_alert=True)
+            return
+        await query.edit_message_text("🧹 Controllo presenze nel gruppo B e rifiuti privacy già registrati… Nessun invito verrà inviato.")
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute("SELECT source_id, user_id, username, display_name, extracted_at FROM extracted_members WHERE source_id = ?", (state["group_a"]["id"],))
+                rows = await cursor.fetchall()
+            kept, diag = await clean_member_rows(rows)
+            kept_ids = {row[1] for row in kept}
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.executemany("DELETE FROM extracted_members WHERE source_id = ? AND user_id = ?",
+                                     [(row[0], row[1]) for row in rows if row[1] not in kept_ids])
+                await db.commit()
+            state["member_page"] = 0
+            await query.edit_message_text("🧹 PULIZIA COMPLETATA\n\n" + cleanup_report(diag) + f"\nRimasti nella lista: {len(kept)}", reply_markup=await members_keyboard())
+        except Exception as exc:
+            await query.edit_message_text("❌ Pulizia non completata — " + safe_connection_error(exc), reply_markup=await members_keyboard())
+        return
+    if data == "member_filters" or data.startswith("member_filter:"):
+        if operation_busy() or state["auto_enabled"]:
+            await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni.", show_alert=True)
+            return
+        if data.startswith("member_filter:"):
+            key = data.split(":", 1)[1]
+            config = await get_member_filters()
+            if key in ("username", "complete_name", "photo", "no_admin"):
+                config[key] = not config[key]
+            elif key in ("seen_days", "message_days", "message_limit", "mode"):
+                options = {"seen_days": (0, 1, 7, 30), "message_days": (1, 7, 30), "message_limit": (500, 1000, 5000), "mode": ("members", "authors")}[key]
+                config[key] = options[(options.index(config[key]) + 1) % len(options)]
+            else:
+                await callback_notice(query, "Filtro non valido.")
+                return
+            await set_setting("member_filters", json.dumps(config))
+        await query.edit_message_text(await member_filters_text(), reply_markup=await member_filters_keyboard())
+        return
+    if data == "proxy_status":
+        await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
+        return
+    if data.startswith("proxy_test:") or data == "proxy_ip":
+        if operation_busy():
+            await callback_notice(query, "Ferma le operazioni prima di eseguire la diagnostica proxy.")
+            return
+        await query.edit_message_text("🌐 Verifica proxy in corso… Nessun invito verrà inviato.")
+        if data == "proxy_ip":
+            await check_telegram_ip(current_session_id())
+        else:
+            value = data.split(":", 1)[1]
+            if value not in {"1", "2"}:
+                await callback_notice(query, "Proxy non valido.")
+                return
+            await test_proxy_connection(int(value))
+        await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
+        return
+    if data == "sessions":
+        await reply_long(query.message, await sessions_text(), sessions_keyboard(), edit=True)
+        return
+    if data.startswith("select_session:"):
+        account_id = int(data.split(":", 1)[1])
+        try:
+            await select_session(account_id)
+        except ValueError as exc:
+            await callback_notice(query, str(exc), show_alert=True)
+            return
+        await reply_long(query.message, await session_card_text(account_id), await session_card_keyboard(account_id), edit=True)
+        return
+    if data.startswith("check_session:"):
+        account_id = int(data.split(":", 1)[1])
+        if operation_busy():
+            await callback_notice(query, "Ferma le operazioni prima di verificare la connessione.", show_alert=True)
+            return
+        if account_id not in ACCOUNT_IDS:
+            await callback_notice(query, "Sessione non valida.")
+            return
+        await query.edit_message_text(f"🔎 Verifica dettagliata ACCOUNT {account_id} in corso… Contatto @SpamBot con /start; nessun invito verrà inviato.")
+        await connect_session(account_id)
+        await add_log("🔎 Connessione verificata: " + session_info[account_id]["error"],
+                      session_id=account_id)
+        await query_spambot(account_id)
+        report = await session_diagnostic_text(account_id)
+        await reply_long(query.message, report, diagnostic_keyboard(), edit=True)
+        return
+    if data.startswith("unlock:"):
+        if data != f"unlock:{state['active_session']}":
+            await callback_notice(query, "La sessione è cambiata: riapri lo sblocco dalla Home.", show_alert=True)
+            return
+        data = "unlock"
+    elif data == "unlock":
+        await callback_notice(query, "Riapri lo sblocco dalla Home per confermare la sessione.", show_alert=True)
+        return
+    if data == "unlock":
+        if operation_busy():
+            await callback_notice(query, "Attendi la fine delle operazioni prima dello sblocco.", show_alert=True)
+            return
+    if data in {"confirm_run", "start_now", "manual_confirm", "contacts_confirm"}:
+        if not session_info[current_session_id()]["ready"]:
+            await callback_notice(query, "Sessione non disponibile. Apri SELEZIONA SESSIONE.", show_alert=True)
+            return
+        if operation_busy():
+            await callback_notice(query, "Un'operazione è già in corso: attendi la fine o ferma il ciclo AUTO.", show_alert=True)
+            return
+        if data in {"manual_confirm", "contacts_confirm", "confirm_run"}:
+            if state.get("prepared_session") != current_session_id():
+                await callback_notice(query, "Conferma scaduta: prepara di nuovo l'operazione con la sessione attiva.", show_alert=True)
+                return
+    if data in {"set_a", "set_b"} and operation_busy():
+        await callback_notice(query, "Non puoi cambiare gruppi durante un'operazione.", show_alert=True)
+        return
+
+    # =====================================================
+    # GRUPPO A
+    # =====================================================
+
+    if data == "set_a":
+
+        state["waiting_for"] = "a"
+
+        await query.edit_message_text(
+            "📥 IMPOSTA GRUPPO A\n\n"
+            "Inserisci @username, "
+            "link t.me oppure ID.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    # =====================================================
+    # GRUPPO B
+    # =====================================================
+
+    elif data == "set_b":
+
+        state["waiting_for"] = "b"
+
+        await query.edit_message_text(
+            "📤 IMPOSTA GRUPPO B\n\n"
+            "Inserisci @username, "
+            "link t.me oppure ID.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    # =====================================================
+    # ORARIO PARTENZA
+    # =====================================================
+
+    elif data == "set_start_time":
+
+        if operation_busy():
+            await callback_notice(query, "Attendi la fine delle operazioni o premi Ferma inviti prima di cambiare l'orario.")
+            return
+        state["waiting_for"] = "start_time"
+        await query.edit_message_text(
+            "🕐 ORARIO PARTENZA\n\n"
+            "Scrivi l'orario giornaliero nel formato HH:MM.\n"
+            "Esempio: 09:00",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Annulla", callback_data="auto_menu")
+            ]]),
+        )
+
+    # =====================================================
+    # TARGET
+    # =====================================================
+
+    elif data == "target_minus":
+
+        if state["daily_target"] > 1:
+
+            state["daily_target"] -= 1
+
+            await set_setting(
+                "daily_target",
+                state["daily_target"],
+            )
+
+        await query.edit_message_text(
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
+        )
+
+    elif data == "target_plus":
+
+        if state["daily_target"] < 50:
+
+            state["daily_target"] += 1
+
+            await set_setting(
+                "daily_target",
+                state["daily_target"],
+            )
+
+        await query.edit_message_text(
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
+        )
+
+    # =====================================================
+    # INTERVALLO
+    # =====================================================
+
+    elif data == "interval_minus":
+
+        if (
+            state["interval_minutes"]
+            > 15
+        ):
+
+            state["interval_minutes"] = max(15, state["interval_minutes"] - 5)
+
+            await set_setting(
+                "interval_minutes",
+                state[
+                    "interval_minutes"
+                ],
+            )
+
+        await query.edit_message_text(
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
+        )
+
+    elif data == "interval_plus":
+
+        if (
+            state["interval_minutes"]
+            < 480
+        ):
+
+            state["interval_minutes"] = min(480, state["interval_minutes"] + 5)
+
+            await set_setting(
+                "interval_minutes",
+                state[
+                    "interval_minutes"
+                ],
+            )
+
+        await query.edit_message_text(
+            await section_text("menu_invites"),
+            reply_markup=invites_keyboard(),
+        )
+
+    # =====================================================
+    # AVVIA AUTO
+    # =====================================================
+
+    elif data == "start_run":
+        state["prepared_session"] = current_session_id()
+
+        if state["telegram_locked"]:
+
+            await callback_notice(query, 
+                "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
+
+            return
+
+        if state["running"]:
+
+            await callback_notice(query, 
+                "AUTO già attivo.",
+                show_alert=True,
+            )
+
+            return
+
+        if (
+            not state["group_a"]
+            or not state["group_b"]
+        ):
+
+            await callback_notice(query, 
+                "Imposta prima A e B.",
+                show_alert=True,
+            )
+
+            return
+
+        stats = (
+            await get_today_stats()
+        )
+
+        await query.edit_message_text(
+            "⚠️ AVVIO AUTOMATICO\n\n"
+
+            f"📥 "
+            f"{state['group_a']['name']}\n"
+
+            f"📤 "
+            f"{state['group_b']['name']}\n\n"
+
+            f"🎯 "
+            f"{state['daily_target']}"
+            f"/giorno\n"
+
+            f"✅ Oggi: "
+            f"{stats['migrated']}\n"
+
+            f"🕐 Partenza giornaliera: {state['start_time']}\n"
+            f"⏱ {state['interval_minutes']} min\n\n"
+            "L'automatico resterà programmato ogni giorno finché non premi STOP.\n\n"
+            "Confermi?",
+
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "✅ CONFERMA",
+                    callback_data="confirm_run",
+                ),
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="auto_menu",
+                ),
+            ]]),
+        )
+
+    elif data == "confirm_run":
+
+        if (
+            state["telegram_locked"]
+            or state["running"]
+            or (worker_task is not None and not worker_task.done())
+        ):
+            await callback_notice(query, 
+                "🟢 Un ciclo automatico è già in esecuzione." if not state["telegram_locked"] else "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
+            return
+
+        state["auto_enabled"] = True
+        state["stop_requested"] = False
+        await set_setting("auto_enabled", "1")
+
+        stats = await get_today_stats()
+        now = now_it()
+        today = now.date().isoformat()
+
+        if (
+            stats["migrated"] < state["daily_target"]
+            and now.strftime("%H:%M") >= state["start_time"]
+        ):
+            state["last_autostart_day"] = today
+            await set_setting("last_autostart_day", today)
+            state["running"] = True
+            worker_task = asyncio.create_task(
+                migration_worker(context.application)
+            )
+            await add_log("🤖 Automatico giornaliero attivato — avvio immediato")
+        else:
+            await add_log(
+                f"🌙 Automatico giornaliero attivato — partenza {state['start_time']}"
+            )
+
+        await query.edit_message_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+
+    # =====================================================
+    # PANNELLO STATO AUTOMATICO
+    # =====================================================
+
+    elif data == "auto_status_menu":
+
+        if state["telegram_locked"]:
+            await callback_notice(query, 
+                "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
+            return
+
+        if state["running"]:
+            stato = "🟢 AUTOMATICO ATTIVO\n\nIl ciclo è in esecuzione in questo momento."
+            keyboard = [
+                [InlineKeyboardButton("🛑 FERMA AUTOMATICO", callback_data="stop")],
+                [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
+            ]
+        else:
+            stato = (
+                f"🟡 AUTOMATICO PROGRAMMATO\n\n"
+                f"🕐 Partenza giornaliera: {state['start_time']}\n"
+                f"🎯 Target: {state['daily_target']}/giorno\n"
+                f"⏱ Intervallo: {state['interval_minutes']} min\n\n"
+                "Puoi lasciarlo programmato oppure avviarlo subito."
+            )
+            keyboard = [
+                [InlineKeyboardButton("▶️ AVVIA ORA", callback_data="start_now")],
+                [InlineKeyboardButton("🕐 CAMBIA ORARIO", callback_data="set_start_time")],
+                [InlineKeyboardButton("⛔ DISATTIVA AUTOMATICO", callback_data="stop")],
+                [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
+            ]
+
+        await query.edit_message_text(
+            stato,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    # =====================================================
+    # AVVIA SUBITO IL CICLO PROGRAMMATO
+    # =====================================================
+
+    elif data == "start_now":
+
+        if state["telegram_locked"]:
+            await callback_notice(query, "🔒 Inviti sospesi.", show_alert=True)
+            return
+
+        if state["running"] or (worker_task is not None and not worker_task.done()):
+            await callback_notice(query, 
+                "🟢 Automatico già in esecuzione. Non è stato avviato un secondo ciclo.",
+                show_alert=True,
+            )
+            return
+
+        if not state["group_a"] or not state["group_b"]:
+            await callback_notice(query, "Imposta prima A e B.", show_alert=True)
+            return
+
+        stats = await get_today_stats()
+        if stats["migrated"] >= state["daily_target"]:
+            await callback_notice(query, 
+                "🎯 Target giornaliero già raggiunto.",
+                show_alert=True,
+            )
+            return
+
+        state["auto_enabled"] = True
+        state["stop_requested"] = False
+        state["running"] = True
+        await set_setting("auto_enabled", "1")
+
+        today = now_it().date().isoformat()
+        state["last_autostart_day"] = today
+        await set_setting("last_autostart_day", today)
+
+        await add_log("▶️ Automatico avviato manualmente dal pannello PROGRAMMATO")
+        worker_task = asyncio.create_task(
+            migration_worker(context.application)
+        )
+
+        await query.edit_message_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+
+    # =====================================================
+    # STOP
+    # =====================================================
+
+    elif data == "stop":
+
+        state["running"] = False
+        state["stop_requested"] = True
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+
+        await add_log(
+            "🛑 Automatico disattivato manualmente"
+        )
+
+        await query.edit_message_text(
+            await automatic_text() if stopped_from_automatic else await home_text(),
+            reply_markup=automatic_keyboard() if stopped_from_automatic else main_keyboard(),
+        )
+
+    # =====================================================
+    # MEMBRI A
+    # =====================================================
+
+    elif data == "members":
+
+        if not state["group_a"]:
+
+            await callback_notice(query, 
+                "Imposta prima "
+                "il gruppo A.",
+                show_alert=True,
+            )
+
+            return
+
+        state["member_page"] = 0
+
+        await query.edit_message_text(
+            await members_page_text(0),
+            reply_markup=await members_keyboard(),
+        )
+
+    # =====================================================
+    # ESTRAZIONE + DIAGNOSTICA
+    # =====================================================
+
+    elif data == "extract_members":
+
+        if not state["group_a"]:
+            return
+
+        await query.edit_message_text(
+            "⏳ Estrazione membri "
+            "in corso...\n\n"
+            "Sto confrontando la lista "
+            "ricevuta con il numero "
+            "dichiarato da Telegram."
+        )
+
+        try:
+
+            diag = (
+                await asyncio.wait_for(extract_members_a(), timeout=120)
+            )
+
+            state["member_page"] = 0
+
+            total = (
+                await extracted_count()
+            )
+
+            text = (
+                "🔎 DIAGNOSTICA ESTRAZIONE\n\n"
+
+                f"👥 Telegram dichiara: "
+                f"{diag['telegram_count']}\n"
+
+                f"📥 Ricevuti dalla sessione: "
+                f"{diag['received']}\n"
+
+                f"🤖 Bot esclusi: "
+                f"{diag['bots']}\n"
+
+                f"🗑 Account eliminati: "
+                f"{diag['deleted']}\n"
+
+                f"♻️ Duplicati: "
+                f"{diag['duplicates']}\n"
+
+                f"⚙️ Esclusi dai filtri: {diag['filtered']}\n"
+                f"❓ Accesso non verificabile escluso: {diag['status_unknown']}\n"
+                f"📝 Messaggi esaminati: {diag['messages']}\n"
+                f"🚪 Autori non più membri: {diag['not_member']}\n"
+                f"📂 Fonte: {diag['mode']}\n"
+                f"💾 Salvati: "
+                f"{diag['saved']}\n\n"
+
+                + cleanup_report(diag["cleanup"]) + "\n"
+                + f"📋 Disponibili nella lista: "
+                f"{total}"
+            )
+
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "👥 MOSTRA MEMBRI",
+                            callback_data="members_show",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🔄 RIPETI ESTRAZIONE",
+                            callback_data="extract_members",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ HOME",
+                            callback_data="home",
+                        )
+                    ],
+                ]),
+            )
+
+        except Exception as e:
+
+            await add_log(
+                f"❌ Estrazione: "
+                f"{type(e).__name__}",
+                "ERROR",
+            )
+
+            logger.exception(
+                "Errore estrazione membri"
+            )
+
+            await query.edit_message_text(
+                "❌ ERRORE ESTRAZIONE\n\n"
+                f"{safe_connection_error(e)}\n\n"
+                "La lettura non completata non sostituisce la lista precedente. Controlla il LOG.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "⬅️ HOME",
+                        callback_data="home",
+                    )
+                ]]),
+            )
+
+    # =====================================================
+    # MOSTRA MEMBRI
+    # =====================================================
+
+    elif data == "members_show":
+
+        state["member_page"] = 0
+
+        await query.edit_message_text(
+            await members_page_text(0),
+            reply_markup=await members_keyboard(),
+        )
+
+    elif data == "members_prev":
+
+        page = max(
+            0,
+            state["member_page"] - 1,
+        )
+
+        await query.edit_message_text(
+            await members_page_text(page),
+            reply_markup=await members_keyboard(),
+        )
+
+    elif data == "members_next":
+
+        total = (
+            await extracted_count()
+        )
+
+        pages = max(
+            1,
+            math.ceil(
+                total / PAGE_SIZE
+            ),
+        )
+
+        page = min(
+            pages - 1,
+            state["member_page"] + 1,
+        )
+
+        await query.edit_message_text(
+            await members_page_text(page),
+            reply_markup=await members_keyboard(),
+        )
+
+    # =====================================================
+    # RUBRICA TELEGRAM
+    # =====================================================
+
+    elif data == "contacts":
+        state["contact_page"] = 0
+        await query.edit_message_text(
+            await contacts_page_text(0),
+            reply_markup=contacts_keyboard(),
+        )
+
+    elif data == "extract_contacts":
+        if operation_busy() or state["auto_enabled"]:
+            await callback_notice(
+                query, "Disattiva AUTO e attendi la fine delle operazioni prima di leggere la rubrica.",
+                show_alert=True,
+            )
+            return
+        account_id = current_session_id()
+        await query.edit_message_text(
+            "⏳ LETTURA RUBRICA TELEGRAM\n\n"
+            f"👤 {session_label(account_id)}\n\nSto leggendo i contatti della sessione..."
+        )
+        try:
+            diag = await asyncio.wait_for(extract_contacts(), timeout=60)
+            state["contact_page"] = 0
+            if diag["saved"] == 0:
+                text = (
+                    "📒 RUBRICA TELEGRAM\n\n"
+                    f"👤 {session_label(account_id)}\n\n"
+                    "⚠️ Nessun contatto disponibile.\n\n"
+                    f"📥 Ricevuti da Telegram: {diag['telegram_received']}\n"
+                    f"💾 Salvati: {diag['saved']}\n"
+                    f"👤 Account stesso escluso: {diag['self']}\n"
+                    f"🤖 Bot esclusi: {diag['bots']}\n"
+                    f"🗑 Account eliminati: {diag['deleted']}\n"
+                    f"♻️ Duplicati: {diag['duplicates']}\n"
+                    f"⚠️ Non validi: {diag['invalid']}\n"
+                    f"⚙️ Esclusi dai filtri: {diag['filtered']}\n"
+                    f"⚙️ Metodo: {diag['method']}\n\n"
+                    "Se nell'app Telegram di questo account sono presenti contatti, controlla il LOG."
+                )
+            else:
+                text = await contacts_page_text(0)
+                text += (
+                    "\n\n──────────────\n"
+                    f"📥 Ricevuti da Telegram: {diag['telegram_received']}\n"
+                    f"💾 Salvati: {diag['saved']}\n"
+                    f"⚙️ Esclusi dai filtri: {diag['filtered']}"
+                )
+            await query.edit_message_text(text, reply_markup=contacts_keyboard())
+        except asyncio.TimeoutError:
+            await add_log("❌ 📒 RUBRICA — timeout durante la lettura", "ERROR", session_id=account_id)
+            await query.edit_message_text(
+                "❌ RUBRICA TELEGRAM\n\n"
+                f"👤 {session_label(account_id)}\n\n"
+                "Telegram non ha completato la lettura entro i tempi previsti.",
+                reply_markup=contacts_keyboard(),
+            )
+        except Exception as exc:
+            await add_log(
+                f"❌ 📒 RUBRICA — {safe_connection_error(exc)}", "ERROR", session_id=account_id,
+            )
+            await query.edit_message_text(
+                "❌ IMPOSSIBILE LEGGERE LA RUBRICA\n\n"
+                f"👤 {session_label(account_id)}\n\n{safe_connection_error(exc)}",
+                reply_markup=contacts_keyboard(),
+            )
+
+    elif data == "contacts_prev":
+        page = max(0, state["contact_page"] - 1)
+        await query.edit_message_text(await contacts_page_text(page), reply_markup=contacts_keyboard())
+
+    elif data == "contacts_next":
+        total = await contacts_count()
+        pages = max(1, math.ceil(total / PAGE_SIZE))
+        page = min(pages - 1, state["contact_page"] + 1)
+        await query.edit_message_text(await contacts_page_text(page), reply_markup=contacts_keyboard())
+
+    elif data == "contacts_add":
+        if not state["group_b"]:
+            await callback_notice(query, "Imposta prima il gruppo B.", show_alert=True)
+            return
+
+        # La rubrica viene usata come sorgente manuale: l'admin copia una
+        # pagina da 20 contatti e la incolla qui. Nessun contatto dell'intera
+        # rubrica viene messo automaticamente in coda.
+        state["waiting_for"] = "contact_ids"
+
+        await query.edit_message_text(
+            "➕ AGGIUNGI CONTATTI RUBRICA\n\n"
+            "Incolla qui un blocco della 📒 RUBRICA TELEGRAM.\n\n"
+            "Puoi incollare direttamente la pagina da 20 contatti, ad esempio:\n"
+            "1. Mario Rossi (@mario) — 123456789\n"
+            "2. @luca — 987654321\n\n"
+            "Il bot riconoscerà al massimo 20 contatti per volta e, dopo la tua "
+            "conferma, proverà ad aggiungerli direttamente al Gruppo B.\n\n"
+            "Usa questa funzione solo per contatti che hanno già dato il consenso.\n"
+            "Nessuna operazione partirà finché non premi CONFERMA.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ ANNULLA", callback_data="contacts")
+            ]]),
+        )
+
+    elif data == "contacts_interval_minus":
+        if state["contact_interval_minutes"] > 1:
+            state["contact_interval_minutes"] -= 1
+            await set_setting("contact_interval_minutes", state["contact_interval_minutes"])
+        await query.edit_message_text(await section_text("menu_invites"), reply_markup=invites_keyboard())
+
+    elif data == "contacts_interval_plus":
+        if state["contact_interval_minutes"] < 120:
+            state["contact_interval_minutes"] += 1
+            await set_setting("contact_interval_minutes", state["contact_interval_minutes"])
+        await query.edit_message_text(await section_text("menu_invites"), reply_markup=invites_keyboard())
+
+    elif data == "contacts_confirm":
+        if state["telegram_locked"]:
+            await callback_notice(query, "🔒 Inviti sospesi.", show_alert=True)
+            return
+        if state.get("contact_queue_running"):
+            await callback_notice(query, "📒 Una coda Rubrica è già in esecuzione.", show_alert=True)
+            return
+        refs = list(state.get("manual_refs") or [])
+        if not refs:
+            await callback_notice(query, "Nessun contatto preparato.", show_alert=True)
+            return
+        state["contact_queue_running"] = True
+        contact_task = asyncio.create_task(run_contact_queue(context.bot, query.message.chat_id, refs))
+        await query.edit_message_text(
+            f"▶️ CODA RUBRICA AVVIATA\n\nContatti: {len(refs)}\n"
+            f"⏱ Intervallo: {state['contact_interval_minutes']} minuti\n\n"
+            "Puoi continuare a usare il bot: la coda procede in background.",
+            reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Menu principale", callback_data="home")]])
+        )
+
+    # =====================================================
+    # MANUALE
+    # =====================================================
+
+    elif data == "manual_invite":
+
+        # La preparazione della lista manuale resta disponibile anche
+        # se gli inviti sono sospesi. La conferma continuerà invece
+        # a rispettare telegram_locked.
+        if not state["group_b"]:
+
+            await callback_notice(query, 
+                "Imposta prima "
+                "il gruppo B.",
+                show_alert=True,
+            )
+
+            return
+
+        state[
+            "waiting_for"
+        ] = "manual_ids"
+
+        await query.edit_message_text(
+            "➕ INVITO MANUALE\n\n"
+
+            "Incolla gli utenti da invitare.\n\n"
+            "Puoi incollare direttamente una pagina di "
+            "👥 MEMBRI GRUPPO A oppure 📒 RUBRICA TELEGRAM, ad esempio:\n"
+            "1. @utente — 123456789\n"
+            "2. @utente2 — 987654321\n\n"
+            "Oppure puoi inserire semplicemente gli ID, "
+            "uno per riga.\n\n"
+            "Nessun invito partirà finché non premi CONFERMA.",
+
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    elif data == "manual_confirm":
+
+        if state["telegram_locked"]:
+
+            await callback_notice(query, 
+                "🔒 Inviti sospesi.",
+                show_alert=True,
+            )
+
+            return
+
+        await query.edit_message_text(
+            "⏳ Elaborazione manuale..."
+        )
+
+        state["manual_running"] = True
+        try:
+            results = await run_manual_invites()
+        finally:
+            state["manual_running"] = False
+
+        text = (
+            "👤 RISULTATO MANUALE\n\n"
+            + (
+                "\n".join(results)
+                if results
+                else
+                "Nessuna operazione "
+                "eseguita."
+            )
+        )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ HOME",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    # =====================================================
+    # STATISTICHE
+    # =====================================================
+
+    elif data == "statistics":
+
+        today = (
+            await get_today_stats()
+        )
+
+        total = (
+            await get_total_stats()
+        )
+
+        text = (
+            "📊 STATISTICHE\n\n"
+
+            "📅 OGGI\n"
+
+            f"✅ Confermati: "
+            f"{today['migrated']}\n"
+
+            f"🔎 Tentativi: "
+            f"{today['attempts']}\n"
+
+            f"🛡 Privacy: "
+            f"{today['privacy']}\n"
+
+            f"↪️ Già presenti: "
+            f"{today['already']}\n"
+
+            f"⚠️ Non confermati: "
+            f"{today['unconfirmed']}\n"
+
+            f"❌ Errori: "
+            f"{today['errors']}\n\n"
+
+            "📈 TOTALI\n"
+
+            f"✅ Confermati: "
+            f"{total['migrated']}\n"
+
+            f"🔎 Tentativi: "
+            f"{total['attempts']}\n"
+
+            f"🛡 Privacy: "
+            f"{total['privacy']}\n"
+
+            f"↪️ Già presenti: "
+            f"{total['already']}\n"
+
+            f"⚠️ Non confermati: "
+            f"{total['unconfirmed']}\n"
+
+            f"❌ Errori: "
+            f"{total['errors']}"
+        )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ INDIETRO",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    # =====================================================
+    # LOG
+    # =====================================================
+
+    elif data == "logs" or data.startswith(("logs:", "logdetails:")):
+        selected_filter = data.split(":", 1)[1] if ":" in data else "all"
+        if selected_filter not in {"all", *(str(i) for i in ACCOUNT_IDS)}:
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            if selected_filter == "all":
+                cursor = await db.execute("SELECT created_at, message FROM logs ORDER BY id DESC LIMIT 300")
+            else:
+                cursor = await db.execute(
+                    "SELECT created_at, message FROM logs WHERE session_id = ? ORDER BY id DESC LIMIT 300",
+                    (int(selected_filter),),
+                )
+            rows = await cursor.fetchall()
+        lines = []
+        budget = 0
+        for created_at, message in rows:
+            try:
+                dt = datetime.fromisoformat(created_at)
+                dt = dt.replace(tzinfo=ITALY_TZ) if dt.tzinfo is None else dt.astimezone(ITALY_TZ)
+                stamp = dt.strftime("%d/%m/%Y %H:%M:%S %Z")
+            except (ValueError, TypeError):
+                stamp = "--:--:--"
+            formatted = readable_log(message)
+            if formatted is None:
+                continue
+            formatted = formatted.replace("\n          ", "\n")
+            formatted = formatted.replace(" — ", "\n").replace(" · ", "\n")
+            line = f"🕒 {stamp}\n{formatted}"
+            if budget + len(line) + 2 > 3600:
+                break
+            lines.append(line)
+            budget += len(line) + 2
+            if len(lines) >= 20:
+                break
+        title = "TUTTE LE SESSIONI" if selected_filter == "all" else f"ACCOUNT {selected_filter}"
+        await query.edit_message_text(
+            f"📋 ULTIMI EVENTI — {title}\n\n" + ("\n\n".join(reversed(lines)) or "Nessun evento."),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("TUTTE", callback_data="logs:all")],
+                *[[TelegramInlineKeyboardButton(f"{await session_status_color(i)} {session_button_name(i)}", callback_data=f"logs:{i}")
+                   for i in ACCOUNT_IDS[start:start + 3]] for start in range(0, len(ACCOUNT_IDS), 3)],
+                [InlineKeyboardButton("🔄 Aggiorna", callback_data=f"logs:{selected_filter}")],
+                [InlineKeyboardButton("📄 Esporta log completo TXT", callback_data=f"logs_export:{selected_filter}")],
+                [InlineKeyboardButton("🗑 PULISCI TUTTI I LOG", callback_data="clear_logs_confirm")],
+                [InlineKeyboardButton("⬅️ INDIETRO", callback_data="home")],
+            ]),
+        )
+
+    elif data == "clear_logs_confirm":
+
+        await query.edit_message_text(
+            "⚠️ Cancellare tutti i log, di tutte le sessioni e quelli precedenti?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🗑 SÌ",
+                    callback_data="clear_logs",
+                ),
+                InlineKeyboardButton(
+                    "❌ NO",
+                    callback_data="logs",
+                ),
+            ]]),
+        )
+
+    elif data == "clear_logs":
+
+        await clear_logs()
+
+        await query.edit_message_text(
+            "✅ Log cancellato.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ HOME",
+                    callback_data="home",
+                )
+            ]]),
+        )
+
+    # =====================================================
+    # SBLOCCO
+    # =====================================================
+
+    elif data == "unlock_confirm":
+
+        await query.edit_message_text(
+            f"⚠️ RIABILITARE GLI INVITI?\n{session_label()}\n\n"
+            "Il blocco locale è stato attivato perché Telegram ha segnalato una limitazione.\n\n"
+            "Sblocca solo dopo aver verificato (ad esempio con @SpamBot) "
+            "che l'account non sia più limitato. Lo sblocco del bot non rimuove "
+            "una limitazione applicata da Telegram.",
+
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🔓 CONFERMA",
+                    callback_data=f"unlock:{state['active_session']}",
+                ),
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="home",
+                ),
+            ]]),
+        )
+
+    elif data == "unlock":
+
+        state[
+            "telegram_locked"
+        ] = False
+        state["telegram_restriction_detected"] = False
+
+        await set_setting(
+            "telegram_locked",
+            "0",
+        )
+        await set_setting(
+            "telegram_restriction_detected",
+            "0",
+        )
+
+        await add_log(
+            "🔓 Blocco locale rimosso manualmente — "
+            "su conferma dell’amministratore; nessuna verifica automatica della limitazione Telegram"
+        )
+
+        await query.edit_message_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+
+    # =====================================================
+    # HOME
+    # =====================================================
+
+    elif data == "home":
+
+        state["waiting_for"] = None
+        state["manual_ids"] = []
+        state["manual_refs"] = []
+
+        await query.edit_message_text(
+            await home_text(),
+            reply_markup=main_keyboard(),
+        )
+
+    elif data == "noop":
+        pass
+
+
+# =========================================================
+# INPUT TESTUALE
+# =========================================================
+
+@serialized_control
+async def text_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_admin(update):
+
+        await deny_access(update)
+        return
+
+    if await scheduled_message_input(update, context):
+        return
+    if await feature_text_input(update, context):
+        return
+
+    target = state[
+        "waiting_for"
+    ]
+
+    if target and target.startswith("invite_value:"):
+        key = target.split(":", 1)[1]
+        if key not in INVITE_VALUE_RULES:
+            state["waiting_for"] = None
+            return
+        if operation_busy():
+            await update.message.reply_text("Attendi la fine delle operazioni o premi Ferma inviti prima di cambiare le impostazioni.")
+            return
+        minimum, maximum, title, unit = INVITE_VALUE_RULES[key]
+        value = update.message.text.strip()
+        if not re.fullmatch(r"[0-9]{1,3}", value) or not minimum <= int(value) <= maximum:
+            await update.message.reply_text(f"❌ Scrivi un numero intero da {minimum} a {maximum}.")
+            return
+        state[key] = int(value)
+        state["waiting_for"] = None
+        await set_setting(key, state[key])
+        await add_log(f"⚙️ {title} impostato: {state[key]} {unit}")
+        if key == "contact_interval_minutes":
+            await update.message.reply_text(f"⏱ Pausa inviti rubrica: {state[key]} minuti\n\n" + await contacts_page_text(state["contact_page"]), reply_markup=contacts_keyboard())
+        else:
+            await update.message.reply_text(await automatic_text(), reply_markup=automatic_keyboard())
+        return
+
+    if target == "add_session_phone":
+        if not context.user_data.get("adding_session_phone"):
+            await update.message.reply_text("Premi AGGIUNGI SESSIONE dal tuo pannello per iniziare.")
+            return
+        if operation_busy() or state["auto_enabled"]:
+            await update.message.reply_text("Disattiva AUTO e attendi la fine delle operazioni.")
+            return
+        phone = re.sub(r"[\s()-]", "", update.message.text.strip())
+        if not re.fullmatch(r"\+[1-9]\d{6,14}", phone):
+            await update.message.reply_text("Numero non valido: usa il prefisso internazionale, ad esempio +393331234567.")
+            return
+        try:
+            link = await begin_added_session(phone, update.effective_user.id, update.effective_chat.id)
+            state["waiting_for"] = None
+            context.user_data.pop("adding_session_phone", None)
+            await update.message.reply_text(
+                "🔐 COMPLETA IL COLLEGAMENTO\n\nApri la pagina riservata e inserisci il codice ricevuto da Telegram. "
+                "Se richiesta, inserisci lì anche la password della verifica in due passaggi. "
+                "Non inviare codice o password in chat. Il link scade dopo 10 minuti.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔐 APRI PAGINA DI ACCESSO", url=link)],
+                    [InlineKeyboardButton("❌ ANNULLA", callback_data="cancel_add_session")],
+                ]),
+            )
+        except Exception as exc:
+            logger.warning("Richiesta sessione fallita (%s)", type(exc).__name__)
+            await update.message.reply_text(
+                "❌ Collegamento non avviato (" + type(exc).__name__ + "). "
+                "Controlla il numero e riprova; se Telegram richiede una pausa, attendi prima di riprovare.")
+        return
+
+    # =====================================================
+    # ORARIO PARTENZA
+    # =====================================================
+
+    if target == "start_time":
+        value = update.message.text.strip()
+        match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", value)
+
+        if not match:
+            await update.message.reply_text(
+                "❌ Orario non valido. Usa HH:MM, ad esempio 09:00."
+            )
+            return
+
+        state["start_time"] = value
+        state["waiting_for"] = None
+        await set_setting("start_time", value)
+        await add_log(f"🕐 Orario partenza impostato: {value}")
+
+        await update.message.reply_text(
+            await invites_text(settings=True),
+            reply_markup=invite_settings_keyboard(),
+        )
+        return
+
+    # =====================================================
+    # ID MANUALI
+    # =====================================================
+
+    if target in ("manual_ids", "contact_ids"):
+
+        raw = update.message.text
+        members = []
+        seen = set()
+
+        # Formato: 1. @username — 123456789
+        page_pattern = re.compile(
+            r"^\s*\d+\.\s+(.+?)\s+[—–-]\s*(\d+)\s*$"
+        )
+        username_pattern = re.compile(r"^@?([A-Za-z0-9_]{5,32})$")
+
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            match = page_pattern.match(line)
+            if match:
+                label = match.group(1).strip()
+                user_id = int(match.group(2))
+                username = None
+                username_match = re.search(r"@([A-Za-z0-9_]{5,32})", label)
+                if username_match:
+                    username = username_match.group(1)
+
+                key = (user_id, username)
+                if key not in seen:
+                    seen.add(key)
+                    members.append({
+                        "id": user_id,
+                        "username": username,
+                        "label": label,
+                    })
+                continue
+
+            # Singolo ID numerico.
+            if line.isdigit():
+                user_id = int(line)
+                key = (user_id, None)
+                if key not in seen:
+                    seen.add(key)
+                    members.append({
+                        "id": user_id,
+                        "username": None,
+                        "label": None,
+                    })
+                continue
+
+            # Username con o senza @, uno per riga.
+            username_match = username_pattern.match(line)
+            if username_match:
+                username = username_match.group(1)
+                key = (None, username.lower())
+                if key not in seen:
+                    seen.add(key)
+                    members.append({
+                        "id": None,
+                        "username": username,
+                        "label": "@" + username,
+                    })
+
+        if not members:
+            await update.message.reply_text(
+                "❌ Non ho trovato utenti o ID Telegram validi."
+            )
+            return
+
+        members = members[:20]
+        is_contact_batch = (target == "contact_ids")
+        state["prepared_session"] = current_session_id()
+        state["manual_refs"] = members
+        state["manual_ids"] = [
+            item["id"] for item in members if item["id"] is not None
+        ]
+        state["waiting_for"] = None
+
+        preview_lines = []
+        for index, item in enumerate(members, start=1):
+            user_id = item["id"]
+            username = item["username"]
+            label = item["label"]
+
+            if label and user_id is not None:
+                preview_lines.append(f"{index}. {label} — {user_id}")
+            elif username:
+                preview_lines.append(f"{index}. @{username}")
+            else:
+                preview_lines.append(f"{index}. ID {user_id}")
+
+        lock_note = (
+            "\n\n🔒 Gli inviti sono attualmente sospesi: "
+            "puoi preparare la lista, ma la conferma resterà bloccata "
+            "finché la restrizione non sarà cessata."
+            if state["telegram_locked"]
+            else ""
+        )
+
+        await update.message.reply_text(
+            ("📒 CONFERMA CONTATTI RUBRICA\n\n" if is_contact_batch else "👤 CONFERMA INVITO MANUALE\n\n")
+            + f"📤 Destinazione:\n{state['group_b']['name']}\n\n"
+            f"Utenti riconosciuti: {len(members)}\n\n"
+            + "\n".join(preview_lines)
+            + lock_note
+            + "\n\nProcedere?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "✅ CONFERMA",
+                    callback_data=("contacts_confirm" if is_contact_batch else "manual_confirm"),
+                ),
+                InlineKeyboardButton(
+                    "❌ ANNULLA",
+                    callback_data="home",
+                ),
+            ]]),
+        )
+
+        return
+
+    # =====================================================
+    # GRUPPI
+    # =====================================================
+
+    if target not in (
+        "a",
+        "b",
+    ):
+        return
+
+    if operation_busy():
+        await update.message.reply_text("Attendi la fine delle operazioni prima di cambiare gruppo.")
+        return
+
+    try:
+
+        group = await resolve_group(
+            update.message.text
+        )
+
+        other = (
+            state["group_b"]
+            if target == "a"
+            else state["group_a"]
+        )
+
+        if (
+            other
+            and other["id"]
+            == group["id"]
+        ):
+
+            await update.message.reply_text(
+                "❌ A e B devono "
+                "essere diversi."
+            )
+
+            return
+
+        if target == "a":
+
+            state["group_a"] = group
+
+            await save_group(
+                "group_a",
+                group,
+            )
+
+            label = "A"
+
+        else:
+
+            state["group_b"] = group
+
+            await save_group(
+                "group_b",
+                group,
+            )
+
+            label = "B"
+
+        state["waiting_for"] = None
+
+        await add_log(
+            f"⚙️ Gruppo {label} "
+            f"impostato: "
+            f"{group['name']}"
+        )
+
+        await update.message.reply_text(
+            f"✅ GRUPPO {label} "
+            f"IMPOSTATO\n\n"
+
+            f"👥 {group['name']}\n"
+            f"🆔 {group['id']}\n\n"
+
+            "💾 Salvato.",
+
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Errore impostazione gruppo"
+        )
+
+        await update.message.reply_text(
+            "❌ Gruppo non utilizzabile.\n\n"
+            f"Errore: "
+            f"{type(e).__name__}"
+        )
+
+
+# =========================================================
+# INIT
+# =========================================================
+
+# =========================================================
+# SESSIONI AGGIUNTE DAL PANNELLO / ACCESSO RISERVATO
+# =========================================================
+
+ADDED_SESSIONS_PATH = os.path.join(os.path.dirname(DB_PATH), "added_sessions.json")
+added_sessions = {}
+pending_session_logins = {}
+login_server = None
+login_server_thread = None
+login_cleanup_task = None
+login_loop = None
+LOGIN_TTL = 600
+MAX_ACCOUNTS = 12
+
+
+def new_session_info():
+    return {"ready": False, "name": "Account aggiunto", "user_id": None,
+            "error": "Connessione da verificare", "telegram_locked": False,
+            "telegram_restriction_detected": False, "proxy_slot": None}
+
+
+def added_client(session_string=""):
+    # Le nuove sessioni usano una connessione diretta salvo proxy esplicito.
+    options = {"device_model": "BestPrice Member Manager", "flood_sleep_threshold": 0}
+    proxy_slot = os.environ.get("ADDED_SESSION_PROXY", "").strip()
+    if proxy_slot:
+        slot = int(proxy_slot)
+        if slot not in (1, 2):
+            raise ValueError("ADDED_SESSION_PROXY deve essere 1 oppure 2")
+        # Riutilizza configurazione e validazione già presenti nel progetto.
+        proxy_account = next((i for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot), None)
+        if proxy_account is None:
+            raise ValueError("Proxy richiesto non configurato in una sessione esistente")
+        _, options["proxy"] = proxy_for_account(proxy_account)
+    return TelegramClient(StringSession(session_string), API_ID, API_HASH, **options)
+
+
+def persist_added_sessions():
+    os.makedirs(os.path.dirname(ADDED_SESSIONS_PATH), exist_ok=True)
+    temporary = ADDED_SESSIONS_PATH + ".tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(added_sessions, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, ADDED_SESSIONS_PATH)
+
+
+def load_added_sessions():
+    global ACCOUNT_IDS
+    if not os.path.isfile(ADDED_SESSIONS_PATH):
+        return
+    with open(ADDED_SESSIONS_PATH) as stream:
+        saved = json.load(stream)
+    if not isinstance(saved, dict):
+        raise ValueError("Archivio sessioni aggiunte non valido")
+    for key, value in saved.items():
+        account_id = int(key)
+        if account_id in ACCOUNT_IDS or not 7 <= account_id <= MAX_ACCOUNTS:
+            raise ValueError("Slot sessione aggiunta non valido")
+        if not isinstance(value, str) or not value:
+            raise ValueError("Sessione salvata non valida")
+        session_clients[account_id] = added_client(value)
+        session_info[account_id] = new_session_info()
+        session_info[account_id]["proxy_slot"] = int(os.environ["ADDED_SESSION_PROXY"]) if os.environ.get("ADDED_SESSION_PROXY", "").strip() else None
+        added_sessions[key] = value
+    ACCOUNT_IDS = tuple(sorted(session_info))
+
+
+def public_login_base():
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    value = os.environ.get("SESSION_LOGIN_BASE_URL", "").strip() or (f"https://{domain}" if domain else "")
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Configura un dominio pubblico HTTPS Railway oppure SESSION_LOGIN_BASE_URL")
+    return value.rstrip("/")
+
+
+async def discard_pending_login(token):
+    item = pending_session_logins.pop(token, None)
+    if item is not None:
+        try:
+            await item["client"].disconnect()
+        except Exception:
+            pass
+
+
+async def expire_session_logins():
+    while True:
+        await asyncio.sleep(15)
+        async with control_lock:
+            for token, item in list(pending_session_logins.items()):
+                if time.monotonic() >= item["expires"]:
+                    await discard_pending_login(token)
+
+
+async def begin_added_session(phone, admin_id, chat_id):
+    if login_server is None:
+        raise ValueError("Pagina di accesso non disponibile: configura il dominio HTTPS del servizio Railway")
+    if len(ACCOUNT_IDS) >= MAX_ACCOUNTS:
+        raise ValueError("Sono già presenti 12 sessioni")
+    for token, item in list(pending_session_logins.items()):
+        if item["admin_id"] == admin_id:
+            await discard_pending_login(token)
+    if len(pending_session_logins) >= len(ADMIN_USER_IDS):
+        raise ValueError("Attendi la fine degli altri collegamenti")
+    client = added_client()
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30)
+        sent = await asyncio.wait_for(client.send_code_request(phone), timeout=30)
+        if not getattr(sent, "phone_code_hash", None):
+            raise ValueError("Questo accesso richiede una modalità non supportata; usa un client Telegram ufficiale")
+        token = secrets.token_urlsafe(32)
+        pending_session_logins[token] = {
+            "client": client, "phone": phone, "hash": sent.phone_code_hash,
+            "stage": "code", "expires": time.monotonic() + LOGIN_TTL,
+            "admin_id": admin_id, "chat_id": chat_id, "attempts": 0,
+        }
+        return public_login_base() + "/session-login/" + token
+    except BaseException:
+        await client.disconnect()
+        raise
+
+
+async def login_web_operation(token, form=None):
+    global ACCOUNT_IDS
+    async with control_lock:
+        item = pending_session_logins.get(token)
+        if item is None or time.monotonic() >= item["expires"]:
+            await discard_pending_login(token)
+            return "expired", "Collegamento scaduto. Premi nuovamente AGGIUNGI SESSIONE."
+        if form is None:
+            return item["stage"], ""
+        if not secrets.compare_digest(form.get("token", ""), token):
+            return "expired", "Richiesta non valida."
+        if operation_busy() or state["auto_enabled"]:
+            return item["stage"], "Ferma le operazioni e disattiva AUTO nel bot prima di completare il collegamento."
+        client = item["client"]
+        item["attempts"] += 1
+        if item["attempts"] > 5:
+            await discard_pending_login(token)
+            return "expired", "Troppi tentativi. Riparti dal pannello."
+        try:
+            if item["stage"] == "code":
+                code = form.get("code", "").strip()
+                if not re.fullmatch(r"\d{4,8}", code):
+                    return "code", "Inserisci soltanto le cifre del codice Telegram."
+                try:
+                    await asyncio.wait_for(client.sign_in(phone=item["phone"], code=code,
+                                                          phone_code_hash=item["hash"]), timeout=45)
+                except SessionPasswordNeededError:
+                    item["stage"] = "password"
+                    return "password", "È attiva la verifica in due passaggi."
+            else:
+                password = form.get("password", "")
+                if not password:
+                    return "password", "Inserisci la password della verifica in due passaggi."
+                await asyncio.wait_for(client.sign_in(password=password), timeout=45)
+            me = await asyncio.wait_for(client.get_me(), timeout=15)
+            if me is None or getattr(me, "bot", False):
+                raise ValueError("È necessario un account utente Telegram")
+            if any(info["user_id"] == me.id for info in session_info.values()):
+                await discard_pending_login(token)
+                return "expired", "Questo account è già presente: selezionalo nel pannello."
+            account_id = next((i for i in range(7, MAX_ACCOUNTS + 1) if i not in session_info), None)
+            if account_id is None:
+                await discard_pending_login(token)
+                return "expired", "Nessuno slot disponibile."
+            added_sessions[str(account_id)] = client.session.save()
+            try:
+                persist_added_sessions()
+            except Exception:
+                added_sessions.pop(str(account_id), None)
+                raise
+            session_clients[account_id] = client
+            session_info[account_id] = new_session_info()
+            ACCOUNT_IDS = tuple(sorted(session_info))
+            # Il client ora è di proprietà del gestore delle sessioni.
+            pending_session_logins.pop(token, None)
+            await register_session_age(account_id, me.id, newly_added=True)
+            await bind_session_owner(account_id, me.id)
+            session_info[account_id].update(
+                ready=True, user_id=me.id,
+                name=telegram_profile_name(me), display_name=telegram_profile_name(me), username=me.username,
+                error="Connessa e autorizzata",
+                proxy_slot=int(os.environ["ADDED_SESSION_PROXY"]) if os.environ.get("ADDED_SESSION_PROXY", "").strip() else None,
+            )
+            await select_session(account_id)
+            await add_log(f"✅ Sessione aggiunta dal pannello — ACCOUNT {account_id}", session_id=account_id)
+            try:
+                await welcome_bot.send_message(
+                    chat_id=item["chat_id"],
+                    text=f"✅ SESSIONE AGGIUNTA E SELEZIONATA\n\n{session_label(account_id)}\n\n"
+                         "RUBRICA leggerà i contatti di questo account. AUTO è disattivato.",
+                    reply_markup=main_keyboard(),
+                )
+            except Exception:
+                logger.warning("Notifica collegamento non recapitata")
+            return "done", "Sessione aggiunta e selezionata. Torna al bot e apri RUBRICA → ESTRAI/AGGIORNA."
+        except PhoneCodeInvalidError:
+            return "code", "Codice non valido. Riprova senza inviarlo in chat Telegram."
+        except PhoneCodeExpiredError:
+            await discard_pending_login(token)
+            return "expired", "Codice scaduto. Riparti da AGGIUNGI SESSIONE."
+        except PasswordHashInvalidError:
+            return "password", "Password non corretta. Riprova."
+        except FloodWaitError as exc:
+            await discard_pending_login(token)
+            return "expired", f"Telegram richiede di attendere {exc.seconds} secondi. Riprova più tardi."
+        except Exception as exc:
+            # Non registrare messaggi di errore che potrebbero contenere dati di accesso.
+            logger.warning("Collegamento sessione fallito (%s)", type(exc).__name__)
+            if token in pending_session_logins:
+                await discard_pending_login(token)
+            return "expired", "Collegamento non completato. Controlla il pannello e riprova."
+
+
+def render_login_page(stage, note, token):
+    title = "Collega il tuo account Telegram"
+    form = ""
+    if stage in ("code", "password"):
+        field = ('<label>Codice ricevuto da Telegram</label><input name="code" inputmode="numeric" '
+                 'pattern="[0-9]{4,8}" autocomplete="one-time-code" required>' if stage == "code" else
+                 '<label>Password della verifica in due passaggi</label><input type="password" '
+                 'name="password" autocomplete="current-password" required>')
+        form = (f'<form method="post"><input type="hidden" name="token" value="{html.escape(token)}">'
+                f'{field}<button type="submit">COLLEGA SESSIONE</button></form>'
+                '<p>Inserisci questi dati soltanto qui, sulla pagina del tuo bot. Il link scade dopo 10 minuti.</p>')
+    return ("<!doctype html><html lang=it><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+            f"<title>{title}</title><style>body{{font:17px system-ui;background:#f5f6fa;margin:0;padding:24px}}"
+            "main{max-width:460px;margin:30px auto;background:white;padding:24px;border-radius:18px}"
+            "input,button{box-sizing:border-box;width:100%;padding:14px;margin:12px 0;font:inherit}"
+            "button{background:#1665dc;color:white;border:0;border-radius:10px}p{line-height:1.5}</style>"
+            f"<main><h2>{title}</h2><p>{html.escape(note)}</p>{form}</main></html>")
+
+
+def canonical_https_origin(value):
+    """Confronta dominio e porta senza differenze di maiuscole o porta 443."""
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return None
+        return (parsed.hostname.lower(), parsed.port or 443)
+    except (TypeError, ValueError):
+        return None
+
+
+def login_origin_allowed(origin, referer, token, form_token):
+    # La pagina usa un link riservato non prevedibile e un token nel modulo.
+    if not token or not secrets.compare_digest(form_token or "", token):
+        return False
+    expected = canonical_https_origin(public_login_base())
+    if expected is None:
+        return False
+    if origin and origin.strip().lower() != "null":
+        return canonical_https_origin(origin) == expected
+    # Alcuni browser interni inviano un'origine opaca (null) o nessuna origine.
+    # Se presente, il Referer deve comunque appartenere al dominio configurato.
+    if referer:
+        return canonical_https_origin(referer) == expected
+    return True  # Rimangono necessari token valido, scadenza e sessione pendente.
+
+
+class SessionLoginHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # Il percorso contiene un token riservato.
+
+    def handle_page(self, post=False):
+        path = urlsplit(self.path).path
+        if path in ("/", "/health") and not post:
+            self.respond(200, "Servizio attivo")
+            return
+        match = re.fullmatch(r"/session-login/([A-Za-z0-9_-]{40,60})", path)
+        if not match:
+            self.respond(404, "Pagina non disponibile")
+            return
+        token = match.group(1)
+        form = None
+        if post:
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 4096:
+                    self.respond(400, "Richiesta non valida")
+                    return
+                values = parse_qs(self.rfile.read(size).decode("utf-8"), max_num_fields=5)
+                form = {key: value[0] for key, value in values.items()}
+                if not login_origin_allowed(self.headers.get("Origin"), self.headers.get("Referer"),
+                                            token, form.get("token", "")):
+                    expected = urlsplit(public_login_base()).netloc
+                    note = ("La pagina non corrisponde al dominio configurato oppure il modulo non è valido. "
+                            "Torna al bot e riparti da Aggiungi sessione. "
+                            f"Su Railway, SESSION_LOGIN_BASE_URL deve indicare il dominio HTTPS effettivo: {expected}.")
+                    self.respond(403, render_login_page("expired", note, ""))
+                    return
+            except (ValueError, UnicodeError):
+                self.respond(400, "Richiesta non valida")
+                return
+        future = asyncio.run_coroutine_threadsafe(login_web_operation(token, form), login_loop)
+        try:
+            stage, note = future.result(timeout=90)
+            self.respond(200 if stage != "expired" else 410, render_login_page(stage, note, token))
+        except Exception:
+            self.respond(503, "Servizio momentaneamente non disponibile. Torna al bot.")
+
+    def respond(self, status, body):
+        content = body.encode("utf-8")
+        self.send_response(status)
+        for key, value in {
+            "Content-Type": "text/html; charset=utf-8", "Content-Length": str(len(content)),
+            "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        }.items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(content)
+
+    def do_GET(self):
+        self.handle_page()
+
+    def do_POST(self):
+        self.handle_page(post=True)
+
+
+async def start_login_service():
+    global login_loop, login_server, login_server_thread, login_cleanup_task
+    login_loop = asyncio.get_running_loop()
+    try:
+        public_login_base()
+        login_server = ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), SessionLoginHandler)
+        login_server.daemon_threads = True
+        login_server_thread = threading.Thread(target=login_server.serve_forever, daemon=True)
+        login_server_thread.start()
+        login_cleanup_task = asyncio.create_task(expire_session_logins())
+    except Exception as exc:
+        logger.warning("Pagina aggiungi sessione non disponibile (%s)", type(exc).__name__)
+        login_server = None
+
+
+def members_export_text(rows):
+    lines = []
+    for index, (user_id, username, name) in enumerate(rows, 1):
+        username = "".join((username or "").split()).lstrip("@")
+        label = "@" + username if username else " ".join((name or "Senza nome").split())
+        lines.append(f"{index}. {label} — {user_id}")
+    return "\n".join(lines) + "\n"
+
+
+async def export_members(message):
+    group = state.get("group_a")
+    if not group:
+        await message.reply_text("Configura prima il gruppo A.", reply_markup=groups_keyboard())
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id, username, display_name FROM extracted_members WHERE source_id=? "
+            "ORDER BY CASE WHEN username IS NULL THEN 1 ELSE 0 END, "
+            "username COLLATE NOCASE, display_name COLLATE NOCASE, user_id",
+            (group["id"],),
+        )
+        rows = await cursor.fetchall()
+    if not rows:
+        await message.reply_text("Nessun membro da esportare. Premi prima Estrai / aggiorna.", reply_markup=await members_keyboard())
+        return
+    document = io.BytesIO(members_export_text(rows).encode("utf-8"))
+    document.name = f"membri_gruppo_a_{now_it():%Y-%m-%d_%H%M%S}.txt"
+    await message.reply_document(
+        document=document, filename=document.name,
+        caption=f"👥 Membri gruppo A: {group['name']}\nTotale esportato: {len(rows)}\n"
+                "Lista completa salvata nell'ultima estrazione, con i filtri allora applicati e le eventuali pulizie successive.",
+    )
+    await add_log(f"📄 Membri gruppo A esportati: {len(rows)} — gruppo {group['id']}", session_id=0)
+
+
+async def export_contacts(message):
+    account_id = current_session_id()
+    condition = ""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id, username, display_name FROM session_contacts WHERE session_id = ?"
+            + condition + " ORDER BY display_name COLLATE NOCASE, user_id", (account_id,),
+        )
+        rows = await cursor.fetchall()
+    if not rows:
+        await message.reply_text("Nessun contatto corrisponde al filtro. Premi ESTRAI/AGGIORNA o cambia filtro.")
+        return
+    lines = []
+    for index, (user_id, username, name) in enumerate(rows, 1):
+        name = " ".join((name or "Senza nome").split())
+        label = f"{name} (@{username})" if username else name
+        lines.append(f"{index}. {label} — {user_id}")
+    document = io.BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
+    document.name = f"rubrica_account_{account_id}_{now_it():%Y%m%d_%H%M%S}.txt"
+    await message.reply_document(
+        document=document, filename=document.name,
+        caption=f"📒 {session_label(account_id)}\nContatti: {len(rows)}\n"
+                + "Lista dell’ultima estrazione con i filtri allora applicati."
+                + "\nPuoi copiare le righe nella lista manuale dopo aver selezionato un'altra sessione. "
+                  "Ogni conferma resta limitata a 20 contatti. Usa la lista per persone che hanno acconsentito.",
+    )
+    await add_log(f"📄 Rubrica esportata: {len(rows)} contatti", session_id=account_id)
+
+
+async def restore_removed_sessions():
+    global ACCOUNT_IDS
+    try:
+        removed = json.loads(await get_setting("removed_env_sessions", "[]"))
+    except (ValueError, TypeError):
+        removed = []
+    if not isinstance(removed, list):
+        removed = []
+    for account_id in removed:
+        if isinstance(account_id, int) and 1 <= account_id <= 6:
+            session_clients.pop(account_id, None)
+            session_info.pop(account_id, None)
+    ACCOUNT_IDS = tuple(sorted(session_info))
+
+
+async def remove_session_from_bot(account_id):
+    global ACCOUNT_IDS
+    if operation_busy() or state["auto_enabled"]:
+        raise ValueError("Disattiva AUTO e attendi la fine delle operazioni prima di eliminare una sessione.")
+    if account_id not in ACCOUNT_IDS:
+        raise ValueError("Sessione già rimossa.")
+    if len(ACCOUNT_IDS) <= 1:
+        raise ValueError("Mantieni almeno una sessione nel bot. Aggiungine un'altra prima di eliminare questa.")
+    # Conserva i dati delle altre sessioni e lo storico delle operazioni.
+    if account_id <= 6:
+        removed = json.loads(await get_setting("removed_env_sessions", "[]"))
+        if not isinstance(removed, list):
+            raise ValueError("Configurazione delle sessioni rimosse non valida.")
+        await set_setting("removed_env_sessions", json.dumps(sorted(set(removed + [account_id]))))
+    else:
+        previous = added_sessions.pop(str(account_id), None)
+        try:
+            persist_added_sessions()
+        except Exception:
+            if previous is not None:
+                added_sessions[str(account_id)] = previous
+            raise
+    # Le credenziali nelle variabili Railway rimangono gestite da Railway,
+    # ma lo slot eliminato non viene più caricato dal bot ai riavvii.
+    client = session_clients.pop(account_id, None)
+    if client is not None:
+        try:
+            await client.disconnect()
+        except Exception:
+            logger.warning("Disconnessione sessione rimossa non completata (%s)", account_id)
+    session_info.pop(account_id)
+    ACCOUNT_IDS = tuple(sorted(session_info))
+    if state["active_session"] == account_id:
+        state["active_session"] = next((i for i in ACCOUNT_IDS if session_info[i]["ready"]), ACCOUNT_IDS[0])
+        session_context.set(state["active_session"])
+        sync_session_state()
+        await set_setting("active_session", state["active_session"])
+    state["waiting_for"] = None
+    state["manual_refs"] = []
+    state["manual_ids"] = []
+    state["prepared_session"] = None
+    state["member_page"] = 0
+    state["contact_page"] = 0
+    await add_log(f"🗑 Sessione ACCOUNT {account_id} rimossa dal bot; account Telegram conservato.", session_id=0)
+
+
+async def post_init(
+    application,
+):
+
+    global welcome_bot
+    welcome_bot = application.bot
+    await init_db()
+    await restore_welcome_deletions(application.bot)
+    await init_session_features()
+    await restore_removed_sessions()
+    load_added_sessions()
+    await load_settings()
+    await start_login_service()
+    await ensure_today()
+
+    for account_id in ACCOUNT_IDS:
+        await connect_session(account_id)
+        await add_log("🔌 Connessione iniziale — " + session_info[account_id]["error"], session_id=account_id)
+    available = [account_id for account_id in ACCOUNT_IDS if session_info[account_id]["ready"]]
+    if not available:
+        logger.warning("Nessuna sessione disponibile: il pannello resta accessibile per la diagnostica")
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+    elif state["active_session"] not in available:
+        state["active_session"] = available[0]
+        sync_session_state()
+        await set_setting("active_session", state["active_session"])
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+    gate = await invitation_gate(state["active_session"])
+    if gate and state["auto_enabled"]:
+        state["auto_enabled"] = False
+        await set_setting("auto_enabled", "0")
+        await add_log("🛑 Programmazione disattivata all'avvio — " + gate, "WARNING")
+    failures = [f"ACCOUNT {i}: {session_info[i]['error']}" for i in ACCOUNT_IDS if not session_info[i]["ready"]]
+    await add_log(f"⚙️ Avvio V4.9.9.20 — {len(available)}/{len(ACCOUNT_IDS)} sessioni connesse" + (" — " + "; ".join(failures) if failures else ""), session_id=0)
+
+    await restore_prepare(application)
+    await restore_scheduled_messages(application)
+
+    global scheduler_task
+    scheduler_task = asyncio.create_task(
+        daily_scheduler(application)
+    )
+
+
+async def post_shutdown(
+    application,
+):
+
+    global scheduler_task, worker_task, contact_task
+    state["running"] = False
+    state["stop_requested"] = True
+    tasks = [task for task in (scheduler_task, worker_task, contact_task, login_cleanup_task, prepare_task, scheduled_message_task) if task is not None]
+    tasks.extend(list(welcome_tasks))
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for token in list(pending_session_logins):
+        await discard_pending_login(token)
+    if login_server is not None:
+        await asyncio.to_thread(login_server.shutdown)
+        login_server.server_close()
+    for client in session_clients.values():
+        await client.disconnect()
+
+
+# =========================================================
+# BENVENUTO NUOVI MEMBRI GRUPPO B
+# =========================================================
+
+WELCOME_DELETE_SECONDS = 30 * 60
+CHANNEL_URL = "https://t.me/bestprice_2026"
+
+
+def _same_telegram_chat_id(a, b):
+    """Confronta in modo tollerante gli ID chat Telethon/Bot API."""
+    try:
+        a = int(a)
+        b = int(b)
+    except (TypeError, ValueError):
+        return False
+
+    if a == b:
+        return True
+
+    # Il prefisso -100 è una marcatura Bot API, non parte dell'ID positivo.
+    def unmarked(value):
+        if value <= -1000000000000:
+            return -value - 1000000000000
+        return abs(value)
+    return unmarked(a) == unmarked(b)
+
+
+def schedule_welcome_deletion(bot, chat_id, message_id, delete_at):
+    task = asyncio.create_task(_delete_welcome_later(bot, chat_id, message_id, delete_at))
+    welcome_tasks.add(task)
+    task.add_done_callback(welcome_tasks.discard)
+
+
+async def restore_welcome_deletions(bot):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT chat_id, message_id, delete_at FROM welcome_deletions")
+        rows = await cursor.fetchall()
+    for chat_id, message_id, delete_at in rows:
+        schedule_welcome_deletion(bot, chat_id, message_id, delete_at)
+
+
+async def _delete_welcome_later(bot, chat_id, message_id, delete_at):
+    await asyncio.sleep(max(0, delete_at - time.time()))
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.warning("Impossibile eliminare il benvenuto %s: %s", message_id, e)
+        await add_log(f"⚠️ Benvenuto {message_id} non eliminato nel gruppo {chat_id}: {type(e).__name__}", "WARNING", session_id=0)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM welcome_deletions WHERE chat_id=? AND message_id=?", (chat_id, message_id))
+        await db.commit()
+
+
+
+async def record_membership_event(message, chat, member, event):
+    actor = getattr(getattr(message, "from_user", None), "id", None)
+    date = getattr(message, "date", None)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO membership_events(chat_id,user_id,event,actor_id,event_date,observed_at) VALUES (?,?,?,?,?,?)",
+                         (chat.id, member.id, event, actor, date.isoformat() if date else None, now_it().isoformat()))
+        await db.commit()
+    await add_log(f"📥 EVENTO {event} — ID membro {member.id} — gruppo {chat.id} — autore ID {actor or 'non disponibile'} — data Telegram {date.isoformat() if date else 'non disponibile'} — messaggio {message.message_id}", session_id=0)
+
+
+async def delete_left_member_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Registra l'uscita e lascia visibile il messaggio durante la diagnosi."""
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message or not chat or not message.left_chat_member:
+        return
+
+    # Agisce esclusivamente nel Gruppo B configurato.
+    if not state.get("group_b") or not _same_telegram_chat_id(
+        chat.id,
+        state["group_b"].get("id"),
+    ):
+        return
+
+    await record_membership_event(message, chat, message.left_chat_member, "LEFT")
+    async with welcome_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM welcome_sent WHERE chat_id = ? AND user_id = ?", (chat.id, message.left_chat_member.id))
+            await db.commit()
+    # Diagnosi: lascia visibile l'avviso d'uscita. Non rimuove nessun membro.
+    await add_log("🔎 Avviso di uscita mantenuto visibile per la diagnosi", session_id=0)
+
+
+async def send_welcome_once(bot, chat_id, member, origin, session_id=0):
+    """Unica funzione per evento d'ingresso e fallback dopo invito confermato."""
+    if getattr(member, "is_bot", False) or getattr(member, "bot", False):
+        return False
+    user_id = int(member.id)
+    phase = "preparazione / controllo duplicati"
+    try:
+        async with welcome_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT sent_at FROM welcome_sent WHERE chat_id = ? AND user_id = ?",
+                    (chat_id, user_id),
+                )
+                row = await cursor.fetchone()
+            if row:
+                stamp = datetime.fromisoformat(row[0])
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=ITALY_TZ)
+                if (now_it() - stamp).total_seconds() < 24 * 60 * 60:
+                    await add_log(
+                        f"↪️ Benvenuto già inviato — ID {user_id} — {origin}; duplicato evitato",
+                        session_id=session_id,
+                    )
+                    return False
+            username = getattr(member, "username", None)
+            if username:
+                person = f"@{html.escape(username)}"
+            else:
+                name = getattr(member, "full_name", None) or " ".join(
+                    value for value in (getattr(member, "first_name", None),
+                                        getattr(member, "last_name", None)) if value
+                ) or "nuovo membro"
+                person = f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+            text = (
+                f"👋 <b>Benvenuto {person} nella Community BestPrice24h!</b>\n\n"
+                "🔥 Sei nel posto giusto per scoprire <b>offerte, ribassi di prezzo e occasioni Amazon</b> "
+                "selezionate ogni giorno.\n\n"
+                "📲 Le offerte vengono pubblicate sul nostro <b>canale ufficiale BestPrice24h</b>, "
+                "così puoi trovarle subito senza perderti tra centinaia di prodotti.\n\n"
+                "💡 <b>Il consiglio:</b> entra nel canale e attiva le notifiche per non perdere "
+                "le occasioni migliori.\n\n"
+                "👇 <b>Ci vediamo nel canale!</b>\n\n"
+                "Se non desideri restare, premi il pulsante qui sotto: uscirai dal gruppo "
+                "e non verrai invitato di nuovo automaticamente."
+            )
+            phase = "sendMessage pubblico nel gruppo"
+            sent = await bot.send_message(
+                chat_id=chat_id, text=text, parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔥 SCOPRI LE OFFERTE", url=CHANNEL_URL)],
+                    [InlineKeyboardButton("🚪 NON DESIDERO RESTARE", callback_data=f"welcome_exit:{user_id}")],
+                ]),
+            )
+            delete_at = time.time() + WELCOME_DELETE_SECONDS
+            schedule_welcome_deletion(bot, chat_id, sent.message_id, delete_at)
+            phase = "registrazione del benvenuto e della scadenza"
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO welcome_sent(chat_id, user_id, sent_at, message_id) VALUES (?, ?, ?, ?)",
+                    (chat_id, user_id, now_it().isoformat(), sent.message_id),
+                )
+                await db.execute(
+                    "INSERT OR REPLACE INTO welcome_deletions(chat_id,message_id,delete_at) VALUES (?,?,?)",
+                    (chat_id, sent.message_id, delete_at),
+                )
+                await db.commit()
+            await add_log(
+                f"👋 BENVENUTO PUBBLICO INVIATO — cancellazione dopo 30 minuti — ID {user_id} — {origin} — messaggio {sent.message_id}",
+                session_id=session_id,
+            )
+            return True
+    except Exception as exc:
+        logger.exception("Errore benvenuto per ID %s", user_id)
+        await add_log(
+            f"❌ BENVENUTO FALLITO — ID {user_id} — {origin} — operazione: {phase} — "
+            f"{type(exc).__name__}: {str(exc)[:220]}", "ERROR", session_id=session_id,
+        )
+        return False
+
+
+async def welcome_exit(update, context):
+    query = update.callback_query
+    try:
+        target = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("Pulsante non valido.", show_alert=True)
+        return
+    if query.from_user.id != target:
+        await query.answer("Questo pulsante è riservato al destinatario del benvenuto.", show_alert=True)
+        return
+    message = query.message
+    if message is None:
+        await query.answer("Apri il pulsante nel gruppo.", show_alert=True)
+        return
+    chat_id = message.chat.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM welcome_sent WHERE chat_id = ? AND user_id = ?", (chat_id, target))
+        if not await cursor.fetchone():
+            await query.answer("Benvenuto non disponibile.", show_alert=True)
+            return
+        await db.execute(
+            "INSERT OR REPLACE INTO invitation_optout VALUES (?, ?, ?)",
+            (chat_id, target, now_it().isoformat()),
+        )
+        await db.commit()
+    await query.answer("Uscita richiesta. Non verrai invitato nuovamente.", show_alert=True)
+    try:
+        # Rimuove il membro senza impedirgli un futuro ingresso volontario.
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=target, only_if_banned=False)
+        await add_log(f"🚪 USCITA VOLONTARIA — ID {target} — gruppo {chat_id}; futuri inviti esclusi", session_id=0)
+    except Exception as exc:
+        await add_log(f"❌ USCITA FALLITA — ID {target} — {type(exc).__name__}: {str(exc)[:220]}", "ERROR", session_id=0)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Non riesco a rimuovere il tuo account. Puoi uscire dal menu del gruppo. Non verrai invitato di nuovo.",
+            )
+        except Exception:
+            logger.exception("Impossibile notificare l'errore di uscita")
+
+
+async def welcome_confirmed_invite(destination, user):
+    """L'errore del benvenuto non deve annullare un'aggiunta già confermata."""
+    try:
+        if welcome_bot is None:
+            await add_log("❌ BENVENUTO FALLITO — bot non inizializzato", "ERROR")
+            return
+        try:
+            chat_id = utils.get_peer_id(destination)
+        except (TypeError, ValueError):
+            # Il gruppo B usato da InviteToChannelRequest è un supergruppo.
+            saved_id = int(state["group_b"]["id"])
+            chat_id = saved_id if saved_id < 0 else -1000000000000 - saved_id
+        await send_welcome_once(
+            welcome_bot, chat_id, user, "aggiunta confermata", session_id=current_session_id(),
+        )
+    except Exception as exc:
+        logger.exception("Errore fallback benvenuto")
+        await add_log(f"❌ BENVENUTO FALLITO — {type(exc).__name__}: {str(exc)[:220]}", "ERROR")
+
+
+async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or not message.new_chat_members:
+        return
+    if not state.get("group_b") or not _same_telegram_chat_id(chat.id, state["group_b"].get("id")):
+        return
+    for member in message.new_chat_members:
+        await record_membership_event(message, chat, member, "JOIN")
+    try:
+        await context.bot.delete_message(chat_id=chat.id, message_id=message.message_id)
+    except Exception as exc:
+        await add_log(
+            f"⚠️ Messaggio di ingresso non eliminato — {type(exc).__name__}: {str(exc)[:160]}",
+            "WARNING", session_id=0,
+        )
+    for member in message.new_chat_members:
+        await send_welcome_once(context.bot, chat.id, member, "evento Telegram", session_id=0)
+
+
+
+# =========================================================
+# MODERAZIONE GRUPPO B
+# =========================================================
+
+_LINK_RE = re.compile(
+    r"(?i)(?:https?://|www\.|t\.me/|telegram\.me/|(?:[a-z0-9-]+\.)+(?:com|it|net|org|eu|io|co|me|app|dev|info|biz)(?:/|\b))"
+)
+
+
+def _message_contains_link(message):
+    """Rileva link espliciti, link Telegram e URL incorporati nel testo/caption."""
+    if not message:
+        return False
+
+    for entity in list(message.entities or []) + list(message.caption_entities or []):
+        if entity.type in ("url", "text_link"):
+            return True
+
+    content = (message.text or message.caption or "").strip()
+    return bool(content and _LINK_RE.search(content))
+
+
+# Parole complete: evita falsi positivi come "successo" o "classico".
+_CHAT_BAD_WORDS = (
+    "cazzo", "cazzi", "cazzata", "cazzate", "cazzone", "cazzoni", "cazzuto",
+    "incazzato", "incazzata", "incazzati", "incazzate", "incazzare",
+    "vaffanculo", "fanculo", "affanculo", "merda", "merde", "merdoso", "merdosa",
+    "stronzo", "stronza", "stronzi", "stronze", "stronzata", "stronzate",
+    "coglione", "cogliona", "coglioni", "coglionata", "coglionate",
+    "minchia", "minchione", "minchioni", "minchiata", "minchiate",
+    "puttana", "puttane", "puttanata", "puttanate", "troia", "troie",
+    "bastardo", "bastarda", "bastardi", "bastarde", "cretino", "cretina", "cretini", "cretine",
+    "ricchione", "ricchioni", "frocio", "froci", "fottiti", "fottere",
+    "fottuto", "fottuta", "fottuti", "fottute",
+    "fuck", "fucking", "fucker", "motherfucker", "shit", "bullshit", "bitch", "bitches", "asshole",
+)
+_CHAT_EXPLICIT_WORDS = (
+    "sesso", "sessuale", "sessuali", "sessualmente", "sex", "sexy", "sexting",
+    "porno", "porn", "pornografia", "pornografico", "pornografica", "pornografici", "pornografiche",
+    "erotico", "erotica", "erotici", "erotiche", "erotismo", "hardcore", "onlyfans",
+    "scopare", "scopata", "scopate", "scopami", "scopiamo", "trombare", "trombata", "trombate",
+    "pompino", "pompini", "pompinara", "segaiolo",
+    "masturbazione", "masturbare", "masturbarsi", "orgasmo", "orgasmi",
+    "sborra", "sborrare", "sborrata", "sborrate", "sborro", "sborri",
+    "figa", "fighe", "fica", "fregna", "cock", "dick", "pussy", "blowjob", "handjob",
+    "escort", "prostituta", "prostitute", "prostituzione", "nudes", "naked",
+)
+_CHAT_BLOCKED_PHRASES = (
+    "porco dio", "porca madonna", "dio cane", "dio porco", "figlio di puttana",
+    "figlia di puttana", "testa di cazzo", "pezzo di merda", "vai a cagare",
+    "foto intime", "foto hot", "video hot", "chat hot", "chat erotica", "incontri sessuali",
+    "send nudes", "sex chat", "farsi una sega", "faccio una sega", "fai una sega",
+    "sei un finocchio",
+)
+
+
+def normalize_chat_content(content):
+    content = unicodedata.normalize("NFKD", content.casefold())
+    content = "".join(c for c in content if unicodedata.category(c) not in {"Mn", "Cf"})
+    return content.translate(str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t"}))
+
+
+def blocked_word_pattern(words):
+    # Gestisce punti, asterischi e lettere separate (es. c.a.z.z.o).
+    patterns = []
+    for word in sorted(set(words), key=len, reverse=True):
+        patterns.append(r"[\W_]*".join(re.escape(c) for c in word))
+    return re.compile(r"(?<!\w)(?:" + "|".join(patterns) + r")(?!\w)")
+
+
+_CHAT_BAD_RE = blocked_word_pattern(_CHAT_BAD_WORDS)
+_CHAT_EXPLICIT_RE = blocked_word_pattern(_CHAT_EXPLICIT_WORDS)
+_CHAT_PHRASES_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(r"[\W_]*".join(re.escape(c) for c in phrase.replace(" ", ""))
+                             for phrase in _CHAT_BLOCKED_PHRASES) + r")(?!\w)"
+)
+
+
+def message_cleanliness_reason(message):
+    content = normalize_chat_content(getattr(message, "text", None) or getattr(message, "caption", None) or "")
+    if not content:
+        return None
+    if _CHAT_BAD_RE.search(content):
+        return "parolacce o insulti"
+    if _CHAT_EXPLICIT_RE.search(content) or _CHAT_PHRASES_RE.search(content):
+        return "espressioni sessuali esplicite o offensive"
+    return None
+
+
+async def moderate_group_b_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Elimina nel gruppo B link, parolacce e contenuti testuali sessuali espliciti."""
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat:
+        return
+
+    # Moderazione esclusivamente nel Gruppo B configurato.
+    if not state.get("group_b") or not _same_telegram_chat_id(
+        chat.id,
+        state["group_b"].get("id"),
+    ):
+        return
+
+    # Non toccare i messaggi inviati dal bot stesso.
+    if user and user.id == context.bot.id:
+        return
+
+    reason = "link" if _message_contains_link(message) else message_cleanliness_reason(message)
+    if not reason:
+        return
+
+    try:
+        await context.bot.delete_message(
+            chat_id=chat.id,
+            message_id=message.message_id,
+        )
+        who = (
+            f"@{user.username}"
+            if user and user.username
+            else (user.full_name if user else "utente")
+        )
+        await add_log(f"🗑 Messaggio eliminato nel Gruppo B — motivo: {reason} — {who}", session_id=0)
+    except Exception as e:
+        logger.warning(
+            "Impossibile eliminare messaggio moderato nel Gruppo B %s: %s",
+            message.message_id,
+            e,
+        )
+        await add_log(f"⚠️ Messaggio con {reason} nel Gruppo B: eliminazione non riuscita", session_id=0)
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(8)  # Gli eventi del gruppo arrivano anche durante le attese degli inviti.
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("myid", myid, filters=filters.ChatType.PRIVATE))
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    application.add_handler(CommandHandler("stopinviti", stop_link_invites, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CallbackQueryHandler(public_link_preference, pattern=r"^link_opt(?:in|out)$"))
+    application.add_handler(CallbackQueryHandler(welcome_exit, pattern=r"^welcome_exit:"))
+    application.add_handler(CallbackQueryHandler(buttons))
+
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            welcome_new_members,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.LEFT_CHAT_MEMBER,
+            delete_left_member_notice,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS,
+            moderate_group_b_links,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & filters.TEXT
+            & ~filters.COMMAND,
+            text_input,
+        )
+    )
+
+    logger.info(
+        "BestPrice Member Manager "
+        "V4.9.9.20 avviato"
+    )
+
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
