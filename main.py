@@ -1536,8 +1536,7 @@ async def scheduled_message_screen():
     if scheduled_message_job:
         lines += ["", "Stato: " + scheduled_message_job.get("status", ""), f"Avanzamento: {scheduled_message_job.get('index', 0)}/{len(scheduled_message_job.get('steps', []))}"]
         lines += scheduled_message_job.get("results", [])[-3:]
-    active = scheduled_message_task is not None and not scheduled_message_task.done()
-    rows = [[InlineKeyboardButton("📋 Destinatari", callback_data="scheduled:recipients")], [InlineKeyboardButton("✏️ Testo del messaggio", callback_data="scheduled:text")], [InlineKeyboardButton("🕒 Programmazione", callback_data="scheduled:time")], [InlineKeyboardButton("⏹ Interrompi" if active else "▶️ Avvia invio", callback_data="scheduled:stop" if active else "scheduled:start")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="scheduled:menu")], [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]]
+    rows = [[InlineKeyboardButton("✏️ Testo del messaggio", callback_data="scheduled:text")], [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]]
     return "\n".join(lines)[:3900], panel_markup(rows, include_invite_stop=False)
 
 async def save_scheduled_messages():
