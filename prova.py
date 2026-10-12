@@ -914,7 +914,7 @@ async def add_log(
 def readable_log(message):
     if "🔌 Connessione iniziale" in message or "📥 EVENTO JOIN" in message:
         return None
-    if ⚙️ Avvio V" in message:
+    if "⚙️ Avvio V" in message:
         message = re.sub(r"\[ACCOUNT [^\]]+\]\s*", "", message)
         return "🖥 " + message.replace("⚙️ Avvio", "Bot avviato")
     if "👋 BENVENUTO PUBBLICO INVIATO" in message:
@@ -1296,7 +1296,7 @@ async def prepare_screen():
             lines.append("Prossima operazione: " + datetime.fromtimestamp(prepare_job["next_at"], tz=now_it().tzinfo).strftime("%d/%m %H:%M"))
         lines += prepare_job.get("results", [])[-6:]
     rows = [[InlineKeyboardButton(f"👥 Seleziona sessioni ({len(slots)})", callback_data="prep:sessions")]]
-    rows.append([InlineKeyboardButton(⚙️ Operazioni da eseguire", callback_data="prep:operations")])
+    rows.append([InlineKeyboardButton("⚙️ Operazioni da eseguire", callback_data="prep:operations")])
     rows.append([InlineKeyboardButton("📨 Messaggi programmati", callback_data="scheduled:menu")])
     preparing = prepare_task is not None and not prepare_task.done() and prepare_job.get("status") == "in corso"
     rows.extend([[InlineKeyboardButton(f"⏱ Intervallo: {interval} minuti", callback_data="prep:interval")], [InlineKeyboardButton("⏹ Interrompi" if preparing else "▶️ Avvia preparazione", callback_data="prep:stop" if preparing else "prep:start")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="prep:menu")], [InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")]])
@@ -1386,7 +1386,7 @@ async def run_prepare(application):
             except Exception as exc:
                 if isinstance(exc, FloodWaitError):
                     await set_setting(f"profile_pause_{slot}", now_it().timestamp() + exc.seconds)
-                result = ⚠️ " + safe_connection_error(exc)
+                result = "⚠️ " + safe_connection_error(exc)
                 
             prepare_job["results"].append(f"ACCOUNT {slot}: {result}")
             await add_log("⚙️ PREPARAZIONE — " + result, session_id=slot)
@@ -1440,7 +1440,7 @@ async def prepare_action(update, context, data):
             await set_setting("prepare_selected", json.dumps({str(i): session_info[i]["user_id"] for i in slots}))
         rows = []
         for slot in ACCOUNT_IDS:
-            icon = "✅" if slot in slots else ⬜️"
+            icon = "✅" if slot in slots else "⬜️"
             suffix = " — non disponibile" if not session_info[slot]["ready"] else ""
             rows.append([InlineKeyboardButton(f"{icon} {session_button_name(slot)}{suffix}", callback_data=f"prep:session:{slot}")])
         rows.append([InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")])
