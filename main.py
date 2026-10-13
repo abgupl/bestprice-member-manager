@@ -75,10 +75,10 @@ def InlineKeyboardButton(text, *args, **kwargs):
     return TelegramInlineKeyboardButton(button_label(text), *args, **kwargs)
 
 
-def panel_markup(rows, include_invite_stop=True):
-    """Lascia lo stop accessibile nei pannelli amministrativi."""
+def panel_markup(rows, include_invite_stop=False):
+    """Mostra lo stop soltanto nei pannelli inviti che lo richiedono."""
     rows = [list(row) for row in rows]
-    if include_invite_stop and (operation_busy() or state["auto_enabled"]):
+    if include_invite_stop and state["running"]:
         if not any(getattr(button, "callback_data", None) == "stop" for row in rows for button in row):
             rows.insert(0, [InlineKeyboardButton("🛑 Ferma inviti", callback_data="stop")])
     return InlineKeyboardMarkup(rows)
@@ -112,6 +112,7 @@ logger = logging.getLogger(__name__)
 # =========================================================
 
 ACCOUNT_IDS = tuple(range(1, 7))
+PROXY_IDS = tuple(range(1, 7))
 session_clients = {}
 session_info = {}
 session_context = ContextVar("telegram_account", default=None)
@@ -127,8 +128,8 @@ def account_suffix(account_id):
 
 def proxy_for_account(account_id):
     slot = int(os.environ.get(f"SESSION_PROXY_{account_id}", "1" if account_id <= 3 else "2"))
-    if slot not in (1, 2):
-        raise ValueError("SESSION_PROXY deve essere 1 oppure 2")
+    if slot not in PROXY_IDS:
+        raise ValueError("SESSION_PROXY deve essere un numero da 1 a 6")
     host = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
     if not host:
         raise ValueError(f"PROXY_{slot}_HOST mancante")
@@ -180,7 +181,7 @@ for account_id in ACCOUNT_IDS:
 
 def safe_connection_error(exc):
     message = str(exc)
-    for slot in (1, 2):
+    for slot in PROXY_IDS:
         for field in ("PASSWORD", "USERNAME"):
             value = os.environ.get(f"PROXY_{slot}_{field}", "")
             if value:
@@ -1298,7 +1299,7 @@ async def prepare_screen():
     rows = [[InlineKeyboardButton(f"👥 Seleziona sessioni ({len(slots)})", callback_data="prep:sessions")]]
     rows.append([InlineKeyboardButton("⚙️ Operazioni da eseguire", callback_data="prep:operations")])
     rows.append([InlineKeyboardButton("📨 Invia messaggi", callback_data="preparemsg:menu")])
-    preparing = prepare_task is not None and not prepare_task.done() and prepare_job.get("status") == "in corso"
+    preparing = prepare_job.get("status") == "in corso"
     rows.extend([[InlineKeyboardButton(f"⏱ Intervallo: {interval} minuti", callback_data="prep:interval")], [InlineKeyboardButton("⏹ Interrompi" if preparing else "▶️ Avvia preparazione", callback_data="prep:stop" if preparing else "prep:start")], [InlineKeyboardButton("🔄 Aggiorna avanzamento", callback_data="prep:menu")], [InlineKeyboardButton("⬅️ Gestione sessioni", callback_data="sessions")]])
     return "\n".join(lines), panel_markup(rows, include_invite_stop=False)
 async def prepare_profile(slot, owner):
@@ -1334,6 +1335,22 @@ async def prepare_profile(slot, owner):
     session_info[slot].update(name=role, display_name=role, username=username)
     return "✅ Profilo creato: " + role
 
+async def refresh_prepare_panel(application):
+    chat_id = prepare_job.get("panel_chat_id")
+    message_id = prepare_job.get("panel_message_id")
+    if not chat_id or not message_id:
+        return
+    try:
+        text, markup = await prepare_screen()
+        await application.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
+    except RetryAfter:
+        # L'aggiornamento del pannello non deve bloccare le operazioni.
+        logger.warning("Aggiornamento pannello preparazione temporaneamente limitato")
+    except Exception as exc:
+        if "message is not modified" not in str(exc).lower():
+            logger.warning("Aggiornamento pannello preparazione non riuscito: %s", type(exc).__name__)
+
+
 async def run_prepare(application):
     try:
         while prepare_job.get("status") == "in corso" and prepare_job["index"] < len(prepare_job["steps"]):
@@ -1347,6 +1364,7 @@ async def run_prepare(application):
             prepare_job["current"] = f"ACCOUNT {slot} — " + ("profilo" if action_type == "profiles" else "ingresso nel gruppo B" if action_type == "join" else f"messaggio ad account {step.get('target_slot')}")
             prepare_job["inflight"] = True
             await save_prepare_job()
+            await refresh_prepare_panel(application)
             try:
                 if slot not in ACCOUNT_IDS or not session_info[slot]["ready"]:
                     raise ValueError("Sessione non disponibile")
@@ -1403,6 +1421,7 @@ async def run_prepare(application):
                 prepare_job["status"] = "completata"
                 prepare_job["next_at"] = 0
             await save_prepare_job()
+            await refresh_prepare_panel(application)
             
         if prepare_job.get("status") == "completata":
             await add_log("✅ PREPARAZIONE TERMINATA — " + str(prepare_job["index"]) + " operazioni elaborate; consulta i risultati per eventuali errori", session_id=0)
@@ -1417,9 +1436,11 @@ async def run_prepare(application):
         prepare_job["status"] = "interrotta per errore"
         prepare_job.setdefault("results", []).append(safe_connection_error(exc))
         await save_prepare_job()
+        await refresh_prepare_panel(application)
 
 async def prepare_action(update, context, data):
     global prepare_task, prepare_job
+    start_prepare = False
     if not data.startswith("prep:"):
         return False
     query = update.callback_query
@@ -1527,10 +1548,15 @@ async def prepare_action(update, context, data):
             prepare_job = {"status": "in corso", "index": 0, "steps": steps, "interval": interval, "next_at": 0, "inflight": False, "results": [], "group": dict(state["group_b"]) if state["group_b"] else None, "chat_id": update.effective_chat.id}
             await save_prepare_job()
             await add_log("⚙️ PREPARAZIONE AVVIATA — account: " + ", ".join(str(i) for i in slots) + " — operazioni: " + ", ".join(actions) + f" — intervallo {interval} minuti", session_id=0)
-            prepare_task = asyncio.create_task(run_prepare(context.application))
+            start_prepare = True
             
     text, markup = await prepare_screen()
     await query.edit_message_text(text, reply_markup=markup)
+    prepare_job["panel_chat_id"] = update.effective_chat.id
+    prepare_job["panel_message_id"] = query.message.message_id
+    await save_prepare_job()
+    if start_prepare:
+        prepare_task = asyncio.create_task(run_prepare(context.application))
     return True
 async def prepare_message_screen():
     slots, _ = await prepare_choices()
@@ -1995,18 +2021,20 @@ ip_checks = {}
 
 
 def proxy_keyboard():
-    return panel_markup([
-        [InlineKeyboardButton("🧪 TEST PROXY 1", callback_data="proxy_test:1"),
-         InlineKeyboardButton("🧪 TEST PROXY 2", callback_data="proxy_test:2")],
+    rows = []
+    for offset in range(0, len(PROXY_IDS), 2):
+        rows.append([InlineKeyboardButton(f"🧪 TEST PROXY {slot}", callback_data=f"proxy_test:{slot}") for slot in PROXY_IDS[offset:offset + 2]])
+    rows.extend([
         [InlineKeyboardButton("🔎 IP TELEGRAM — SESSIONE ATTIVA", callback_data="proxy_ip")],
         [InlineKeyboardButton("🔄 AGGIORNA", callback_data="proxy_status")],
         [InlineKeyboardButton("⬅️ Diagnostica", callback_data="menu_diagnostics")],
     ])
+    return panel_markup(rows)
 
 
 async def proxy_status_text():
     lines = ["🌐 PROXY / DIAGNOSTICA", ""]
-    for slot in (1, 2):
+    for slot in PROXY_IDS:
         host = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
         port = os.environ.get(f"PROXY_{slot}_PORT", "50101")
         accounts = [str(i) for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot]
@@ -2024,7 +2052,7 @@ async def proxy_status_text():
 
 
 async def test_proxy_connection(slot):
-    if slot not in (1, 2):
+    if slot not in PROXY_IDS:
         raise ValueError("Proxy non valido")
     sock = None
     stamp = now_it().strftime("%H:%M:%S")
@@ -3206,7 +3234,7 @@ def invites_keyboard():
         [InlineKeyboardButton("👤 Invito manuale", callback_data="manual_invite")],
         [InlineKeyboardButton("🤖 Automatico", callback_data="auto_menu")],
         [InlineKeyboardButton("⬅️ Menu principale", callback_data="home")],
-    ])
+    ], include_invite_stop=True)
 
 
 def automatic_keyboard():
@@ -3214,7 +3242,7 @@ def automatic_keyboard():
     if state["running"] or state["auto_enabled"]:
         if not state["running"]:
             rows.append([InlineKeyboardButton("▶️ Avvia ora", callback_data="start_now")])
-        rows.append([InlineKeyboardButton("🛑 Ferma automatico", callback_data="auto_stop")])
+        rows.append([InlineKeyboardButton("🛑 Ferma automatico" if state["running"] else "⛔ Disattiva programmazione", callback_data="auto_stop")])
     else:
         rows.append([InlineKeyboardButton("▶️ Avvia automatico", callback_data="start_run")])
     rows.extend([
@@ -5404,8 +5432,6 @@ async def start(
 async def callback_notice(query, text, show_alert=False):
     """L'ack iniziale chiude lo spinner; gli avvisi successivi restano in chat."""
     rows = []
-    if state["running"] or (worker_task is not None and not worker_task.done()):
-        rows.append([InlineKeyboardButton("🛑 FERMA AUTO", callback_data="stop")])
     rows.append([InlineKeyboardButton("⬅️ Menu principale", callback_data="home")])
     await query.message.reply_text(text, reply_markup=panel_markup(rows))
     await add_log(f"ℹ️ Pannello — {text}", "WARNING")
@@ -5429,6 +5455,9 @@ async def buttons(
     await query.answer()
 
     data = query.data
+    if query.message and prepare_job.get("panel_chat_id") == update.effective_chat.id and prepare_job.get("panel_message_id") == query.message.message_id:
+        prepare_job.pop("panel_message_id", None)
+        await save_prepare_job()
     if await prepare_message_action(update, context, data):
         return
     if data in {"home", "sessions"} or data.startswith("prep:"):
@@ -5684,7 +5713,7 @@ async def buttons(
             await check_telegram_ip(current_session_id())
         else:
             value = data.split(":", 1)[1]
-            if value not in {"1", "2"}:
+            if value not in {str(slot) for slot in PROXY_IDS}:
                 await callback_notice(query, "Proxy non valido.")
                 return
             await test_proxy_connection(int(value))
@@ -7080,8 +7109,8 @@ def added_client(session_string=""):
     proxy_slot = os.environ.get("ADDED_SESSION_PROXY", "").strip()
     if proxy_slot:
         slot = int(proxy_slot)
-        if slot not in (1, 2):
-            raise ValueError("ADDED_SESSION_PROXY deve essere 1 oppure 2")
+        if slot not in PROXY_IDS:
+            raise ValueError("ADDED_SESSION_PROXY deve essere un numero da 1 a 6")
         # Riutilizza configurazione e validazione già presenti nel progetto.
         proxy_account = next((i for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot), None)
         if proxy_account is None:
