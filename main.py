@@ -2149,32 +2149,7 @@ proxy_checks = {}
 
 
 def proxy_keyboard():
-    rows = []
-    for offset in range(0, len(PROXY_IDS), 2):
-        rows.append([InlineKeyboardButton(f"🧪 TEST PROXY {slot}", callback_data=f"proxy_test:{slot}") for slot in PROXY_IDS[offset:offset + 2]])
-    rows.extend([
-        [InlineKeyboardButton("🔍 Verifica tutte le sessioni", callback_data="proxy_all")],
-        [InlineKeyboardButton("🔄 AGGIORNA", callback_data="proxy_status")],
-        [InlineKeyboardButton("⬅️ Diagnostica", callback_data="menu_diagnostics")],
-    ])
-    return panel_markup(rows)
-
-
-async def proxy_status_text():
-    lines = ["🔍 VERIFICA TUTTE LE SESSIONI E PROXY", "Premi Verifica tutte le sessioni per controllare gli account e i rispettivi proxy.", ""]
-    for slot in PROXY_IDS:
-        host = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
-        port = os.environ.get(f"PROXY_{slot}_PORT", "50101")
-        accounts = [str(i) for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot]
-        lines.extend([f"PROXY {slot} — SOCKS5 {host or 'non configurato'}:{port}",
-                      "Account configurati: " + (", ".join(accounts) or "nessuno"),
-                      proxy_checks.get(slot, "⚪ Non ancora testato in questo avvio"), ""])
-    account_id = state["active_session"]
-    lines.extend(["Sessione attiva: " + session_label(account_id),
-                  "Il test verifica autenticazione SOCKS5 e apertura di una connessione verso Telegram.",
-                  "Un risultato positivo non certifica l'assenza di limitazioni antispam.",
-                  "Questi controlli non inviano inviti e non rimuovono i blocchi locali."])
-    return "\n".join(lines)
+    return panel_markup([[InlineKeyboardButton("⬅️ Diagnostica", callback_data="menu_diagnostics")]])
 
 
 async def test_proxy_connection(slot, account_id=None):
@@ -3423,8 +3398,6 @@ def diagnostics_menu_keyboard():
          InlineKeyboardButton("📊 Statistiche", callback_data="statistics")],
         [InlineKeyboardButton("🔍 Verifica tutte le sessioni", callback_data="proxy_all")],
     ]
-    if state["telegram_locked"]:
-        rows.append([InlineKeyboardButton("🔓 Riabilita inviti", callback_data="unlock_confirm")])
     rows.append([InlineKeyboardButton("⬅️ Menu principale", callback_data="home")])
     return panel_markup(rows)
 
@@ -5885,23 +5858,11 @@ async def buttons(
             await set_setting("member_filters", json.dumps(config))
         await query.edit_message_text(await member_filters_text(), reply_markup=await member_filters_keyboard())
         return
-    if data == "proxy_status":
-        await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
-        return
-    if data.startswith("proxy_test:") or data in {"proxy_ip", "proxy_all"}:
+    if data == "proxy_all":
         if operation_busy():
-            await callback_notice(query, "Ferma le operazioni prima di eseguire la diagnostica proxy.")
+            await callback_notice(query, "Ferma le operazioni prima di verificare sessioni e proxy.")
             return
-        if data in {"proxy_all", "proxy_ip"}:
-            await verify_all_session_connections(query)
-            return
-        await query.edit_message_text("🌐 Verifica proxy in corso… Nessun invito verrà inviato.")
-        value = data.split(":", 1)[1]
-        if value not in {str(slot) for slot in PROXY_IDS}:
-            await callback_notice(query, "Proxy non valido.")
-            return
-        await test_proxy_connection(int(value))
-        await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
+        await verify_all_session_connections(query)
         return
     if data == "sessions":
         await reply_long(query.message, await sessions_text(), sessions_keyboard(), edit=True)
