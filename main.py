@@ -1280,6 +1280,121 @@ async def prepare_choices():
             eligible.append(slot)
     return eligible, [a for a in ("profiles", "join", "messages") if a in actions]
 
+PREPARE_CHAT_PHRASES = (
+    ("Ciao! Come va oggi?", "Come sta andando la giornata?", "Spero che la giornata stia andando bene.",
+     "Oggi mi prendo un momento di pausa.", "Ogni tanto una pausa ci vuole.", "Hai programmi per più tardi?",
+     "Un saluto e buona giornata!", "Ci sentiamo più tardi.", "Tutto tranquillo da queste parti.",
+     "Spero sia una giornata serena.", "Per ora mi godo un po' di tranquillità.", "A presto!"),
+    ("Una passeggiata ogni tanto ci vuole.", "Mi piace stare un po' all'aria aperta.", "Preferisci il mare o la montagna?",
+     "Una giornata al mare sarebbe piacevole.", "Anche la montagna ha il suo fascino.", "Mi piacciono i posti tranquilli.",
+     "A volte basta una passeggiata breve.", "Un po' di aria fresca fa piacere.", "Hai un posto preferito per camminare?",
+     "Mi piace scoprire posti nuovi.", "Sarebbe bello organizzare una piccola gita.", "Ci aggiorniamo sui prossimi programmi."),
+    ("Hai ascoltato qualcosa di interessante ultimamente?", "Mi piace ascoltare musica mentre mi rilasso.",
+     "Ogni tanto cerco qualche canzone nuova.", "Una bella playlist cambia l'atmosfera.", "Preferisci musica tranquilla o movimentata?",
+     "Dipende sempre dal momento della giornata.", "Anche un film ogni tanto è una buona idea.", "Hai qualche film da suggerire?",
+     "Mi piacciono le storie leggere.", "È bello staccare un po' dalla routine.", "Una serata tranquilla ci sta.", "Ne riparliamo con calma."),
+)
+
+
+async def prepare_message_steps(selected_senders, require_preview_match=False):
+    count = int(await get_setting("prepare_message_count", "3"))
+    eligible = []
+    for slot in ACCOUNT_IDS:
+        info = session_info[slot]
+        record = await registry_for(slot)
+        if info["ready"] and info.get("user_id") and not info["telegram_locked"] and not info["telegram_restriction_detected"] and not record.get("halted_reason"):
+            eligible.append(slot)
+    selected = [slot for slot in selected_senders if slot in eligible]
+    signature = json.dumps({"selected": selected, "eligible": [(i, session_info[i]["user_id"]) for i in eligible],
+                            "text_mode": "random_phrases_v1", "count": count,
+                            "interval": await get_setting("prepare_interval", "60"),
+                            "actions": await get_setting("prepare_actions", '["profiles", "join", "messages"]')}, sort_keys=True)
+    try:
+        cached = json.loads(await get_setting("prepare_message_preview", "{}"))
+    except (ValueError, TypeError):
+        cached = {}
+    if cached.get("signature") == signature:
+        return cached["steps"]
+    if require_preview_match and cached:
+        raise ValueError("La configurazione o le sessioni sono cambiate: apri Anteprima per confermare la nuova sequenza.")
+    rng = secrets.SystemRandom()
+    directions = []
+    if len(selected) == 1:
+        targets = [i for i in eligible if i != selected[0]]
+        for target in rng.sample(targets, min(2, len(targets))):
+            directions.append((selected[0], target))
+    elif len(selected) >= 2:
+        pairs = [(a, b) for index, a in enumerate(selected) for b in selected[index + 1:]]
+        rng.shuffle(pairs)
+        for a, b in pairs:
+            if rng.randrange(2):
+                a, b = b, a
+            directions.extend([(a, b), (b, a)])
+    steps = []
+    topics = {}
+    previous_text = None
+    for sender_slot, target_slot in directions:
+        pair = tuple(sorted((sender_slot, target_slot)))
+        if pair not in topics:
+            topics[pair] = rng.choice(PREPARE_CHAT_PHRASES)
+        phrases = topics[pair]
+        sender, target = session_info[sender_slot], session_info[target_slot]
+        for number in range(1, count + 1):
+            text = rng.choice([phrase for phrase in phrases if phrase != previous_text])
+            previous_text = text
+            steps.append({"type": "messages", "slot": sender_slot, "owner": sender["user_id"],
+                          "target_slot": target_slot, "target_owner": target["user_id"],
+                          "target_username": target.get("username"), "text": text,
+                          "message_number": number, "message_count": count})
+    await set_setting("prepare_message_preview", json.dumps({"signature": signature, "steps": steps}))
+    return steps
+
+
+async def prepare_plan(slots, actions, require_preview_match=False):
+    steps = []
+    for action in actions:
+        if action in {"profiles", "join"}:
+            steps.extend({"type": action, "slot": slot, "owner": session_info[slot]["user_id"]} for slot in slots)
+        elif action == "messages":
+            steps.extend(await prepare_message_steps(slots, require_preview_match))
+    return steps
+
+
+async def prepare_preview_screen():
+    slots, actions = await prepare_choices()
+    steps = await prepare_plan(slots, actions)
+    interval = int(await get_setting("prepare_interval", "60"))
+    count = int(await get_setting("prepare_message_count", "3"))
+    messages = [step for step in steps if step["type"] == "messages"]
+    minutes = max(0, len(steps) - 1) * interval
+    lines = ["📋 ANTEPRIMA PREPARAZIONE", "", "Ordine delle operazioni:"]
+    index = 0
+    while index < len(steps):
+        step = steps[index]
+        if step["type"] == "messages":
+            lines.append(f"ACCOUNT {step['slot']} → ACCOUNT {step['target_slot']}: {count} messaggi")
+            for message_step in steps[index:index + min(count, 3)]:
+                lines.append("  • " + message_step["text"])
+            if count > 3:
+                lines.append(f"  … altri {count - 3} messaggi casuali")
+            index += count
+        else:
+            label = "Crea profilo (saltato se già preparato o con username)" if step["type"] == "profiles" else "Ingresso gruppo B (saltato se già presente)"
+            lines.append(f"ACCOUNT {step['slot']}: {label}")
+            index += 1
+    if not steps:
+        lines.append("Nessuna operazione disponibile.")
+    if len(slots) == 1 and "messages" in actions and len(messages) < 2 * count:
+        lines.append("⚠️ Meno di 2 destinatari disponibili: sono inclusi soltanto quelli operativi.")
+    lines.extend(["", f"Messaggi totali: {len(messages)}", f"Operazioni totali: {len(steps)}",
+                  f"Pausa tra ogni operazione: {interval} minuti",
+                  f"Durata stimata: {minutes // 60} ore e {minutes % 60} minuti, più il tempo delle operazioni.",
+                  "L'avvio usa questa sequenza. Se cambi impostazioni o disponibilità degli account, riapri l'anteprima."])
+    if minutes > 48 * 60:
+        lines.append("⚠️ Supera il limite di 48 ore: riduci messaggi, intervallo o sessioni prima dell'avvio.")
+    return "\n".join(lines), panel_markup([[InlineKeyboardButton("⬅️ Invia messaggi", callback_data="preparemsg:menu")], [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]], include_invite_stop=False)
+
+
 async def prepare_screen():
     slots, actions = await prepare_choices()
     interval = int(await get_setting("prepare_interval", "60"))
@@ -1288,7 +1403,7 @@ async def prepare_screen():
         "🔥 RISCALDA SESSIONI", "",
         "Seleziona gli account e spunta le operazioni da eseguire:", "",
         "🎨 Crea profili: salta gli account con username già impostato o profilo già preparato.",
-        "📨 Invia messaggi: invia il testo impostato dagli account selezionati a tutte le sessioni disponibili, escludendo sé stessi.",
+        "📨 Invia messaggi: una sessione scrive a 2 destinatari casuali; con più sessioni selezionate, ogni coppia scambia lo stesso numero di messaggi in entrambe le direzioni.",
         "🚪 Entra nel gruppo B: esegue l’ingresso soltanto per gli account non ancora presenti.", "",
         "⏱ Imposta la pausa tra le operazioni e premi Avvia preparazione.", "",
         f"Sessioni selezionate: {len(slots)}",
@@ -1368,7 +1483,7 @@ async def run_prepare(application):
             step = prepare_job["steps"][prepare_job["index"]]
             slot = step["slot"]
             action_type = step.get("type") or step.get("action", "profiles")
-            prepare_job["current"] = f"ACCOUNT {slot} — " + ("profilo" if action_type == "profiles" else "ingresso nel gruppo B" if action_type == "join" else f"messaggio ad account {step.get('target_slot')}")
+            prepare_job["current"] = f"ACCOUNT {slot} — " + ("profilo" if action_type == "profiles" else "ingresso nel gruppo B" if action_type == "join" else f"messaggio {step.get('message_number', 1)}/{step.get('message_count', 3)} ad account {step.get('target_slot')}")
             prepare_job["inflight"] = True
             await save_prepare_job()
             await refresh_prepare_panel(application)
@@ -1530,41 +1645,22 @@ async def prepare_action(update, context, data):
                 await callback_notice(query, "Spunta almeno una sessione e un’operazione; configura il gruppo B per l’ingresso.")
                 return True
             interval = int(await get_setting("prepare_interval", "60"))
-            text_template = await get_setting("scheduled_message_text", "ciao")
-            
-            steps = []
-            for a in actions:
-                if a in {"profiles", "join"}:
-                    for i in slots:
-                        steps.append({"type": a, "slot": i, "owner": session_info[i]["user_id"]})
-                elif a == "messages":
-                    for sender_slot in slots:
-                        sender_owner = session_info[sender_slot]["user_id"]
-                        for target_slot in ACCOUNT_IDS:
-                            if not session_info[target_slot]["ready"] or not session_info[target_slot].get("user_id"):
-                                continue
-                            if sender_slot == target_slot or sender_owner == session_info[target_slot]["user_id"]:
-                                continue
-                            target_record = await registry_for(target_slot)
-                            if target_record.get("halted_reason") or session_info[target_slot]["telegram_locked"] or session_info[target_slot]["telegram_restriction_detected"]:
-                                continue
-                            target_owner = session_info[target_slot]["user_id"]
-                            target_username = session_info[target_slot].get("username")
-                            steps.append({
-                                "type": "messages",
-                                "slot": sender_slot,
-                                "owner": sender_owner,
-                                "target_slot": target_slot,
-                                "target_owner": target_owner,
-                                "target_username": target_username,
-                                "text": text_template
-                            })
+            try:
+                steps = await prepare_plan(slots, actions, require_preview_match=True)
+            except ValueError as exc:
+                await callback_notice(query, str(exc))
+                return True
+
+            if not steps:
+                await callback_notice(query, "Nessuna operazione disponibile: verifica mittenti selezionati e destinatari della sequenza.")
+                return True
 
             if (len(steps) - 1) * interval > 48 * 60:
                 await callback_notice(query, "Questa combinazione supera le 48 ore: riduci l’intervallo o il numero di sessioni.")
                 return True
             prepare_job = {"status": "in corso", "index": 0, "steps": steps, "interval": interval, "next_at": 0, "inflight": False, "results": [], "group": dict(state["group_b"]) if state["group_b"] else None, "chat_id": update.effective_chat.id}
             await save_prepare_job()
+            await set_setting("prepare_message_preview", "{}")
             await add_log("⚙️ PREPARAZIONE AVVIATA — account: " + ", ".join(str(i) for i in slots) + " — operazioni: " + ", ".join(actions) + f" — intervallo {interval} minuti", session_id=0)
             start_prepare = True
             
@@ -1578,9 +1674,16 @@ async def prepare_action(update, context, data):
     return True
 async def prepare_message_screen():
     slots, _ = await prepare_choices()
-    text = await get_setting("scheduled_message_text", "ciao")
-    lines = ["📨 INVIA MESSAGGI", "", "Account selezionati: " + (", ".join(session_button_name(i) for i in slots) or "nessuno"), "Testo: " + text, "", "Ogni account selezionato invia questo testo a tutte le sessioni disponibili, escludendo sé stesso. Per avviare, spunta Invia messaggi nelle operazioni e premi Avvia preparazione in Riscalda sessioni."]
-    rows = [[InlineKeyboardButton("✏️ Testo del messaggio", callback_data="preparemsg:text")], [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]]
+    count = int(await get_setting("prepare_message_count", "3"))
+    lines = ["📨 INVIA MESSAGGI", "", "Sessioni selezionate: " + (", ".join(session_button_name(i) for i in slots) or "nessuna"),
+             "Testi: brevi frasi casuali in italiano, scelte automaticamente dal bot.", f"Messaggi per direzione: {count}", "",
+             "Una sessione selezionata: invia a 2 destinatari casuali, senza risposta automatica.",
+             "Due o più sessioni: ogni coppia selezionata comunica una volta, con lo stesso numero di messaggi in uscita e in risposta. Ordine casuale.",
+             "Sessioni sospese o non disponibili escluse. La pausa è tra ogni singolo messaggio.",
+             "Apri Anteprima per vedere ordine, totale e durata. Avvia da Riscalda sessioni."]
+    rows = [[InlineKeyboardButton(f"🔢 Messaggi per direzione: {count}", callback_data="preparemsg:count")],
+            [InlineKeyboardButton("📋 Anteprima", callback_data="preparemsg:preview")],
+            [InlineKeyboardButton("⬅️ Riscalda sessioni", callback_data="prep:menu")]]
     return "\n".join(lines)[:3900], panel_markup(rows, include_invite_stop=False)
 
 async def prepare_message_action(update, context, data):
@@ -1593,28 +1696,34 @@ async def prepare_message_action(update, context, data):
     context.user_data.pop("prepare_message_input", None)
     state["waiting_for"] = None
     context.user_data.pop("feature_input", None)
-    if data == "preparemsg:text":
+    if data in {"preparemsg:count", "preparemsg:preview"}:
         if operation_busy() or state["auto_enabled"]:
-            await callback_notice(query, "Interrompi le operazioni e disattiva AUTO prima di modificare il testo.")
+            await callback_notice(query, "Interrompi le operazioni e disattiva AUTO prima di configurare o generare l'anteprima.")
             return True
-        context.user_data["prepare_message_input"] = True
-        await query.edit_message_text("Scrivi il testo da inviare (massimo 1000 caratteri).", reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Invia messaggi", callback_data="preparemsg:menu")]], include_invite_stop=False))
+        if data == "preparemsg:preview":
+            text, markup = await prepare_preview_screen()
+            await reply_long(query.message, text, markup, edit=True)
+            return True
+        context.user_data["prepare_message_input"] = "count"
+        prompt = "Scrivi il numero di messaggi per ogni direzione (da 1 a 20). Esempio: 3 = 3 invii e 3 risposte per coppia. Con una sola sessione non ci sono risposte automatiche."
+        await query.edit_message_text(prompt, reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Invia messaggi", callback_data="preparemsg:menu")]], include_invite_stop=False))
         return True
     text, markup = await prepare_message_screen()
     await query.edit_message_text(text, reply_markup=markup)
     return True
 
 async def prepare_message_input(update, context):
-    if not context.user_data.get("prepare_message_input"):
+    target = context.user_data.get("prepare_message_input")
+    if not target:
         return False
     if update.effective_chat.type != "private" or operation_busy() or state["auto_enabled"]:
         await update.message.reply_text("Interrompi le operazioni prima di cambiare le impostazioni.")
         return True
     value = update.message.text.strip()
-    if not value or len(value) > 1000:
-        await update.message.reply_text("❌ Scrivi da 1 a 1000 caratteri")
+    if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= 20:
+        await update.message.reply_text("❌ Inserisci un numero intero da 1 a 20")
         return True
-    await set_setting("scheduled_message_text", value)
+    await set_setting("prepare_message_count", int(value))
     context.user_data.pop("prepare_message_input", None)
     text, markup = await prepare_message_screen()
     await update.message.reply_text(text, reply_markup=markup)
@@ -2040,7 +2149,7 @@ def proxy_keyboard():
 
 
 async def proxy_status_text():
-    lines = ["🌐 PROXY / DIAGNOSTICA", ""]
+    lines = ["🔍 VERIFICA TUTTE LE SESSIONI E PROXY", "Premi Verifica tutte le sessioni per controllare gli account e i rispettivi proxy.", ""]
     for slot in PROXY_IDS:
         host = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
         port = os.environ.get(f"PROXY_{slot}_PORT", "50101")
@@ -3300,7 +3409,6 @@ def diagnostics_menu_keyboard():
     rows = [
         [InlineKeyboardButton("📋 Log", callback_data="logs"),
          InlineKeyboardButton("📊 Statistiche", callback_data="statistics")],
-        [InlineKeyboardButton("🌐 Proxy / diagnostica", callback_data="proxy_status")],
         [InlineKeyboardButton("🔍 Verifica tutte le sessioni", callback_data="proxy_all")],
     ]
     if state["telegram_locked"]:
