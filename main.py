@@ -3465,6 +3465,31 @@ async def selected_account_status(account_id, record=None):
     return "\n".join(lines)
 
 
+def current_operation_text():
+    lines = []
+    if prepare_job.get("status") == "in corso":
+        total = len(prepare_job.get("steps", []))
+        completed = prepare_job.get("index", 0)
+        lines.extend(["🔥 Preparazione sessioni in corso", f"Avanzamento: {completed}/{total}"])
+        current = prepare_job.get("current")
+        if current:
+            label = "Operazione in esecuzione" if prepare_job.get("inflight") else "Ultima operazione"
+            lines.append(label + ": " + current)
+        if not prepare_job.get("inflight") and prepare_job.get("next_at"):
+            stamp = datetime.fromtimestamp(prepare_job["next_at"], tz=now_it().tzinfo)
+            lines.append("⏳ Prossima operazione: " + stamp.strftime("%d/%m %H:%M"))
+        lines.append("Controlli: Gestione sessioni → Riscalda sessioni")
+    if state.get("running"):
+        lines.append("📤 Inviti automatici in corso — " + session_button_name(state["active_session"]))
+    if state.get("contact_queue_running"):
+        lines.append("📒 Inviti dalla rubrica in corso")
+    if state.get("manual_running"):
+        lines.append("👤 Invito manuale in corso")
+    if not lines:
+        return "⚪ Nessuna operazione in corso"
+    return "🟠 OPERAZIONE IN CORSO\n" + "\n".join(lines)
+
+
 async def home_text():
     account_id = state["active_session"]
     counts = {"🟢": 0, "🟡": 0, "🔴": 0}
@@ -3482,6 +3507,7 @@ async def home_text():
         automatic = "⏸ Automatico disattivato"
     return (
         "👥 BESTPRICE MEMBER MANAGER V4.9.9.20\n\n"
+        + current_operation_text() + "\n\n"
         + await selected_account_status(account_id, active_record)
         + f"\n\n👥 Sessioni: {len(ACCOUNT_IDS)}\n"
         + f"🟢 Abilitate: {counts['🟢']}\n"
