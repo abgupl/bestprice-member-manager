@@ -1177,6 +1177,8 @@ async def connect_session(account_id):
             await db.commit()
     except Exception as exc:
         info["ready"] = False
+        if isinstance(exc, PeerFloodError):
+            await halt_session(account_id, "PeerFloodError durante connessione")
         info["error"] = safe_connection_error(exc)
         if info.get("user_id"):
             async with aiosqlite.connect(DB_PATH) as db:
@@ -1271,7 +1273,12 @@ async def prepare_choices():
     except (TypeError, ValueError):
         selected, actions = {}, []
     slots = [i for i in ACCOUNT_IDS if session_info[i]["ready"] and str(selected.get(str(i))) == str(session_info[i]["user_id"])]
-    return slots, [a for a in ("profiles", "join", "messages") if a in actions]
+    eligible = []
+    for slot in slots:
+        record = await registry_for(slot)
+        if not record.get("halted_reason") and not session_info[slot]["telegram_locked"] and not session_info[slot]["telegram_restriction_detected"]:
+            eligible.append(slot)
+    return eligible, [a for a in ("profiles", "join", "messages") if a in actions]
 
 async def prepare_screen():
     slots, actions = await prepare_choices()
@@ -1368,6 +1375,9 @@ async def run_prepare(application):
             try:
                 if slot not in ACCOUNT_IDS or not session_info[slot]["ready"]:
                     raise ValueError("Sessione non disponibile")
+                record = await registry_for(slot)
+                if record.get("halted_reason") or session_info[slot]["telegram_locked"] or session_info[slot]["telegram_restriction_detected"]:
+                    raise ValueError("Sessione sospesa; operazione saltata")
                 client = session_clients[slot]
                 
                 me = await asyncio.wait_for(client.get_me(), 15)
@@ -1388,6 +1398,9 @@ async def run_prepare(application):
                     result = await join_destination_once(slot, reference, group)
                 elif action_type == "messages":
                     target_owner = step.get("target_owner")
+                    target_record = await registry_for(step["target_slot"])
+                    if target_record.get("halted_reason") or session_info[step["target_slot"]]["telegram_locked"] or session_info[step["target_slot"]]["telegram_restriction_detected"]:
+                        raise ValueError("Sessione destinataria sospesa; invio saltato")
                     target_info = session_info.get(step.get("target_slot"), {})
                     if target_info.get("user_id") != target_owner:
                         raise ValueError("Account destinatario cambiato: invio annullato")
@@ -1408,6 +1421,8 @@ async def run_prepare(application):
                     await asyncio.wait_for(client.send_message(recipient, step["text"], parse_mode=None), 20)
                     result = f"✅ Messaggio inviato ad account {step.get('target_slot')}"
             except Exception as exc:
+                if isinstance(exc, PeerFloodError):
+                    await halt_session(slot, "PeerFloodError durante preparazione")
                 if isinstance(exc, FloodWaitError):
                     await set_setting(f"profile_pause_{slot}", now_it().timestamp() + exc.seconds)
                 result = "⚠️ " + safe_connection_error(exc)
@@ -1529,6 +1544,9 @@ async def prepare_action(update, context, data):
                             if not session_info[target_slot]["ready"] or not session_info[target_slot].get("user_id"):
                                 continue
                             if sender_slot == target_slot or sender_owner == session_info[target_slot]["user_id"]:
+                                continue
+                            target_record = await registry_for(target_slot)
+                            if target_record.get("halted_reason") or session_info[target_slot]["telegram_locked"] or session_info[target_slot]["telegram_restriction_detected"]:
                                 continue
                             target_owner = session_info[target_slot]["user_id"]
                             target_username = session_info[target_slot].get("username")
@@ -1679,34 +1697,24 @@ async def session_card_text(account_id):
 
 async def session_card_keyboard(account_id):
     record = await registry_for(account_id)
-    try:
-        diagnosis = json.loads(record.get("diagnosis", "{}"))
-    except (ValueError, TypeError):
-        diagnosis = {}
-    rows = [[InlineKeyboardButton("🔎 Diagnostica", callback_data="sf:diagnose")]]
-    if diagnosis.get("group_id") == (state["group_b"] or {}).get("id") and diagnosis.get("membership") == "absent":
-        rows.append([InlineKeyboardButton("🚪 Entra nel gruppo B", callback_data="jb:setup")])
-    rows.append([InlineKeyboardButton("⚙️ Gestisci account", callback_data="sf:manage")])
-    rows.append([InlineKeyboardButton("⬅️ Elenco sessioni", callback_data="sf:list")])
-    return panel_markup(rows)
-
-
-async def account_management_keyboard(account_id):
-    record = await registry_for(account_id)
-    remaining = wait_remaining(record)
     info = session_info[account_id]
     rows = [[InlineKeyboardButton("🔌 Verifica connessione e SpamBot", callback_data=f"check_session:{account_id}")],
             [InlineKeyboardButton("📨 Messaggi ricevuti", callback_data=f"inbox:list:{account_id}:0")],
-            [InlineKeyboardButton("🎲 Genera profilo", callback_data=f"profile_new:{account_id}")]]
-    if remaining is None and info["user_id"]:
+            [InlineKeyboardButton("🎲 Genera profilo", callback_data=f"profile_new:{account_id}")],
+            [InlineKeyboardButton("🚪 Entra nel gruppo B", callback_data="jb:setup")]]
+    if info.get("user_id"):
+        action = "resume" if record.get("manual_reason") else "suspend"
+        label = "▶️ Riattiva sospensione manuale" if action == "resume" else "⏸ Sospendi sessione"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sf:{action}:{account_id}")])
+    if wait_remaining(record) is None and info.get("user_id"):
         rows.append([InlineKeyboardButton("⏳ Inizia attesa", callback_data="sf:age")])
-    elif remaining == 0 and (not record.get("approved") or record.get("halted_reason")) and not info["telegram_locked"] and not info["telegram_restriction_detected"]:
-        rows.append([InlineKeyboardButton("✅ Abilita sessione", callback_data="sf:enable")])
-    if info["telegram_locked"]:
+    if info["telegram_locked"] or info["telegram_restriction_detected"]:
         rows.append([InlineKeyboardButton("🔒 Gestisci blocco", callback_data="unlock_confirm")])
     rows.extend([[InlineKeyboardButton("🗑 Elimina sessione", callback_data=f"delete_session:{account_id}")],
-                 [InlineKeyboardButton("⬅️ Scheda sessione", callback_data="sf:card")]])
+                 [InlineKeyboardButton("⬅️ Elenco sessioni", callback_data="sf:list")]])
     return panel_markup(rows)
+
+
 
 
 PROFILE_COLORS = ((36, 43, 56), (38, 62, 73), (49, 66, 61), (58, 47, 67), (81, 59, 43), (42, 60, 65))
@@ -2017,7 +2025,6 @@ async def profile_action(update, context):
 
 
 proxy_checks = {}
-ip_checks = {}
 
 
 def proxy_keyboard():
@@ -2025,7 +2032,7 @@ def proxy_keyboard():
     for offset in range(0, len(PROXY_IDS), 2):
         rows.append([InlineKeyboardButton(f"🧪 TEST PROXY {slot}", callback_data=f"proxy_test:{slot}") for slot in PROXY_IDS[offset:offset + 2]])
     rows.extend([
-        [InlineKeyboardButton("🔎 IP TELEGRAM — SESSIONE ATTIVA", callback_data="proxy_ip")],
+        [InlineKeyboardButton("🔍 Verifica tutte le sessioni", callback_data="proxy_all")],
         [InlineKeyboardButton("🔄 AGGIORNA", callback_data="proxy_status")],
         [InlineKeyboardButton("⬅️ Diagnostica", callback_data="menu_diagnostics")],
     ])
@@ -2043,15 +2050,13 @@ async def proxy_status_text():
                       proxy_checks.get(slot, "⚪ Non ancora testato in questo avvio"), ""])
     account_id = state["active_session"]
     lines.extend(["Sessione attiva: " + session_label(account_id),
-                  ip_checks.get(account_id, "⚪ IP visto da Telegram non ancora verificato"), "",
                   "Il test verifica autenticazione SOCKS5 e apertura di una connessione verso Telegram.",
-                  "L'IP è quello riportato da Telegram per l'autorizzazione corrente: può essere aggiornato con ritardo.",
                   "Un risultato positivo non certifica l'assenza di limitazioni antispam.",
                   "Questi controlli non inviano inviti e non rimuovono i blocchi locali."])
     return "\n".join(lines)
 
 
-async def test_proxy_connection(slot):
+async def test_proxy_connection(slot, account_id=None):
     if slot not in PROXY_IDS:
         raise ValueError("Proxy non valido")
     sock = None
@@ -2062,7 +2067,9 @@ async def test_proxy_connection(slot):
         candidates = [i for i in ACCOUNT_IDS if session_info[i]["proxy_slot"] == slot]
         if not candidates:
             raise ValueError("Nessuna sessione configurata per questo proxy")
-        account_id = candidates[0]
+        account_id = account_id if account_id is not None else candidates[0]
+        if account_id not in candidates:
+            raise ValueError("Proxy non assegnato alla sessione richiesta")
         _, config = proxy_for_account(account_id)
         client = session_clients.get(account_id)
         if client is None:
@@ -2085,29 +2092,38 @@ async def test_proxy_connection(slot):
     return result
 
 
-async def check_telegram_ip(account_id):
-    stamp = now_it().strftime("%H:%M:%S")
-    info = session_info[account_id]
-    if not info["ready"]:
-        result = f"⚠️ {stamp} — Sessione non connessa: usa VERIFICA nel menu SESSIONI"
-    else:
+async def verify_all_session_connections(query):
+    lines = ["🔍 VERIFICA TUTTE LE SESSIONI", "Controllo: " + now_it().strftime("%d/%m/%Y %H:%M:%S"), ""]
+    for index, slot in enumerate(tuple(ACCOUNT_IDS), 1):
+        await query.edit_message_text("\n".join(lines)[-3000:] + f"\n⏳ {index}/{len(ACCOUNT_IDS)} — ACCOUNT {slot}")
+        info = session_info[slot]
+        lines.append(f"ACCOUNT {slot} — {session_label(slot)}")
+        proxy_slot = info.get("proxy_slot")
+        if proxy_slot:
+            host = os.environ.get(f"PROXY_{proxy_slot}_HOST", "non configurato")
+            port = os.environ.get(f"PROXY_{proxy_slot}_PORT", "50101")
+            lines.append(f"Proxy assegnato: {proxy_slot} — IP/Host: {host} — Porta: {port}")
+            try:
+                lines.append(await test_proxy_connection(proxy_slot, account_id=slot))
+            except Exception as exc:
+                lines.append("❌ Proxy: " + safe_connection_error(exc))
+        else:
+            lines.append("⚠️ Connessione diretta / proxy non configurato")
         try:
-            response = await asyncio.wait_for(session_clients[account_id](GetAuthorizationsRequest()), timeout=15)
-            current = next((a for a in response.authorizations if getattr(a, "current", False)), None)
-            if current is None or not getattr(current, "ip", None):
-                raise ValueError("IP dell'autorizzazione corrente non disponibile")
-            slot = info["proxy_slot"]
-            expected = os.environ.get(f"PROXY_{slot}_HOST", "").strip()
-            result = f"🔎 {stamp} — IP riportato da Telegram: {current.ip}"
-            if current.ip == expected:
-                result += f" — coincide con il server proxy {slot}"
-            else:
-                result += " — diverso dal server proxy configurato; può essere un IP di uscita distinto o un dato non ancora aggiornato"
+            await connect_session(slot)
+            if not info["ready"]:
+                raise ValueError(info["error"])
+            me = await asyncio.wait_for(session_clients[slot].get_me(), timeout=10)
+            if me is None or me.id != info["user_id"]:
+                raise ValueError("Identità account non confermata")
+            lines.append("✅ Sessione Telegram connessa e identità verificata")
         except Exception as exc:
-            result = f"❌ {stamp} — VERIFICA IP FALLITA — {safe_connection_error(exc)}"
-    ip_checks[account_id] = result
-    await add_log(result, session_id=account_id)
-    return result
+            if isinstance(exc, PeerFloodError):
+                await halt_session(slot, "PeerFloodError durante verifica connessione")
+            lines.append("❌ Sessione: " + safe_connection_error(exc))
+        lines.extend(["Stato: " + await session_status_label(slot), ""])
+    lines.append("Controllo completato. IP/Host è il server proxy configurato. Nessun invito inviato e nessun blocco rimosso.")
+    await reply_long(query.message, "\n".join(lines), proxy_keyboard(), edit=True)
 
 
 async def diagnostic_group(client, group, label):
@@ -2216,6 +2232,8 @@ async def query_spambot(account_id):
         await add_log("🤖 SPAMBOT — verifica aggiornata: " + record["status"] +
                       "; blocco locale mantenuto se già presente", session_id=account_id)
     except Exception as exc:
+        if isinstance(exc, PeerFloodError):
+            await halt_session(account_id, "PeerFloodError durante verifica SpamBot")
         record["error"] = ("Nessuna risposta entro il tempo previsto" if isinstance(exc, asyncio.TimeoutError)
                            else safe_connection_error(exc))
         await add_log("⚠️ SPAMBOT — stato non determinabile: " + record["error"], session_id=account_id)
@@ -2252,7 +2270,9 @@ async def session_diagnostic_text(account_id):
              "Blocco locale antispam: " + ("🔒 ATTIVO" if info["telegram_locked"] else "nessuno registrato"), ""]
     slot = info["proxy_slot"]
     if slot:
-        lines.append(f"🌐 Proxy assegnato: {slot} — SOCKS5")
+        host = os.environ.get(f"PROXY_{slot}_HOST", "non configurato")
+        port = os.environ.get(f"PROXY_{slot}_PORT", "50101")
+        lines.append(f"🌐 Proxy assegnato: {slot} — IP/Host: {host} — Porta: {port} — SOCKS5")
         await test_proxy_connection(slot)
         lines.append(proxy_checks[slot])
     else:
@@ -2277,9 +2297,6 @@ async def session_diagnostic_text(account_id):
             lines.append("I flag dell'identità non certificano l'assenza di limiti sugli inviti.")
         except Exception as exc:
             lines.append("⚠️ Lettura identità fallita — " + safe_connection_error(exc))
-        lines.extend(["", "🌐 CONNESSIONE DELLA SESSIONE"])
-        lines.append(await check_telegram_ip(account_id))
-        lines.append("L'IP riportato può aggiornarsi con ritardo o differire dall'IP del server proxy.")
         suffix = account_suffix(account_id)
         for name, label in (("DEVICE_MODEL", "Dispositivo configurato"), ("SYSTEM_VERSION", "Sistema"), ("APP_VERSION", "Versione client")):
             lines.append(label + ": " + os.environ.get(name + suffix, "predefinito Telethon")[:80])
@@ -2307,13 +2324,6 @@ async def session_diagnostic_text(account_id):
     lines.extend(["", "⚠️ Nessun test d'invito eseguito. Telegram non fornisce qui una certificazione preventiva dell'assenza di limiti antispam.",
                   "PeerFlood indica una limitazione sugli inviti, non necessariamente un ban completo. Non rimuovere il blocco per riprovare."])
     return "\n".join(lines)
-
-
-def diagnostic_keyboard():
-    return panel_markup([
-        [InlineKeyboardButton("⬅️ Scheda sessione", callback_data="sf:card")],
-        [InlineKeyboardButton("👥 Gestione sessioni", callback_data="sessions")],
-    ])
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2657,6 +2667,7 @@ async def clean_member_rows(rows):
             unknown.add(user_id)
             destination = None
         except PeerFloodError:
+            await halt_session(current_session_id(), "PeerFloodError durante verifica membri")
             for flag in ("telegram_locked", "telegram_restriction_detected"):
                 await set_setting(flag, "1")
             sync_session_state()
@@ -3290,7 +3301,7 @@ def diagnostics_menu_keyboard():
         [InlineKeyboardButton("📋 Log", callback_data="logs"),
          InlineKeyboardButton("📊 Statistiche", callback_data="statistics")],
         [InlineKeyboardButton("🌐 Proxy / diagnostica", callback_data="proxy_status")],
-        [InlineKeyboardButton("🔎 Verifica sessione attiva", callback_data=f"check_session:{current_session_id()}")],
+        [InlineKeyboardButton("🔍 Verifica tutte le sessioni", callback_data="proxy_all")],
     ]
     if state["telegram_locked"]:
         rows.append([InlineKeyboardButton("🔓 Riabilita inviti", callback_data="unlock_confirm")])
@@ -3448,7 +3459,19 @@ async def registry_for(account_id):
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM session_registry WHERE owner_id=?", (owner,))
         row = await cursor.fetchone()
-    return dict(row) if row else {}
+    record = dict(row) if row else {}
+    record["manual_reason"] = await get_setting(f"manual_suspend_{owner}", "")
+    if record["manual_reason"]:
+        record["halted_reason"] = record.get("halted_reason") or "Sospensione manuale: " + record["manual_reason"]
+    info = session_info[account_id]
+    if (record and not record.get("approved") and wait_remaining(record) == 0
+            and info["ready"] and not info["telegram_locked"]
+            and not info["telegram_restriction_detected"] and not record.get("halted_reason")):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE session_registry SET approved=1 WHERE owner_id=? AND halted_reason=''", (owner,))
+            await db.commit()
+        record["approved"] = 1
+    return record
 
 
 def wait_remaining(record):
@@ -3484,6 +3507,10 @@ async def invitation_gate(account_id):
 async def session_status_label(account_id, record=None):
     info = session_info[account_id]
     record = record if record is not None else await registry_for(account_id)
+    if record.get("manual_reason"):
+        return "Sospesa manualmente — " + record["manual_reason"]
+    if record.get("halted_reason"):
+        return "Sospesa — " + record["halted_reason"]
     if not info["ready"]:
         return "Disconnessa — " + info.get("error", "connessione non verificata")[:160]
     if info["telegram_locked"] or info["telegram_restriction_detected"] or record.get("halted_reason"):
@@ -3495,16 +3522,24 @@ async def session_status_label(account_id, record=None):
         return f"In attesa iniziale — {math.ceil(remaining / 3600)} ore residue"
     if record.get("legacy_session") and record.get("approved"):
         return "Sessione esistente — nessuna nuova attesa"
-    return "Abilitata manualmente" if record.get("approved") else "Attesa completata — da abilitare manualmente"
+    return "Operativa — attesa iniziale completata" if record.get("approved") else "Attesa completata — verifica necessaria"
 
 
 async def halt_session(account_id, reason):
     owner = session_info[account_id].get("user_id")
+    if not owner:
+        return
+    if "PeerFlood" in reason:
+        for flag in ("telegram_locked", "telegram_restriction_detected"):
+            session_info[account_id][flag] = True
+            await set_setting(f"session_{account_id}_{flag}", "1")
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO session_registry(owner_id,inserted_at) VALUES (?,?)", (owner, now_it().isoformat()))
         await db.execute("UPDATE session_registry SET approved=0,halted_reason=?,last_error=? WHERE owner_id=?",
                          (reason[:400], now_it().isoformat() + " — " + reason[:400], owner))
         await db.commit()
     if account_id == state["active_session"]:
+        sync_session_state()
         state["auto_enabled"] = False
         state["running"] = False
         await set_setting("auto_enabled", "0")
@@ -3556,6 +3591,8 @@ async def diagnose_destination(account_id):
             result["restrictions"] = "confirmed" if getattr(permission, "is_banned", False) else "none_reported"
             result["summary"] = "Permesso d'invito assente" if not allowed else "Permessi compatibili; eventuali rifiuti Telegram restano da spiegare"
     except Exception as exc:
+        if isinstance(exc, PeerFloodError):
+            await halt_session(account_id, "PeerFloodError durante diagnostica gruppo B")
         if type(exc).__name__ == "UserNotParticipantError":
             result.update(membership="absent", invite_allowed=False, summary="Account non presente nel gruppo B")
         if isinstance(exc, FloodWaitError):
@@ -3574,6 +3611,8 @@ async def diagnose_destination(account_id):
             state_label = "bannato" if getattr(rights, "view_messages", False) else "assente" if getattr(participant, "left", False) or type(participant).__name__ == "ChannelParticipantLeft" else "presente" if participant else "non verificabile"
             result["target"] = f"ID {user.id}: {state_label}"
     except Exception as exc:
+        if isinstance(exc, PeerFloodError):
+            await halt_session(account_id, "PeerFloodError durante diagnostica gruppo B")
         result["target"] = "Ultimo destinatario: assente" if type(exc).__name__ == "UserNotParticipantError" else "Ultimo destinatario non verificabile — " + safe_connection_error(exc)
     spam = await spambot_record(account_id)
     result["spambot"] = spam.get("status", "UNKNOWN")
@@ -3785,7 +3824,7 @@ async def inbox_action(update, context, data):
             if nav:
                 rows.append(nav)
             rows.extend([[InlineKeyboardButton("🔄 Aggiorna", callback_data=f"inbox:list:{slot}:{page}")],
-                         [InlineKeyboardButton("⬅️ Gestisci account", callback_data="sf:manage")]])
+                         [InlineKeyboardButton("⬅️ Scheda sessione", callback_data="sf:card")]])
             await reply_long(query.message, "\n".join(lines), panel_markup(rows), edit=True)
         elif action == "chat":
             token, offset = parts[2], max(0, int(parts[3]))
@@ -3810,7 +3849,7 @@ async def inbox_action(update, context, data):
             if len(messages) == 20:
                 rows.append([InlineKeyboardButton("⬅️ 20 precedenti", callback_data=f"inbox:chat:{token}:{min(m.id for m in messages)}")])
             rows.extend([[InlineKeyboardButton("⬅️ Altre chat", callback_data=f"inbox:list:{slot}:{entry['page']}")],
-                         [InlineKeyboardButton("⬅️ Gestisci account", callback_data="sf:manage")]])
+                         [InlineKeyboardButton("⬅️ Scheda sessione", callback_data="sf:card")]])
             await reply_long(query.message, "\n".join(lines), panel_markup(rows), edit=True)
         else:
             raise ValueError("Pulsante messaggi non valido.")
@@ -3832,36 +3871,31 @@ async def session_features_action(update, context, data):
     action = data[3:]
     account_id = state["active_session"]
     if action == "list":
-        await query.edit_message_text("📋 SELEZIONA SESSIONE\nSessione selezionata: " + session_button_name(account_id) + "\n\n🟢 Abilitata localmente · 🟡 Attesa o verifica necessaria · 🔴 Disconnessa o inviti sospesi\nPremi un nome per aprire la scheda. Il cambio disattiva AUTO.", reply_markup=await session_list_keyboard())
+        await query.edit_message_text("📋 SELEZIONA SESSIONE\nSessione selezionata: " + session_button_name(account_id) + "\n\n🟢 Operativa · 🟡 Attesa o verifica necessaria · 🔴 Sospesa, limitata o disconnessa\nPremi un nome per aprire la scheda. Il cambio disattiva AUTO.", reply_markup=await session_list_keyboard())
         return True
-    if action == "card":
+    if action in {"card", "manage"}:
         await reply_long(query.message, await session_card_text(account_id), await session_card_keyboard(account_id), edit=True)
-        return True
-    if action == "manage":
-        await query.edit_message_text("⚙️ GESTISCI ACCOUNT\n" + session_label(account_id), reply_markup=await account_management_keyboard(account_id))
         return True
     if operation_busy() or state["auto_enabled"]:
         await callback_notice(query, "Disattiva AUTO e attendi la fine delle operazioni.")
         return True
     state["waiting_for"] = None
+    if action.startswith(("suspend:", "resume:")):
+        slot = int(action.split(":")[1])
+        if slot != account_id or not session_info[slot].get("user_id"):
+            await callback_notice(query, "Sessione cambiata o non disponibile: riapri la scheda.")
+            return True
+        if action.startswith("suspend:"):
+            context.user_data["feature_input"] = "suspend_reason"
+            context.user_data["suspend_pending"] = {"slot": slot, "owner": session_info[slot]["user_id"]}
+            await query.edit_message_text("⏸ SOSPENDI SESSIONE\n" + session_label(slot) + "\n\nScrivi il motivo della sospensione (massimo 400 caratteri).", reply_markup=panel_markup([[InlineKeyboardButton("⬅️ Annulla", callback_data="sf:card")]]))
+        else:
+            await set_setting(f"manual_suspend_{session_info[slot]['user_id']}", "")
+            await add_log("▶️ Sospensione manuale rimossa; eventuali blocchi Telegram restano attivi", session_id=slot)
+            await reply_long(query.message, await session_card_text(slot), await session_card_keyboard(slot), edit=True)
+        return True
     if action == "all":
-        lines = ["🔎 VERIFICA TUTTE LE SESSIONI — nessun ingresso o messaggio"]
-        for slot in tuple(ACCOUNT_IDS):
-            await query.edit_message_text("\n".join(lines)[-3200:] + f"\n⏳ Verifica ACCOUNT {slot}…")
-            wait = float(await get_setting(f"session_check_wait_{session_info[slot].get('user_id')}", "0"))
-            if wait > now_it().timestamp():
-                lines.append(f"ACCOUNT {slot}: pausa Telegram attiva; controllo saltato")
-                continue
-            await connect_session(slot)
-            result = await diagnose_destination(slot)
-            lines.extend([session_label(slot), "Stato: " + await session_status_label(slot),
-                          "Gruppo B: " + result["membership"], "Esito: " + result["summary"], ""])
-            await add_log("🔎 Verifica generale — " + result["summary"], session_id=slot)
-        await reply_long(query.message, "\n".join(lines), sessions_keyboard(), edit=True)
-    elif action == "diagnose":
-        await query.edit_message_text("🔎 Controllo gruppo B in corso…")
-        result = await diagnose_destination(account_id)
-        await reply_long(query.message, format_destination_diagnosis(account_id, result), await session_card_keyboard(account_id), edit=True)
+        await verify_all_session_connections(query)
     elif action == "age":
         record = await registry_for(account_id)
         if not record:
@@ -3951,6 +3985,9 @@ async def inspect_destination_link(client, reference, group):
 
 
 async def join_destination_once(account_id, reference, group):
+    record = await registry_for(account_id)
+    if record.get("halted_reason") or session_info[account_id]["telegram_locked"] or session_info[account_id]["telegram_restriction_detected"]:
+        return "⏸ Sessione sospesa: nessun ingresso tentato"
     client = session_clients[account_id]
     owner = session_info[account_id]["user_id"]
     if not session_info[account_id]["ready"]:
@@ -4514,6 +4551,19 @@ async def feature_text_input(update, context):
         return True
     value = update.message.text.strip()
     try:
+        if target == "suspend_reason":
+            pending = context.user_data.get("suspend_pending", {})
+            slot = pending.get("slot")
+            if slot != state["active_session"] or session_info.get(slot, {}).get("user_id") != pending.get("owner"):
+                raise ValueError("Sessione cambiata: riapri Sospendi sessione")
+            if not value or len(value) > 400:
+                raise ValueError("Scrivi un motivo da 1 a 400 caratteri")
+            await set_setting(f"manual_suspend_{pending['owner']}", value)
+            context.user_data.pop("feature_input", None)
+            context.user_data.pop("suspend_pending", None)
+            await add_log("⏸ Sospensione manuale — " + value, session_id=slot)
+            await reply_long(update.message, await session_card_text(slot), await session_card_keyboard(slot))
+            return True
         if target == "join_b_link":
             pending = context.user_data.get("join_b_draft")
             if not pending or pending["slot"] != state["active_session"] or pending["group"] != state["group_b"]:
@@ -4657,6 +4707,7 @@ async def stop_invites_for_destination(display, mode, error_name, message):
 
 async def report_verification_problem(display, mode, error_name, message):
     if error_name == "PeerFloodError":
+        await halt_session(current_session_id(), "PeerFloodError durante verifica")
         state["running"] = False
         state["auto_enabled"] = False
         state["telegram_locked"] = True
@@ -4890,6 +4941,7 @@ async def invite_one(destination, user, mode):
 
     except PeerFloodError as e:
 
+        await halt_session(current_session_id(), "PeerFloodError durante invito")
         state["running"] = False
         state["telegram_locked"] = True
         state["telegram_restriction_detected"] = True
@@ -4974,6 +5026,8 @@ async def daily_scheduler(application):
         try:
             if not control_lock.locked():
                 async with control_lock:
+                    for slot in tuple(ACCOUNT_IDS):
+                        await registry_for(slot)
                     if (state["auto_enabled"] and not operation_busy()
                             and not state["telegram_locked"]
                             and not await invitation_gate(state["active_session"])
@@ -5494,10 +5548,20 @@ async def buttons(
         for key in ("feature_input", "message_draft", "join_b_draft", "enable_session_pending", "link_consent_pending"):
             context.user_data.pop(key, None)
         state["waiting_for"] = None
-    if data.startswith(("sf:", "jb:", "msg:", "link:", "inbox:")):
+    if data.startswith(("profile_new:", "profile_regen:", "profile_apply:", "jb:")):
+        slot = int(data.split(":")[1]) if data.startswith("profile_new:") else state["active_session"]
+        record = await registry_for(slot)
+        if record.get("halted_reason") or session_info[slot]["telegram_locked"] or session_info[slot]["telegram_restriction_detected"]:
+            await callback_notice(query, "Sessione sospesa: operazione non consentita.")
+            return
+    if data.startswith(("sf:", "jb:", "msg:", "link:", "inbox:", "select_session:")):
         state["waiting_for"] = None
+        context.user_data.pop("feature_input", None)
+        context.user_data.pop("suspend_pending", None)
     if await inbox_action(update, context, data):
         return
+    if data == "sf:diagnose":
+        data = f"check_session:{state['active_session']}"
     if await session_features_action(update, context, data):
         return
     if await join_b_action(update, context, data):
@@ -5704,19 +5768,19 @@ async def buttons(
     if data == "proxy_status":
         await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
         return
-    if data.startswith("proxy_test:") or data == "proxy_ip":
+    if data.startswith("proxy_test:") or data in {"proxy_ip", "proxy_all"}:
         if operation_busy():
             await callback_notice(query, "Ferma le operazioni prima di eseguire la diagnostica proxy.")
             return
+        if data in {"proxy_all", "proxy_ip"}:
+            await verify_all_session_connections(query)
+            return
         await query.edit_message_text("🌐 Verifica proxy in corso… Nessun invito verrà inviato.")
-        if data == "proxy_ip":
-            await check_telegram_ip(current_session_id())
-        else:
-            value = data.split(":", 1)[1]
-            if value not in {str(slot) for slot in PROXY_IDS}:
-                await callback_notice(query, "Proxy non valido.")
-                return
-            await test_proxy_connection(int(value))
+        value = data.split(":", 1)[1]
+        if value not in {str(slot) for slot in PROXY_IDS}:
+            await callback_notice(query, "Proxy non valido.")
+            return
+        await test_proxy_connection(int(value))
         await query.edit_message_text(await proxy_status_text(), reply_markup=proxy_keyboard())
         return
     if data == "sessions":
@@ -5745,7 +5809,9 @@ async def buttons(
                       session_id=account_id)
         await query_spambot(account_id)
         report = await session_diagnostic_text(account_id)
-        await reply_long(query.message, report, diagnostic_keyboard(), edit=True)
+        result = await diagnose_destination(account_id)
+        report += "\n\n" + format_destination_diagnosis(account_id, result)
+        await reply_long(query.message, report, await session_card_keyboard(account_id), edit=True)
         return
     if data.startswith("unlock:"):
         if data != f"unlock:{state['active_session']}":
