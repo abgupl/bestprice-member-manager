@@ -1305,8 +1305,10 @@ async def prepare_message_steps(selected_senders, require_preview_match=False):
         if info["ready"] and info.get("user_id") and not info["telegram_locked"] and not info["telegram_restriction_detected"] and not record.get("halted_reason"):
             eligible.append(slot)
     selected = [slot for slot in selected_senders if slot in eligible]
+    if len(selected) == 1 and len([slot for slot in eligible if slot != selected[0]]) < 2:
+        raise ValueError("Servono 2 destinatari distinti e operativi oltre al mittente. Al momento non sono disponibili: controlla stato e sospensioni delle altre sessioni.")
     signature = json.dumps({"selected": selected, "eligible": [(i, session_info[i]["user_id"]) for i in eligible],
-                            "text_mode": "random_phrases_v1", "count": count,
+                            "text_mode": "random_phrases_v2_two_targets", "count": count,
                             "interval": await get_setting("prepare_interval", "60"),
                             "actions": await get_setting("prepare_actions", '["profiles", "join", "messages"]')}, sort_keys=True)
     try:
@@ -1339,8 +1341,14 @@ async def prepare_message_steps(selected_senders, require_preview_match=False):
             topics[pair] = rng.choice(PREPARE_CHAT_PHRASES)
         phrases = topics[pair]
         sender, target = session_info[sender_slot], session_info[target_slot]
+        remaining_phrases = []
         for number in range(1, count + 1):
-            text = rng.choice([phrase for phrase in phrases if phrase != previous_text])
+            if not remaining_phrases:
+                remaining_phrases = list(phrases)
+                rng.shuffle(remaining_phrases)
+                if remaining_phrases[-1] == previous_text:
+                    remaining_phrases[0], remaining_phrases[-1] = remaining_phrases[-1], remaining_phrases[0]
+            text = remaining_phrases.pop()
             previous_text = text
             steps.append({"type": "messages", "slot": sender_slot, "owner": sender["user_id"],
                           "target_slot": target_slot, "target_owner": target["user_id"],
@@ -1701,7 +1709,11 @@ async def prepare_message_action(update, context, data):
             await callback_notice(query, "Interrompi le operazioni e disattiva AUTO prima di configurare o generare l'anteprima.")
             return True
         if data == "preparemsg:preview":
-            text, markup = await prepare_preview_screen()
+            try:
+                text, markup = await prepare_preview_screen()
+            except ValueError as exc:
+                await callback_notice(query, str(exc))
+                return True
             await reply_long(query.message, text, markup, edit=True)
             return True
         context.user_data["prepare_message_input"] = "count"
