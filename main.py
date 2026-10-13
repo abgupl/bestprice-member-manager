@@ -1276,7 +1276,7 @@ async def prepare_choices():
     eligible = []
     for slot in slots:
         record = await registry_for(slot)
-        if not record.get("halted_reason") and not session_info[slot]["telegram_locked"] and not session_info[slot]["telegram_restriction_detected"]:
+        if "messages" in actions or (not record.get("halted_reason") and not session_info[slot]["telegram_locked"] and not session_info[slot]["telegram_restriction_detected"]):
             eligible.append(slot)
     return eligible, [a for a in ("profiles", "join", "messages") if a in actions]
 
@@ -1301,14 +1301,18 @@ async def prepare_message_steps(selected_senders, require_preview_match=False):
     eligible = []
     for slot in ACCOUNT_IDS:
         info = session_info[slot]
-        record = await registry_for(slot)
-        if info["ready"] and info.get("user_id") and not info["telegram_locked"] and not info["telegram_restriction_detected"] and not record.get("halted_reason"):
+        if info["ready"] and info.get("user_id"):
             eligible.append(slot)
     selected = [slot for slot in selected_senders if slot in eligible]
-    if len(selected) == 1 and len([slot for slot in eligible if slot != selected[0]]) < 2:
-        raise ValueError("Servono 2 destinatari distinti e operativi oltre al mittente. Al momento non sono disponibili: controlla stato e sospensioni delle altre sessioni.")
+    recipients = [slot for slot in ACCOUNT_IDS if session_info[slot].get("user_id")]
+    if len(selected) == 1:
+        sender_owner = session_info[selected[0]]["user_id"]
+        recipients = [slot for slot in recipients if session_info[slot]["user_id"] != sender_owner]
+        if len({session_info[slot]["user_id"] for slot in recipients}) < 2:
+            raise ValueError("Servono 2 destinatari distinti con identità Telegram nota oltre al mittente. Il colore verde, giallo o rosso non conta per ricevere.")
     signature = json.dumps({"selected": selected, "eligible": [(i, session_info[i]["user_id"]) for i in eligible],
-                            "text_mode": "random_phrases_v2_two_targets", "count": count,
+                            "text_mode": "random_phrases_v4_chat_any_color", "count": count,
+                            "recipients": [(i, session_info[i]["user_id"]) for i in recipients],
                             "interval": await get_setting("prepare_interval", "60"),
                             "actions": await get_setting("prepare_actions", '["profiles", "join", "messages"]')}, sort_keys=True)
     try:
@@ -1322,7 +1326,13 @@ async def prepare_message_steps(selected_senders, require_preview_match=False):
     rng = secrets.SystemRandom()
     directions = []
     if len(selected) == 1:
-        targets = [i for i in eligible if i != selected[0]]
+        seen = set()
+        targets = []
+        for slot in recipients:
+            owner = session_info[slot]["user_id"]
+            if owner not in seen:
+                targets.append(slot)
+                seen.add(owner)
         for target in rng.sample(targets, min(2, len(targets))):
             directions.append((selected[0], target))
     elif len(selected) >= 2:
@@ -1353,7 +1363,7 @@ async def prepare_message_steps(selected_senders, require_preview_match=False):
             steps.append({"type": "messages", "slot": sender_slot, "owner": sender["user_id"],
                           "target_slot": target_slot, "target_owner": target["user_id"],
                           "target_username": target.get("username"), "text": text,
-                          "message_number": number, "message_count": count})
+                          "message_number": number, "message_count": count, "receive_only": len(selected) == 1})
     await set_setting("prepare_message_preview", json.dumps({"signature": signature, "steps": steps}))
     return steps
 
@@ -1411,7 +1421,7 @@ async def prepare_screen():
         "🔥 RISCALDA SESSIONI", "",
         "Seleziona gli account e spunta le operazioni da eseguire:", "",
         "🎨 Crea profili: salta gli account con username già impostato o profilo già preparato.",
-        "📨 Invia messaggi: una sessione scrive a 2 destinatari casuali; con più sessioni selezionate, ogni coppia scambia lo stesso numero di messaggi in entrambe le direzioni.",
+        "📨 Invia messaggi: una sessione scrive a 2 destinatari casuali di qualsiasi colore; con più sessioni selezionate, ogni coppia scambia lo stesso numero di messaggi in entrambe le direzioni.",
         "🚪 Entra nel gruppo B: esegue l’ingresso soltanto per gli account non ancora presenti.", "",
         "⏱ Imposta la pausa tra le operazioni e premi Avvia preparazione.", "",
         f"Sessioni selezionate: {len(slots)}",
@@ -1481,6 +1491,18 @@ async def refresh_prepare_panel(application):
             logger.warning("Aggiornamento pannello preparazione non riuscito: %s", type(exc).__name__)
 
 
+def exclude_prepare_chat_session(job, slot):
+    halted = job.setdefault("message_halted_slots", [])
+    if slot not in halted:
+        halted.append(slot)
+    index = job["index"]
+    completed = job["steps"][:index]
+    remaining = job["steps"][index:]
+    kept = [step for step in remaining if step.get("type") != "messages" or (step.get("slot") != slot and step.get("target_slot") != slot)]
+    job["steps"] = completed + kept
+    return len(remaining) - len(kept)
+
+
 async def run_prepare(application):
     try:
         while prepare_job.get("status") == "in corso" and prepare_job["index"] < len(prepare_job["steps"]):
@@ -1495,12 +1517,15 @@ async def run_prepare(application):
             prepare_job["inflight"] = True
             await save_prepare_job()
             await refresh_prepare_panel(application)
+            excluded_slot = None
             try:
                 if slot not in ACCOUNT_IDS or not session_info[slot]["ready"]:
                     raise ValueError("Sessione non disponibile")
                 record = await registry_for(slot)
-                if record.get("halted_reason") or session_info[slot]["telegram_locked"] or session_info[slot]["telegram_restriction_detected"]:
+                if action_type != "messages" and (record.get("halted_reason") or session_info[slot]["telegram_locked"] or session_info[slot]["telegram_restriction_detected"]):
                     raise ValueError("Sessione sospesa; operazione saltata")
+                if action_type == "messages" and slot in prepare_job.get("message_halted_slots", []):
+                    raise ValueError("Invii fermati per una limitazione rilevata durante questo ciclo")
                 client = session_clients[slot]
                 
                 me = await asyncio.wait_for(client.get_me(), 15)
@@ -1521,9 +1546,6 @@ async def run_prepare(application):
                     result = await join_destination_once(slot, reference, group)
                 elif action_type == "messages":
                     target_owner = step.get("target_owner")
-                    target_record = await registry_for(step["target_slot"])
-                    if target_record.get("halted_reason") or session_info[step["target_slot"]]["telegram_locked"] or session_info[step["target_slot"]]["telegram_restriction_detected"]:
-                        raise ValueError("Sessione destinataria sospesa; invio saltato")
                     target_info = session_info.get(step.get("target_slot"), {})
                     if target_info.get("user_id") != target_owner:
                         raise ValueError("Account destinatario cambiato: invio annullato")
@@ -1532,11 +1554,15 @@ async def run_prepare(application):
                     if target_username:
                         try:
                             recipient = await client.get_entity("@" + target_username.lstrip("@"))
+                        except (PeerFloodError, FloodWaitError):
+                            raise
                         except Exception:
                             pass
                     if recipient is None and target_owner:
                         try:
                             recipient = await client.get_entity(target_owner)
+                        except (PeerFloodError, FloodWaitError):
+                            raise
                         except Exception:
                             pass
                     if recipient is None:
@@ -1544,8 +1570,13 @@ async def run_prepare(application):
                     await asyncio.wait_for(client.send_message(recipient, step["text"], parse_mode=None), 20)
                     result = f"✅ Messaggio inviato ad account {step.get('target_slot')}"
             except Exception as exc:
+                if action_type == "messages" and isinstance(exc, (PeerFloodError, FloodWaitError)):
+                    excluded_slot = slot
                 if isinstance(exc, PeerFloodError):
                     await halt_session(slot, "PeerFloodError durante preparazione")
+                    halted = prepare_job.setdefault("message_halted_slots", [])
+                    if slot not in halted:
+                        halted.append(slot)
                 if isinstance(exc, FloodWaitError):
                     await set_setting(f"profile_pause_{slot}", now_it().timestamp() + exc.seconds)
                 result = "⚠️ " + safe_connection_error(exc)
@@ -1553,6 +1584,11 @@ async def run_prepare(application):
             prepare_job["results"].append(f"ACCOUNT {slot}: {result}")
             await add_log("⚙️ PREPARAZIONE — " + result, session_id=slot)
             prepare_job["index"] += 1
+            if excluded_slot is not None:
+                removed = exclude_prepare_chat_session(prepare_job, excluded_slot)
+                notice = f"ACCOUNT {excluded_slot}: escluso dagli scambi rimanenti per limitazione; {removed} invii rimossi"
+                prepare_job["results"].append(notice)
+                await add_log("⏹ PREPARAZIONE — " + notice, "WARNING", session_id=excluded_slot)
             prepare_job["inflight"] = False
             prepare_job["next_at"] = now_it().timestamp() + prepare_job["interval"] * 60
             if prepare_job["index"] == len(prepare_job["steps"]):
@@ -1687,7 +1723,7 @@ async def prepare_message_screen():
              "Testi: brevi frasi casuali in italiano, scelte automaticamente dal bot.", f"Messaggi per direzione: {count}", "",
              "Una sessione selezionata: invia a 2 destinatari casuali, senza risposta automatica.",
              "Due o più sessioni: ogni coppia selezionata comunica una volta, con lo stesso numero di messaggi in uscita e in risposta. Ordine casuale.",
-             "Sessioni sospese o non disponibili escluse. La pausa è tra ogni singolo messaggio.",
+             "Per questa chat il colore non limita invii o ricezione. I mittenti devono essere connessi. La pausa è tra ogni singolo messaggio.",
              "Apri Anteprima per vedere ordine, totale e durata. Avvia da Riscalda sessioni."]
     rows = [[InlineKeyboardButton(f"🔢 Messaggi per direzione: {count}", callback_data="preparemsg:count")],
             [InlineKeyboardButton("📋 Anteprima", callback_data="preparemsg:preview")],
